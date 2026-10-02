@@ -1,0 +1,74 @@
+# Default data configuration for shotcloud.
+#
+# Splits are configurable. Two split modes are supported:
+#
+#   1. season-based (preferred for paper reproducibility):
+#        split_mode: "season"
+#        train_seasons: [...]
+#        val_seasons:   [...]
+#        test_seasons:  [...]
+#
+#   2. fractional (for quick iteration on a single-season slice):
+#        split_mode: "fractional"
+#        train_frac: 0.8
+#        val_frac:   0.1
+#        test_frac:  0.1
+#        split_seed: 42
+#
+# To override at run time:
+#   uv run python scripts/train_full.py data.split_mode=fractional data.train_frac=0.7
+
+# ---------------------------------------------------------------------------
+# Paths (relative to repo root unless absolute).
+# ---------------------------------------------------------------------------
+paths:
+  raw_dir:       "data/raw"
+  processed_dir: "data/processed"
+  cache_dir:     "data/cache"
+
+# ---------------------------------------------------------------------------
+# Coordinate convention. Basket at origin, units = feet (LOC_X/LOC_Y / 10).
+# ---------------------------------------------------------------------------
+coords:
+  divide_loc_by: 10        # raw LOC_X/LOC_Y are tenths of feet
+  basket_at_origin: true
+  x_range: [-25.0, 25.0]   # feet, full court width
+  y_range: [-5.0, 47.0]    # feet, full half-court (use [-5, 35] to crop)
+
+# ---------------------------------------------------------------------------
+# Grid resolution for KDE / decoder cells.
+# ---------------------------------------------------------------------------
+grid:
+  nx: 64
+  ny: 56
+
+# ---------------------------------------------------------------------------
+# Splits.
+# ---------------------------------------------------------------------------
+split:
+  split_mode: "season"
+
+  # Used when split_mode == "season":
+  train_seasons: ["2018-19", "2019-20", "2020-21", "2021-22"]
+  val_seasons:   ["2022-23"]
+  test_seasons:  ["2023-24"]
+
+  # Used when split_mode == "fractional":
+  train_frac: 0.8
+  val_frac:   0.1
+  test_frac:  0.1
+  split_seed: 42
+
+# ---------------------------------------------------------------------------
+# Filtering.
+# ---------------------------------------------------------------------------
+filter:
+  min_shots_per_player: 50    # drop players with fewer than this many shots in train
+  drop_backcourt: true        # zone == -1 (backcourt / unclassified)
+  drop_nan_locations: true
+
+# ---------------------------------------------------------------------------
+# Recency weighting (for hierarchical KDE).
+# ---------------------------------------------------------------------------
+recency:
+  half_life_days: 365         # exponential decay; null disables recency weighting
