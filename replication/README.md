@@ -39,8 +39,9 @@ the current shell instead.
 
 A step is skipped when its outputs already exist, so an interrupted run resumes
 where it stopped and finished work is never overwritten. `FORCE=1` runs every
-step regardless; the training scripts still refuse to overwrite an existing run
-directory, so move that directory aside first.
+step regardless; the count-head, timing-head, and AC-KDE training scripts still
+refuse to overwrite an existing run directory, so move that directory aside
+first.
 
 ## Stages
 
