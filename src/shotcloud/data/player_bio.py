@@ -1,14 +1,12 @@
 """Player biographical data loader.
 
-Consumes the CSV produced by :doc:`scripts/fetch_player_bio`. Provides
-a typed dataframe + helpers for the trait-vector builder in
-:mod:`shotcloud.data.player_traits` (Phase 2 of the collaborative-KDE
-pivot).
+Loads the CSV produced by ``scripts/fetch_player_bio.py`` into a typed
+DataFrame and provides helpers for the trait-vector builder in
+:mod:`shotcloud.data.player_traits`.
 
-The biographical data is the cold-start-tolerant block of the trait
-vector — every NBA player has a height/weight/birthdate/position
-regardless of whether they've taken any shots yet. See
-:doc:`docs/model_spec.md` §"Causal player traits".
+Biographical fields form the cold-start-tolerant block of the trait
+vector: every player has a height, weight, birthdate, and position
+whether or not they have taken any shots.
 """
 
 from __future__ import annotations
@@ -20,10 +18,12 @@ import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 
-#: Five-way biographical position groups (best-effort mapping from the
-#: NBA Stats POSITION field, which is 3-way + hyphenated combos).
+#: Five-way biographical position groups, a best-effort mapping from the
+#: NBA Stats ``POSITION`` field (three base positions plus hyphenated
+#: combinations).
 POSITION_GROUPS: Final[tuple[str, ...]] = ("PG", "SG", "SF", "PF", "C")
 
+#: Columns the player-bio CSV must carry.
 REQUIRED_COLUMNS: Final[tuple[str, ...]] = (
     "player_id",
     "display_name",
@@ -53,9 +53,16 @@ def load_player_bio(path: Path | str) -> pd.DataFrame:
     Other columns from the CSV (``source``, ``fetched_at``, ``error_message``)
     are kept as-is for provenance but aren't required by downstream code.
 
-    Rows with ``status != "ok"`` are kept (the caller decides how to
-    handle them — typically by treating their bio fields as NaN, which
-    Phase 2 then represents via the missingness indicator).
+    Rows with ``status != "ok"`` are kept; the caller decides how to
+    handle them, typically by treating their bio fields as missing,
+    which the trait builder encodes with a missingness indicator.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``path`` does not exist.
+    ValueError
+        If any of :data:`REQUIRED_COLUMNS` is missing.
     """
     p = Path(path)
     if not p.exists():
@@ -85,9 +92,8 @@ def compute_age_years(
     Returns ``NaN`` for rows where birthdate is NaT.
     """
     ref = pd.Timestamp(ref_date)
-    # Convert to seconds, divide by avg seconds/year. Using 365.25
-    # absorbs leap-year drift; sub-day precision doesn't matter for
-    # snapshot-level traits.
+    # A 365.25-day year absorbs leap-year drift; sub-day precision is
+    # irrelevant for snapshot-level traits.
     deltas = (ref - birthdate).dt.total_seconds()
     years: NDArray[np.float64] = (deltas / (365.25 * 24 * 3600)).to_numpy(
         dtype=np.float64, na_value=np.nan

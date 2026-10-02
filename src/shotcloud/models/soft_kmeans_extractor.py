@@ -1,60 +1,41 @@
-"""Support-driven soft k-means / mean-shift mode extractor.
+"""Soft k-means / mean-shift mode extractor over attended support shots.
 
-Replaces the learned-query mode extractor
-(:class:`~shotcloud.models.mode_extractor.SupportModeExtractor`) with
-a math-first clustering operator: mode centers are obtained by
-running a few **differentiable mean-shift iterations** over the
-attended support set, initialized via deterministic weighted
-farthest-point sampling.
+:class:`SoftKMeansModeExtractor` is an alternative to the learned-query
+:class:`~shotcloud.models.mode_extractor.SupportModeExtractor`. Mode
+centers are obtained by a few differentiable mean-shift iterations over
+the attended support set, initialized by deterministic weighted
+farthest-point sampling (FPS). Because each center is a kernel-weighted
+average of nearby support shots, the modes are clusters of the row's own
+support by construction; learned queries, being shared across rows, can
+instead settle on broad league-typical regions that act as global modes.
 
-The key advantage over learned queries is that the centers MUST come
-from local support-density structure (the kernel-weighted average of
-nearby support shots, pulled by ω). The learned-query version
-empirically behaved as "implicit global anchors" — the queries
-learned to attend to broad league-typical regions regardless of
-player. With clustering, the modes are clusters of *this row's*
-support by construction.
+Algorithm:
 
-Per the 2026-05-18 mode-collapse diagnosis:
+1. Initialize ``K`` seeds by weighted FPS on ``support_xy``:
 
-> If the learned queries are global parameters, then even though
-> centers are convex combinations of support shots, the same query
-> may always attend to the same broad region. That creates de facto
-> global modes.
+   * seed 1 is the ω-weighted mean of the attended support,
+     ``μ_1^{(0)} = (Σ_j ω_j s_j) / (Σ_j ω_j)``;
+   * seeds 2..K are picked greedily as ``argmax_j ω_j · D_j²``, where
+     ``D_j`` is the distance from ``s_j`` to the nearest selected seed.
 
-Mathematical specification (v2, 2026-05-18 normalized form):
-
-1. Initialize K seeds via weighted FPS on ``support_xy``:
-   * Seed 0 = the **ω-weighted mean** of the attended support,
-     ``μ_1^{(0)} = (Σ_j ω_j s_j) / (Σ_j ω_j)``.
-   * Seeds 1..K-1 picked greedily as
-     ``argmax_j ω_j · D_j²`` where ``D_j`` is min distance to
-     already-selected seeds.
 2. For ``n_iterations`` steps:
-   * **Normalized responsibility** (soft cluster assignment of
-     each support point to modes):
+
+   * normalized responsibility (soft assignment of each support point
+     to modes),
      ``r_{k,j} = exp(-||s_j - μ_k||² / (2ρ²)) /
-                 Σ_ℓ exp(-||s_j - μ_ℓ||² / (2ρ²))``,
-     so ``Σ_k r_{k,j} = 1`` for every support point.
-   * Centroid update with explicit ω weighting:
+     Σ_ℓ exp(-||s_j - μ_ℓ||² / (2ρ²))``, so ``Σ_k r_{k,j} = 1``;
+   * ω-weighted centroid update,
      ``μ_k = (Σ_j ω_j r_{k,j} s_j) / (Σ_j ω_j r_{k,j})``.
-3. Mode mass = share of attended support assigned to mode k:
+
+3. Mode mass, the share of attended support assigned to mode ``k``:
    ``m_k = Σ_j ω_j r_{k,j}``.
-4. Mode logits: ``log(m_k + ε) + b_k(x_n, h_n)`` with optional
-   context-bias MLP (zero-init last layer).
+4. Mode logits ``log max(m_k, ε) + b_k(x_n, h_n)`` with an optional
+   context-bias MLP whose last layer is zero-initialized.
 
-The v2 normalization makes ``r_{k,j}`` a proper soft cluster
-assignment (cleaner math, cleaner viz), and decouples the
-"cluster assignment" step from the "evidence weight" — ω only
-enters at the centroid + mass aggregation. The previous v1 form
-multiplied ω into raw mean-shift kernel weights, which conflated
-the two.
-
-The only learned parameters are the support embedding (not used in
-v1 of this extractor — kept fixed-zero or absent) and the
-context-bias MLP. Centers are non-parametric (cluster-derived);
-mode mass is non-parametric; only the per-mode mixture weights get
-a small context-conditional MLP correction.
+The responsibility is a proper soft cluster assignment that depends on
+geometry alone; the support attention ω enters only through the seeding,
+the centroid update and the mode mass. Centers and masses are non-parametric; the only
+learned parameters are those of the context-bias MLP.
 """
 
 from __future__ import annotations
@@ -71,9 +52,8 @@ from shotcloud.models.mode_extractor import (
     ModeExtractorOutputs,
 )
 
-#: Default Gaussian kernel bandwidth ρ for the mean-shift
-#: responsibility. 5 ft is the same scale used by the legacy
-#: mode-membership kernel — wide enough that a few iterations smooth
+#: Default Gaussian kernel bandwidth ρ (feet) for the mean-shift
+#: responsibility: wide enough that a few iterations smooth
 #: meaningfully, narrow enough that distinct shot clusters separate.
 DEFAULT_MODE_KERNEL_BANDWIDTH_FT: float = 5.0
 
@@ -95,23 +75,19 @@ def _batched_weighted_fps(
 
     For each batch row independently:
 
-    1. Seed 0 = the **ω-weighted mean** of the attended support,
-       ``μ_1 = (Σ_j ω_j s_j) / (Σ_j ω_j)``. This is a synthesized
-       point (typically not one of the support shots) — it starts one
-       mode at the support cloud's center of mass, more stable than
-       starting at a single highest-ω shot.
-    2. For each subsequent seed, score each candidate support point
-       by ``ω_j · D_j²`` where ``D_j`` is the min distance to any
-       already-selected seed (mean for seed 1, then mean + earlier
-       picks). Pick ``argmax_j`` of the score; ties broken by index
-       and excluding already-picked points.
+    1. The first seed is the ω-weighted mean of the attended support,
+       ``μ_1 = (Σ_j ω_j s_j) / (Σ_j ω_j)``. It is a synthesized point,
+       usually not one of the support shots; starting one mode at the
+       support's center of mass is more stable than starting at the
+       single highest-ω shot.
+    2. Each subsequent seed scores every valid, not-yet-picked support
+       point by ``ω_j · D_j²``, where ``D_j`` is the distance to the
+       nearest already-selected seed, and takes the ``argmax`` (ties go
+       to the lowest index).
 
-    Argmax is non-differentiable (the picked indices), but the
-    output coords are just gathered from ``support_xy``; gradients
-    flow through ``support_xy`` (themselves coords from the dataset,
-    typically detached) and through ``ω`` (which carries upstream
-    support-attention gradient — and is also used directly for the
-    weighted-mean seed 0).
+    The picked indices are non-differentiable; the picked seeds are
+    gathered from ``support_xy``. Gradient reaches ``ω`` through the
+    weighted-mean seed.
 
     Returns ``(B, K, 2)`` seed coordinates.
     """
@@ -120,11 +96,11 @@ def _batched_weighted_fps(
         raise ValueError(f"requested K={k} seeds but only M={m} support points available")
     device = support_xy.device
 
-    # Seed 0: weighted mean of attended support. ω is already masked
-    # to zero on invalid rows by the caller, but we still clamp the
-    # denominator for cold-start rows (all ω=0) so the division is
-    # finite. Cold-start seed 0 = (0, 0), which is meaningless but
-    # finite; the trainer's log-lik floor overrides those rows.
+    # First seed: weighted mean of attended support. ω is already masked
+    # to zero on invalid entries by the caller; the denominator is still
+    # clamped for cold-start rows (all ω = 0) so the division is finite.
+    # Their seed is (0, 0), meaningless but finite; the caller's log-lik
+    # floor overrides those rows.
     omega_sum = omega.sum(dim=-1, keepdim=True).clamp_min(eps)  # (B, 1)
     seed0 = (omega.unsqueeze(-1) * support_xy).sum(dim=-2) / omega_sum  # (B, 2)
     seed_xy = seed0.unsqueeze(1)  # (B, 1, 2)
@@ -162,21 +138,23 @@ class _SoftKMeansHyperparams:
 class SoftKMeansModeExtractor(nn.Module):
     """Mean-shift mode extractor over attended support.
 
-    Drop-in replacement for
-    :class:`~shotcloud.models.mode_extractor.SupportModeExtractor`:
-    same forward signature, same :class:`ModeExtractorOutputs` return.
+    Interchangeable with
+    :class:`~shotcloud.models.mode_extractor.SupportModeExtractor`: same
+    forward signature, same
+    :class:`~shotcloud.models.mode_extractor.ModeExtractorOutputs` return.
 
     Parameters
     ----------
     n_modes : int, default 6
+        Number of modes ``K``.
     n_iterations : int, default 2
         Number of mean-shift refinement steps after the FPS init.
     kernel_bandwidth_ft : float, default 5.0
         ρ — Gaussian kernel bandwidth on support distances during
         the mean-shift iterations.
-    mode_sigma_ft : float, default 2.0
-        Per-mode density bandwidth σ_k for the downstream mode-mixture
-        Gaussian (the same fixed σ as the learned-query path).
+    mode_sigma_ft : float, default 3.0
+        Per-mode density bandwidth σ_k (feet) for the downstream
+        mode-mixture Gaussian, shared with the learned-query extractor.
     context_dim, history_dim, bias_hidden_dim, use_context_correction :
         Same semantics as
         :class:`~shotcloud.models.mode_extractor.SupportModeExtractor`.
@@ -241,7 +219,12 @@ class SoftKMeansModeExtractor(nn.Module):
         context: Tensor,
         history: Tensor | None = None,
     ) -> ModeExtractorOutputs:
-        """Mean-shift extract K modes from the attended support set."""
+        """Extract ``K`` modes from the attended support set by mean shift.
+
+        Parameters and return value are as in
+        :meth:`~shotcloud.models.mode_extractor.SupportModeExtractor.forward`;
+        ``mode_attention`` holds the final responsibilities ``r_{k,j}``.
+        """
         if support_xy.dim() != 3 or support_xy.shape[-1] != 2:
             raise ValueError(f"support_xy must be (B, M, 2); got {tuple(support_xy.shape)}")
         b, m, _ = support_xy.shape
@@ -260,10 +243,10 @@ class SoftKMeansModeExtractor(nn.Module):
                 )
 
         cold_start = ~support_mask.any(dim=-1)  # (B,)
-        # ω in linear space; zero out invalid + cold-start rows so the
-        # FPS / mean-shift never sees their values. Cold-start rows
-        # still need finite seeds (we patch them after) so the forward
-        # doesn't NaN; the caller applies a log-lik floor.
+        # ω in linear space, zeroed on invalid entries so FPS and mean
+        # shift never see them. Cold-start rows still need finite seeds so
+        # the forward pass doesn't produce NaN; the caller applies a
+        # log-lik floor to them.
         omega = log_support_weights.exp()
         omega = omega.masked_fill(~support_mask, 0.0)
 
@@ -278,12 +261,11 @@ class SoftKMeansModeExtractor(nn.Module):
         )  # (B, K, 2)
 
         rho_sq = self.kernel_bandwidth_ft * self.kernel_bandwidth_ft
-        # Per the v2 normalized spec:
         # * responsibility ``r_{k,j} = softmax_k(-d²_{k,j} / (2ρ²))``
         #   so Σ_k r_{k,j} = 1 for every support point;
         # * centroid update ``μ_k = Σ_j ω_j r_{k,j} s_j / Σ_j ω_j r_{k,j}``;
         # * mode mass ``m_k = Σ_j ω_j r_{k,j}``.
-        # We compute one extra responsibility pass after the final
+        # One extra responsibility pass runs after the final
         # centroid update so ``r_kj_final`` and ``mode_mass`` reflect
         # the final ``μ``.
         r_kj_final: Tensor | None = None
@@ -294,7 +276,7 @@ class SoftKMeansModeExtractor(nn.Module):
             log_kernel = -0.5 * dist_sq / rho_sq  # (B, K, M)
             log_r = log_kernel - torch.logsumexp(log_kernel, dim=1, keepdim=True)  # (B, K, M)
             r_kj = log_r.exp()  # (B, K, M); Σ_k r_kj == 1 per support point.
-            # Mask out invalid support contributions. We do this AFTER
+            # Mask out invalid support contributions. This happens AFTER
             # the softmax so the normalization is over the full mode
             # set; invalid points then simply contribute 0 mass.
             r_kj = r_kj.masked_fill(~support_mask.unsqueeze(1), 0.0)
@@ -305,9 +287,9 @@ class SoftKMeansModeExtractor(nn.Module):
                 mu = (weighted.unsqueeze(-1) * support_xy.unsqueeze(1)).sum(dim=-2) / denom
         assert r_kj_final is not None
 
-        # Mode mass is the ω-weighted assignment, NOT the raw r sum
-        # (which under the new normalization would equal "# valid
-        # support points / K" — a useless constant).
+        # Mode mass is the ω-weighted assignment, not the raw r sum: since
+        # Σ_k r_{k,j} = 1, the raw sums total the number of valid support
+        # points and carry no evidence weighting.
         mode_mass = (omega.unsqueeze(1) * r_kj_final).sum(dim=-1)  # (B, K)
         if cold_start.any():
             mode_mass = mode_mass.clone()

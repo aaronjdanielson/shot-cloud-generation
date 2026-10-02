@@ -1,17 +1,13 @@
 """Within-game causal shot-history features ``h_{n,r}``.
 
-The collaborative spatial prior ``q_p^{collab}`` captures the
-target player's **long-run** geometry — recent seasons, retrieval
-analogues, snapshot-bin context. Per the paper §3.5 spec the residual
-decoder is
-
-.. math::
-
-    r_\\theta(c) = u_\\theta(x_n, h_{n,r}, \\tau_{n,r})^\\top v_c,
-
-where :math:`h_{n,r}` is a summary of shots **already taken earlier
-in the current game** by the target player. This module builds that
-summary as a fixed-dimensional per-shot feature vector:
+The collaborative support of the spatial factor captures the target
+player's **long-run** geometry: their own past shots and those of
+retrieved analogues. The within-game history :math:`h_{n,r}` instead
+summarizes the shots the player has **already taken earlier in the
+current game**, and can be fed to the residual-tilt encoder
+:class:`~shotcloud.models.context_residual.ContextResidualEncoder`
+alongside the context :math:`x_n`. This module builds that summary as a
+fixed-dimensional per-shot vector:
 
 ============= ====== ============================================
 slot          name   description
@@ -28,13 +24,16 @@ slot          name   description
 9 ``mask_has_history`` 1 if ``n_prior > 0`` else 0
 ============= ====== ============================================
 
-For a shot that is the **first** shot of its (player, game), all
-features default to zero — including the mask slot (which lets the
-residual MLP gate the rest on a single flag). This is the causal
-edge case that has to be handled explicitly: the encoder shouldn't
-read meaningful means / fractions out of an empty history.
+For the **first** shot of a (player, game) every slot is zero,
+including ``mask_has_history``, so the encoder can tell an empty history
+from one whose means and fractions happen to be zero.
 
-The featurizer is causal by construction: for shot ``i`` in a
+:func:`compute_within_game_sequence` provides the same history as a
+padded per-shot sequence for
+:class:`~shotcloud.models.within_game_gru.WithinGameGRU`, an alternative
+encoder of the within-game history evaluated as an ablation.
+
+Both featurizers are causal by construction: for shot ``i`` in a
 ``(player, game)`` group, only shots strictly before ``i`` in the
 group's chronological order contribute. Ties on ``time_remaining_sec``
 break by the original DataFrame row order (stable sort).
@@ -50,22 +49,21 @@ from numpy.typing import NDArray
 
 from shotcloud.data.zones import zone_from_xy_vectorized
 
-#: Number of within-game-history feature slots. Keep this synchronized
-#: with the constructor + tests for
-#: :class:`shotcloud.models.context_residual.ContextResidualEncoder`.
+#: Number of within-game-history feature slots; pass as ``within_game_dim``
+#: to :class:`shotcloud.models.context_residual.ContextResidualEncoder`.
 WITHIN_GAME_DIM: Final[int] = 10
 
-#: Per-prior-shot feature dimension for the G1 within-game shot GRU.
+#: Per-prior-shot feature dimension of :func:`compute_within_game_sequence`.
 #: Slots: [x_norm, y_norm, zone_id_norm, distance_norm, dt_min_norm, period_norm].
 WITHIN_GAME_SEQ_DIM: Final[int] = 6
 
-#: Max number of prior-shot positions retained per shot for the GRU.
-#: Excess prior shots are truncated (oldest dropped); player-games with
-#: more than this number of attempts are uncommon in NBA data.
+#: Maximum number of prior shots retained per shot in the sequence form.
+#: Older shots beyond the cap are dropped; player-games with more
+#: attempts than this are rare.
 MAX_PRIOR_SHOTS: Final[int] = 40
 
-# Normalization constants used in the per-prior-shot feature vector.
-# These match the operating range of the corresponding raw features.
+# Normalization constants for the per-prior-shot feature vector, matched
+# to the operating range of each raw feature.
 _X_NORM: Final[float] = 25.0  # half-court x extent (ft)
 _Y_NORM: Final[float] = 47.0  # half-court y extent (ft)
 _ZONE_NORM: Final[float] = 8.0  # number of zones — divides zone_id to [0, 1)
@@ -87,7 +85,7 @@ WITHIN_GAME_SLOT_NAMES: Final[tuple[str, ...]] = (
     "mask_has_history",
 )
 
-# Zone-id sets derived from src/shotcloud/data/zones.py (ZONE_NAMES).
+# Zone-id sets, indexed as in shotcloud.data.zones.ZONE_NAMES.
 _RIM_ZONES: Final[set[int]] = {0, 1}  # RA, Paint
 _MID_ZONES: Final[set[int]] = {2}  # Midrange
 _CORNER_ZONES: Final[set[int]] = {3, 4}  # Corner3-L, Corner3-R
@@ -100,22 +98,26 @@ _DT_CAP_MIN: Final[float] = 12.0  # cap for dt_prev_min so a halftime gap doesn'
 def compute_within_game_features(
     shots_df: pd.DataFrame,
 ) -> NDArray[np.float32]:
-    """Per-shot within-game history features in the input row order.
+    """Compute the per-shot within-game history features.
 
     Parameters
     ----------
     shots_df : DataFrame
         Must carry ``x``, ``y``, ``player_id``, ``game_id``,
-        ``time_remaining_sec`` (the loader's column; despite the name
-        this is **elapsed** seconds in the game, not remaining; see
-        :func:`shotcloud.data.loaders.load_shots`).
+        ``time_remaining_sec`` (despite the name, **elapsed** seconds
+        in the game; see :func:`shotcloud.data.loaders.load_shots`).
 
     Returns
     -------
     NDArray of shape ``(n_shots, WITHIN_GAME_DIM)`` float32
-        Per-shot feature vector aligned to ``shots_df.index`` order.
-        First shots in a player-game group get an all-zero vector
-        (including the ``mask_has_history`` slot).
+        Per-shot feature vectors in the input row order. First shots
+        in a player-game group get an all-zero vector (including the
+        ``mask_has_history`` slot).
+
+    Raises
+    ------
+    KeyError
+        If a required column is missing.
     """
     required = ("x", "y", "player_id", "game_id", "time_remaining_sec")
     for col in required:
@@ -127,8 +129,8 @@ def compute_within_game_features(
         return np.zeros((0, WITHIN_GAME_DIM), dtype=np.float32)
 
     # Stable sort by (player_id, game_id, time_remaining_sec) so each
-    # group is in chronological order. We capture the original row
-    # position to scatter the per-group output back at the end.
+    # group is in chronological order; the original row position is kept
+    # to scatter the per-group output back at the end.
     work = shots_df.reset_index(drop=True).copy()
     work["_row"] = np.arange(n, dtype=np.int64)
     work_sorted = work.sort_values(
@@ -140,7 +142,7 @@ def compute_within_game_features(
     t_sec = work_sorted["time_remaining_sec"].to_numpy(dtype=np.float64)
     zone = zone_from_xy_vectorized(x_arr, y_arr)
     row = work_sorted["_row"].to_numpy(dtype=np.int64)
-    # One-hot zone membership over the four masks we'll prefix-sum.
+    # Zone-membership indicators for the four prefix-summed masks.
     is_rim = np.isin(zone, list(_RIM_ZONES)).astype(np.float64)
     is_mid = np.isin(zone, list(_MID_ZONES)).astype(np.float64)
     is_corner = np.isin(zone, list(_CORNER_ZONES)).astype(np.float64)
@@ -216,26 +218,40 @@ def compute_within_game_features(
 def compute_within_game_sequence(
     shots_df: pd.DataFrame,
 ) -> tuple[NDArray[np.float32], NDArray[np.int64]]:
-    """Per-shot causal prior-shot sequence for the G1 within-game GRU.
+    """Compute the per-shot causal prior-shot sequence.
+
+    Parameters
+    ----------
+    shots_df : DataFrame
+        Must carry ``x``, ``y``, ``player_id``, ``game_id``,
+        ``time_remaining_sec`` (elapsed game seconds).
 
     Returns
     -------
     prior_seq : NDArray of shape ``(n_shots, MAX_PRIOR_SHOTS, WITHIN_GAME_SEQ_DIM)``
-        For each shot ``i``, ``prior_seq[i, k, :]`` holds the feature vector
-        of the ``k``-th most recent prior shot of the same player-game,
-        ordered chronologically (oldest first). Slots:
+        For each shot ``i``, ``prior_seq[i, :L_i, :]`` holds the feature
+        vectors of its ``L_i`` most recent prior shots in the same
+        player-game, in chronological order (oldest first). Slots:
         ``[x/_X_NORM, y/_Y_NORM, zone_id/_ZONE_NORM, distance/_DIST_NORM,
-        dt_prev_min/_DT_NORM, period/_PERIOD_NORM]``. Padding rows past
-        the prior count are zero-filled.
+        dt_prev_min/_DT_NORM, period/_PERIOD_NORM]``, with distance
+        clipped to ``[0, 2]`` after normalization and ``dt_prev_min``
+        capped at 12 minutes. Padding rows past ``L_i`` are zero-filled.
     prior_lengths : NDArray of shape ``(n_shots,)`` int64
-        Number of valid prior shots per row (i.e., the GRU sequence length).
-        Capped at :data:`MAX_PRIOR_SHOTS`; the first shot of each
-        player-game gets length 0 and an all-zero prior_seq row.
+        Number of valid prior shots ``L_i`` per row, capped at
+        :data:`MAX_PRIOR_SHOTS`; the first shot of each player-game gets
+        length 0 and an all-zero ``prior_seq`` row.
 
-    Causal by construction: only shots strictly before shot ``i`` within
-    its ``(player, game)`` group contribute. Sort order matches
-    :func:`compute_within_game_features` so the two outputs index the
-    same row positions.
+    Raises
+    ------
+    KeyError
+        If a required column is missing.
+
+    Notes
+    -----
+    Only shots strictly before shot ``i`` within its ``(player, game)``
+    group contribute. The within-group order matches
+    :func:`compute_within_game_features`, and both outputs are in input
+    row order.
     """
     required = ("x", "y", "player_id", "game_id", "time_remaining_sec")
     for col in required:
@@ -260,7 +276,7 @@ def compute_within_game_sequence(
     t_sec = work_sorted["time_remaining_sec"].to_numpy(dtype=np.float64)
     zone = zone_from_xy_vectorized(x_arr, y_arr).astype(np.float64)
     row = work_sorted["_row"].to_numpy(dtype=np.int64)
-    # Distance to rim and period are derivable from the existing cols.
+    # Distance to the rim, and period assuming 12-minute periods.
     dist = np.sqrt(x_arr**2 + y_arr**2)
     period = (t_sec // (12 * 60)).astype(np.float64) + 1.0  # 1..N
 

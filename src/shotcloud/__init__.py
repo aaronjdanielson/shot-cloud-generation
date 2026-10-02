@@ -1,24 +1,23 @@
-"""shotcloud — Adaptive Archetypal KDE for marked point processes on basketball shot clouds.
+"""shotcloud: Adaptive Collaborative KDE for forecasting NBA player-game shot clouds.
 
-Public API for the consolidated AA-KDE model. See
-:doc:`paper/shot_cloud.tex` for the model description and
-:doc:`docs/code_inventory.md` for the inventory of essential vs.
-legacy modules.
+Each player-game is modeled as a marked point process factored into a shot
+count (:class:`NegBinCountHead`), shot timing (:class:`TimingSoftmaxHead`),
+and spatial location. The spatial factor is the Adaptive Collaborative KDE
+(AC-KDE): a continuous kernel mixture over causal support shots, the
+player's own past shots plus pooled shots from analogue players,
+implemented by
+:class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial`.
+The factors are trained by :func:`train_gibbs` on a
+:class:`GibbsShotDataset`, optionally with a pretrained, frozen count
+head.
 
-Two legacy buckets:
-
-* :mod:`shotcloud.legacy` — pre-AA-KDE-pivot classes
-  (``KDEProduct``, ``LearnableTemperature``,
-  ``LearnableKDEProductWeights``, ``PlayerEmbeddingEncoder``,
-  ``PlayerPositionEncoder``).
-* :mod:`shotcloud.legacy_pivot` — pre-Gibbs-trainer classes
-  (``DefensiveKDE``, ``LearnableDefensiveScale``,
-  ``ConstantRateTimingModel``, ``TimingModel``, ``ShotCloud``,
-  ``ShotCloudProcess``, ``ShotSequence``, ``ShotCellDataset``,
-  ``train_decoder``, ``TrainHistory``, ``DecoderCheckpoint``).
-
-Neither is surfaced at the top level. Import from the legacy
-package directly when needed.
+The top-level namespace re-exports the data loader, court grid, KDE
+engines, learned heads, and trainer. Deprecated components are kept for
+reproducibility and are not re-exported here; import them from
+:mod:`shotcloud.legacy` (static KDE product, learnable temperature and
+weights, player-identity encoders) or :mod:`shotcloud.legacy_pivot`
+(grid-cell Gibbs decoder, Wasserstein archetypes, and their training and
+evaluation harness).
 """
 
 from __future__ import annotations

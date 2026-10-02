@@ -1,31 +1,27 @@
-"""Per-shot causal starter-conditioned on-court bin feature.
+"""Per-shot causal on-court presence feature.
 
-The standard 27-dim ``x_n`` carries starter status and total
-minutes-played but not the per-minute on-court distribution that
-captures *when in the game* a player is typically on court. The
-2026-06-07 audit (Phase 3.4) identified this as the binding pregame
-limitation for the timing factor.
+The 27-dimensional context vector ``x_n`` carries starter status and
+minutes played but not *when* in the game a player is typically on
+court. This module supplies that feature for the timing factor: a
+30-bin curve giving, for each 2-minute bin of elapsed game time, the
+expected fraction of the bin the player spends on court.
 
-This module supplies the missing feature, computed honestly:
+* **Per-game source.** The per-(game, player) on-court table produced
+  by ``scripts/build_oncourt_table.py``. Each row is
+  ``(game_id, game_date, player_id, starter, bin_0..bin_{N-1})``, with
+  ``bin_b`` the fraction of the bin's 120 seconds the player was on
+  court, derived from play-by-play lineup tracking.
+* **Causal lookup.** For a shot on date $D$ by player $p$ with starter
+  status $s$, the prior set is the player's games strictly before $D$
+  with the same starter status. Same-day games are excluded, since a
+  same-day game is the shot's own game.
+* **Smoothing.** A frozen :class:`~shotcloud.models.presence.PresenceModel`
+  maps the prior set to the output curve, gating between the player's
+  own history and a learned position-by-starter pool; rows with no
+  prior games fall back to the pool.
 
-* **Per-game source:** the per-(game, player) on-court table produced
-  by :mod:`scripts.build_oncourt_table`. Each row is
-  ``(game_id, game_date, player_id, starter, bin_0..bin_{N_BINS-1})``
-  with ``bin_b`` the fraction of the 2-minute bin's 120 seconds the
-  player was on court (derived from PBP lineup walks).
-* **Per-shot causal lookup:** for a shot at date $D$ by player $p$
-  with starter status $s$, aggregate (mean) the bin vectors over the
-  player's games **strictly before** $D$ with the same starter
-  status. Same-day games are excluded — same-day shots are the same
-  game and cannot inform each other.
-* **Backoff chain when matching same-starter history is sparse:**
-    1. player + matching starter status (≥ ``min_games_for_player``)
-    2. player, any starter status (≥ ``min_games_for_player``)
-    3. league-mean per-bin curve over all training games (cached
-       across queries)
-
-Output: one 30-dim feature vector per shot, ready to concatenate to
-``x_n_raw`` for the timing-pretrain CLI.
+The output, one ``ON_COURT_HISTORY_DIM``-vector per shot, is appended
+to ``x_n_raw`` when training the timing head.
 """
 
 from __future__ import annotations
@@ -37,8 +33,8 @@ import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 
-#: Number of cumulative-minute bins (matches
-#: :data:`scripts.build_oncourt_table.N_BINS` and pbp's hist_minutes).
+#: Number of 2-minute on-court bins of elapsed game time (matches ``N_BINS`` in
+#: ``scripts/build_oncourt_table.py``).
 ON_COURT_HISTORY_DIM: Final[int] = 30
 
 #: Bin width in seconds.
@@ -50,7 +46,21 @@ _BIN_COLS: Final[tuple[str, ...]] = tuple(f"bin_{b}" for b in range(ON_COURT_HIS
 def load_on_court_table(path: str | Path) -> pd.DataFrame:
     """Load the per-(game, player) on-court table.
 
-    Validates required columns and bin count.
+    Parameters
+    ----------
+    path : str or Path
+        CSV produced by ``scripts/build_oncourt_table.py``.
+
+    Returns
+    -------
+    DataFrame
+        The table, with ``game_date`` parsed to datetime.
+
+    Raises
+    ------
+    ValueError
+        If any identifier column or any of the ``ON_COURT_HISTORY_DIM``
+        bin columns is missing.
     """
     df = pd.read_csv(path, parse_dates=["game_date"])
     required = ("game_id", "game_date", "player_id", "starter", *_BIN_COLS)
@@ -61,7 +71,7 @@ def load_on_court_table(path: str | Path) -> pd.DataFrame:
 
 
 def _global_mean_bins(table: pd.DataFrame) -> NDArray[np.float32]:
-    """League-mean bin vector — fallback for cold-start players."""
+    """League-mean bin vector over all rows of ``table``."""
     arr: NDArray[np.float32] = table[list(_BIN_COLS)].mean(axis=0).to_numpy(dtype=np.float32)
     return arr
 
@@ -74,33 +84,33 @@ def compute_player_on_court_features(
     *,
     chunk_size: int = 2048,
 ) -> NDArray[np.float32]:
-    """Per-shot causal starter-conditioned on-court bin feature, computed
-    via a frozen :class:`~shotcloud.models.PresenceModel`.
+    """Compute the per-shot on-court feature with a frozen presence model.
 
-    For each shot $(p, d, s)$ this builds the strictly-prior, matching-
-    starter prior set from ``table``, then queries
+    For each shot $(p, d, s)$ this builds the strictly prior,
+    matching-starter set of games from ``table``, then queries
     ``presence_model(prior_bins, prior_ages_days, prior_mask,
     position_idx, starter_idx, history_count)`` to get the 30-bin
-    on-court fraction. Backoff is built into the gate / pool combination
-    rather than into an explicit chain: cold-start rows (history_count
-    = 0) automatically fall back to the learned position-starter pool.
+    on-court fraction. Backoff is handled by the model's gate rather
+    than an explicit chain: rows with no prior games
+    (``history_count = 0``) fall back to the learned position-starter
+    pool.
 
     Parameters
     ----------
     shots_df : DataFrame
         Must carry ``player_id``, ``date``, and ``starter``. When
-        ``starter`` is missing we fall back to all-bench.
+        ``starter`` is missing, every shot is treated as a bench shot.
     table : DataFrame
         Output of :func:`load_on_court_table`. Provides per-(game,
         player) on-court vectors that feed the model's self-curve.
     presence_model : PresenceModel
-        Frozen, ``eval()``-mode model. Must expose the canonical
-        forward signature ``forward(prior_bins, prior_ages_days,
-        prior_mask, position_idx, starter_idx, history_count)``.
+        Trained model; it is put in ``eval()`` mode and run without
+        gradients. Must expose the forward signature
+        ``forward(prior_bins, prior_ages_days, prior_mask, position_idx,
+        starter_idx, history_count)``.
     player_to_position : dict[int, int]
         ``{player_id: position_idx}`` where ``position_idx`` is in
-        ``[0, n_positions)``. Unknown players default to position 0
-        (guard / shotcloud fallback).
+        ``[0, n_positions)``. Unknown players default to position 0.
     chunk_size : int, default 2048
         Batch size for the model forward; tunes memory/throughput.
 
@@ -177,9 +187,7 @@ def compute_player_on_court_features(
         bins_pad = np.zeros((b, k_max, ON_COURT_HISTORY_DIM), dtype=np.float32)
         ages_pad = np.zeros((b, k_max), dtype=np.float32)
         mask_pad = np.zeros((b, k_max), dtype=np.float32)
-        for j, (bins_j, ages_j) in enumerate(
-            zip(chunk_prior_bins, chunk_prior_ages, strict=False)
-        ):
+        for j, (bins_j, ages_j) in enumerate(zip(chunk_prior_bins, chunk_prior_ages, strict=False)):
             k_j = bins_j.shape[0]
             if k_j > 0:
                 bins_pad[j, :k_j] = bins_j
@@ -205,9 +213,12 @@ def compute_player_on_court_features(
 
 
 def league_mean_curve(table: pd.DataFrame) -> NDArray[np.float32]:
-    """League-mean bin vector exposed for callers that need a static
-    fallback (e.g. when no PresenceModel is wired but the timing
-    head still expects a 30-dim feature)."""
+    """Return the league-mean on-court curve over all rows of ``table``.
+
+    A static fallback for callers that need an ``ON_COURT_HISTORY_DIM``
+    feature without a presence model. The mean is taken over every row,
+    so it is causal only when ``table`` is restricted to training games.
+    """
     return _global_mean_bins(table)
 
 

@@ -9,19 +9,15 @@ The U-statistic estimator of the 2-sample energy distance:
       - \\frac{1}{m(m-1)}\\sum_{i\\ne i'}\\|x_i - x_{i'}\\|
       - \\frac{1}{n(n-1)}\\sum_{j\\ne j'}\\|y_j - y_{j'}\\|
 
-with the Euclidean norm in :math:`\\mathbb R^2`. We report the raw
-energy (no square root) in feet, matching :func:`sliced_wasserstein`.
+with the Euclidean norm in :math:`\\mathbb R^2`. The raw energy (no
+square root) is reported, in feet, matching
+:func:`~shotcloud.evaluation.wasserstein.sliced_wasserstein`.
 
-**Bias note** (audit fix H1, 2026-06-10). The previous implementation
-used the V-statistic estimator — divide within-sample sums by
-:math:`m^2`, not :math:`m(m-1)` — which underestimates within-sample
-mean pairwise distance by a factor of :math:`(m-1)/m`, biasing the
-energy distance *upward* by :math:`O(1/m)`. At :math:`K_{\\mathrm{obs}}
-\\approx 10\\text{--}25`, that was a 4--10% upward bias on absolute
-numbers. The bias cancels in paired-bootstrap deltas with matched
-:math:`K_{\\mathrm{obs}}`, so cross-model rankings (Table 8) were not
-affected, but Table 5 absolute numbers and Fig 4's self-bootstrap floor
-were systematically inflated.
+The U-statistic is used rather than the V-statistic, which divides the
+within-sample sums by :math:`m^2` instead of :math:`m(m-1)`. The
+V-statistic underestimates the within-sample mean pairwise distance by
+a factor of :math:`(m-1)/m` and so biases the energy distance upward by
+:math:`O(1/m)`, which is material for clouds of 10--25 shots.
 
 Properties of the U-statistic estimator:
 
@@ -76,14 +72,15 @@ def energy_distance(
     Parameters
     ----------
     x : array of shape ``(m, 2)``
+        First point cloud, in feet.
     y : array of shape ``(n, 2)``
+        Second point cloud, in feet.
     clamp_nonneg : bool, default False
-        If True, clamp small-sample negative values to 0 (display-only;
-        the U-statistic can dip slightly below 0 when the two samples
-        are from the same distribution, or are literally the same array).
-        The 2026-06-10 audit (H1) flipped this default to ``False`` so
-        downstream callers receive the raw estimator and cannot
-        accidentally introduce a one-sided bias.
+        If True, clamp small-sample negative values to 0. The
+        U-statistic can dip slightly below 0 when the two samples come
+        from the same distribution or are the same array. Clamping
+        introduces a one-sided bias, so it is intended for display only;
+        the default returns the raw, unbiased estimate.
 
     Returns
     -------
@@ -92,6 +89,11 @@ def energy_distance(
         either input is empty, or if a within-sample term cannot be
         formed (m ≤ 1 or n ≤ 1) — those degenerate cases have no
         unbiased estimate.
+
+    Raises
+    ------
+    ValueError
+        If a non-empty input does not have shape ``(·, 2)``.
     """
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
@@ -103,9 +105,7 @@ def energy_distance(
         raise ValueError(f"y must have shape (n, 2); got {y.shape}")
     m, n = x.shape[0], y.shape[0]
     if m < 2 or n < 2:
-        # U-statistic within-sample term is undefined; can't form an
-        # unbiased estimator with a single point. Caller-aware code
-        # should filter these cases out upstream.
+        # The within-sample U-statistic needs at least two points.
         return float("nan")
 
     cross = _cross_mean_pairwise(x, y)

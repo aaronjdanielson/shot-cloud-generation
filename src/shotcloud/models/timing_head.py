@@ -1,4 +1,4 @@
-"""48-bin softmax timing head ``ρ_η(t | x_n)`` (paper §5).
+"""48-bin softmax timing head ``ρ_η(t | x_n)``.
 
 Models per-shot timing as a categorical distribution over a fixed
 discretization of game time
@@ -16,22 +16,19 @@ with two factors:
 * **Context-dependent residual** :math:`b_\\eta(t, x_n) \\in
   \\mathbb R^{n_{\\mathrm{bins}}}` — a small MLP that lets the
   distribution shift with starter status, role, recent usage, etc.
-  The starter / minutes / quarter-usage signals enter through
-  :math:`x_n` rather than as separately-engineered modules; the MLP
-  is a universal approximator over any subset of those features at
-  the chosen capacity.
+  These signals enter through :math:`x_n` rather than through
+  separately engineered modules.
 
 **Zero-init invariant.** The residual MLP's final layer is
 zero-initialized by default (``zero_init_residual=True``), so at
-step 0 the timing distribution is exactly :math:`\\mathrm{softmax}(a(t))` —
-the baseline alone. Together with :math:`a(t) = \\mathbf 0` (also the
-default), the head starts as the uniform distribution over bins. The
-trainer then learns first the baseline pacing, then the contextual
-deformation.
+initialization the timing distribution is exactly
+:math:`\\mathrm{softmax}(a(t))`, the baseline alone. Since
+:math:`a(t) = \\mathbf 0` initially as well, the head starts as the
+uniform distribution over bins.
 
-48 bins corresponds to the standard NBA convention of one bin per
-game minute (4 quarters × 12 minutes). Override ``n_bins`` for
-different temporal resolutions (e.g. quarter-only, half-minute).
+The default 48 bins give one bin per minute of regulation
+(4 quarters × 12 minutes). Override ``n_bins`` for other temporal
+resolutions (e.g. quarter-only, half-minute).
 """
 
 from __future__ import annotations
@@ -45,7 +42,7 @@ from shotcloud.data.context import CONTEXT_DIM
 
 
 class TimingSoftmaxHead(nn.Module):
-    """Discrete-bin softmax timing head ``ρ_η(t | x_n)`` (paper §5).
+    """Discrete-bin softmax timing head ``ρ_η(t | x_n)``.
 
     Parameters
     ----------
@@ -55,13 +52,14 @@ class TimingSoftmaxHead(nn.Module):
     context_dim : int, default :data:`CONTEXT_DIM` (27)
         Input dimension of the learned context vector.
     hidden_dim : int, default 32
-        Hidden width of the residual MLP. Same capacity discipline as
-        :class:`ContextResidualEncoder` and :class:`NegBinCountHead`.
+        Hidden width of the residual MLP, kept small like
+        :class:`~shotcloud.models.ContextResidualEncoder` and
+        :class:`~shotcloud.models.NegBinCountHead`.
     zero_init_residual : bool, default True
-        If True, the residual MLP's final layer (weight + bias) is
-        zero-initialized so timing starts as ``softmax(a(t))`` at
-        step 0. Set False only if you specifically want a random
-        residual at init.
+        If True, the residual MLP's final layer (weight and bias) is
+        zero-initialized so timing starts as ``softmax(a(t))``. If
+        False, the final weights are drawn from a normal distribution
+        with standard deviation ``1 / sqrt(n_bins)``.
     """
 
     def __init__(
@@ -93,11 +91,10 @@ class TimingSoftmaxHead(nn.Module):
         nn.init.kaiming_uniform_(self.fc1.weight, a=math.sqrt(5))
         nn.init.zeros_(self.fc1.bias)
         if zero_init_residual:
-            # Zero-init the residual at step 0 so the timing
-            # distribution begins as softmax(a(t)). Avoids the
-            # dual-zero saddle automatically because a(t) is also
-            # zero-init: ∂L/∂a(t) flows directly from the softmax
-            # cross-entropy regardless of what fc2 is doing.
+            # Zero-init the residual so the timing distribution begins as
+            # softmax(a(t)). There is no zero saddle: ∂L/∂a(t) comes
+            # directly from the softmax cross-entropy, and fc2.weight
+            # receives a gradient through the nonzero hidden activations.
             nn.init.zeros_(self.fc2.weight)
             nn.init.zeros_(self.fc2.bias)
         else:
@@ -110,10 +107,13 @@ class TimingSoftmaxHead(nn.Module):
         Parameters
         ----------
         x_n : Tensor of shape ``(B, context_dim)``
+            Learned context vector.
 
         Returns
         -------
-        Tensor of shape ``(B, n_bins)`` summing to 0 in exp-space row-wise.
+        Tensor of shape ``(B, n_bins)``
+            Log-probabilities; each row exponentiates to a distribution
+            summing to 1.
         """
         if x_n.dim() != 2 or x_n.shape[1] != self.context_dim:
             raise ValueError(
@@ -132,10 +132,11 @@ class TimingSoftmaxHead(nn.Module):
         t_bin : Tensor of integer dtype, shape ``(B,)``
             Per-row timing-bin index in ``[0, n_bins)``.
         x_n : Tensor of float, shape ``(B, context_dim)``
+            Learned context vector.
 
         Returns
         -------
-        Tensor of float, shape ``(B,)``.
+        Tensor of float, shape ``(B,)``
         """
         if t_bin.dim() != 1 or t_bin.shape[0] != x_n.shape[0]:
             raise ValueError(

@@ -1,8 +1,11 @@
 """Wasserstein distances for shot-cloud comparison.
 
-Sliced Wasserstein-1 estimator (random 1D projections) following the
-[shot_flow convention](/Users/aarondanielson/Dropbox/shot_flow/src/shot_flow/evaluation/metrics.py).
-Quantile-matching handles unequal sample sizes without losing information.
+Provides a 1-D Wasserstein-1 distance between empirical samples, a
+sliced Wasserstein-1 estimator for 2-D point clouds (averaged over random
+1-D projections), and a sliced variant for probability vectors on a
+shared grid of cells. The point-cloud estimator follows the convention of
+the companion ``shot_flow`` project so that results are comparable;
+quantile matching handles unequal sample sizes.
 """
 
 from __future__ import annotations
@@ -41,8 +44,9 @@ def sliced_wasserstein(
 ) -> float:
     """Approximate 2D Wasserstein-1 between two shot-location point clouds.
 
-    Algorithm: draw ``n_projections`` random unit vectors in :math:`\\mathbb R^2`,
-    project both clouds to 1D, compute :func:`wasserstein_1d`, and average.
+    Draws ``n_projections`` random unit vectors in :math:`\\mathbb R^2`,
+    projects both clouds onto each, and averages :func:`wasserstein_1d`
+    over the projections.
 
     Parameters
     ----------
@@ -60,6 +64,11 @@ def sliced_wasserstein(
     float
         Approximated W1 in feet (the units of ``p_shots`` / ``q_shots``).
         ``nan`` when either input is empty.
+
+    Raises
+    ------
+    ValueError
+        If a non-empty input does not have shape ``(·, 2)``.
     """
     p = np.asarray(p_shots, dtype=np.float64)
     q = np.asarray(q_shots, dtype=np.float64)
@@ -91,8 +100,8 @@ def sliced_wasserstein_grid(
     """Sliced Wasserstein-1 between two simplex-valued grid distributions.
 
     Both inputs are probability distributions over a shared discrete
-    support of cells with known 2D centers — the natural form of an
-    archetype surface. For each random unit direction :math:`d`, project
+    support of cells with known 2D centers, such as grid densities. For
+    each random unit direction :math:`d`, project
     cell centers onto :math:`d` to get a 1D support, then compute the
     weighted 1D Earth Mover's distance between :math:`(s, a)` and
     :math:`(s, b)` along the projected support. Average over
@@ -105,20 +114,27 @@ def sliced_wasserstein_grid(
         exactly 1 — both are renormalized internally so the function
         is robust to small numerical drift in the simplex constraint.
     cell_centers : array of shape ``(C, 2)``
-        2D Cartesian center of each cell, in feet (the same units the
-        downstream consumer reasons in).
+        2D Cartesian center of each cell, in feet.
     n_projections : int, default 50
         Number of random 1D slices to average. Lower than the point-cloud
-        variant because the per-projection cost is O(C log C) and we
-        invoke this O(K^2) times per anchor for the diagnostic matrix.
+        default because each projection costs O(C log C) and the
+        function is typically called for every pair in a set of grid
+        densities.
     seed : int, default 0
         RNG seed.
 
     Returns
     -------
     float
-        Approximate sliced-W1 distance in feet. Always non-negative;
-        zero iff ``a == b`` after renormalization.
+        Approximate sliced-W1 distance in feet; non-negative, and zero
+        when ``a == b`` after renormalization. ``nan`` if either input
+        has non-positive total mass.
+
+    Raises
+    ------
+    ValueError
+        If ``a`` and ``b`` differ in shape, are not 1-D, or do not match
+        ``cell_centers``.
     """
     from scipy.stats import wasserstein_distance
 

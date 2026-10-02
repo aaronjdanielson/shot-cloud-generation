@@ -1,14 +1,13 @@
 """History-dependent own-vs-pooled mixing gate.
 
-The collaborative KDE assembles a support set of the target
-player's own historical shots plus *pooled* shots from other
-players. An unconstrained joint softmax over that support
-empirically collapses to a near-constant pooled-mass fraction
-(~0.80) regardless of how much own history a player has --- the
-attention never learns to trust own history more as it accumulates.
+The AC-KDE support set combines the target player's own causal shots
+with *pooled* shots from analogue players. Under a single joint softmax
+over that support, the share of mass on own history is whatever the
+support logits happen to produce, with nothing tying it to how much
+own history the player has.
 
-The :class:`PoolingGate` breaks that pathology structurally. The
-spatial density is re-parameterized as a two-component mixture
+:class:`PoolingGate` makes that dependence explicit. The spatial
+density is a two-component mixture
 
 .. math::
 
@@ -17,12 +16,11 @@ spatial density is re-parameterized as a two-component mixture
 
 with ``f_own`` and ``f_pooled`` each normalized within their own
 support subset, and the mixing weight ``λ`` produced by this gate
-as a function of the player's causal own-history count --- *not*
-of the support logits. Parameterizing ``λ`` from history forbids
-the collapse: the gate cannot route own-mass through whatever the
-logits happen to produce.
+as a function of the player's causal own-history volume, *not* of
+the support logits, so mass cannot shift between the subsets through
+the logits.
 
-Parameterization (monotone in history by construction):
+Parameterization:
 
 .. math::
 
@@ -30,10 +28,12 @@ Parameterization (monotone in history by construction):
     = b_0 + \\operatorname{softplus}(b_H)\\,\\log(1+\\hat H_p(t_n))
       + g_\\theta(x_n, h_n, \\log(1 + \\text{own\\_support\\_count})).
 
-``softplus(b_H) \\ge 0`` guarantees ``λ`` is non-decreasing in the
-own-history count. ``g_θ`` is a small MLP with a zero-initialized
-final layer, so at step 0 the gate is exactly the closed-form
-history schedule set by ``(b_0, b_H)``.
+``softplus(b_H) \\ge 0`` makes ``λ`` non-decreasing in the causal
+own-history volume :math:`\\hat H_p(t_n)` with the other inputs held fixed.
+``g_θ`` is a small MLP with a zero-initialized final layer, so at
+initialization the gate equals the closed-form history schedule set by
+``(b_0, b_H)``. Rows without own support get ``λ = 0`` and rows without
+pooled support get ``λ = 1``.
 """
 
 from __future__ import annotations
@@ -51,8 +51,8 @@ DEFAULT_GATE_B0: float = -2.5
 
 #: Default pre-softplus slope ``b_H``. ``softplus(-0.20) ≈ 0.60``,
 #: giving the history schedule λ(H=25)≈0.37, λ(H=100)≈0.57,
-#: λ(H=300)≈0.71, λ(H=1000)≈0.84 --- monotone, low at cold-start,
-#: clearly past 0.70 by the dense-history regime.
+#: λ(H=300)≈0.71, λ(H=1000)≈0.84: low with little own history and
+#: above 0.7 once own history is dense.
 DEFAULT_GATE_BH_INIT: float = -0.20
 
 #: Default hidden width of the context MLP ``g_θ``.
@@ -123,13 +123,16 @@ class PoolingGate(nn.Module):
         h_n: Tensor | None = None,
         pooled_available: Tensor | None = None,
     ) -> Tensor:
-        """Mixing weight ``λ`` per row.
+        """Compute the own-support mixing weight ``λ`` per row.
 
         Parameters
         ----------
         log1p_h_hat : Tensor of shape ``(B,)``
-            ``log(1 + Ĥ_p(t_n))`` --- log of the (estimated) causal
-            own-history shot count.
+            ``log(1 + Ĥ_p(t_n))``, where ``Ĥ_p(t_n)`` measures the
+            player's causal own-history volume.
+            :class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial`
+            passes the trait ``log1p_minutes_M`` (recency-weighted causal
+            minutes).
         x_n : Tensor of shape ``(B, context_dim)``
             Learned context vector.
         own_support_count : Tensor of shape ``(B,)``
@@ -184,9 +187,11 @@ class PoolingGate(nn.Module):
         return lam
 
     def history_schedule(self, h_hat: float) -> float:
-        """Closed-form ``λ`` at own-history count ``h_hat`` with
-        ``g_θ = 0`` (the step-0 schedule). Useful for tests and for
-        documenting the initialization."""
+        """Return ``λ`` at own-history count ``h_hat`` with ``g_θ = 0``.
+
+        This is the gate's schedule at initialization, when the ``g_θ``
+        output layer is zero.
+        """
         b_h = float(self.b_h.detach())
         b0 = float(self.b0.detach())
         slope = math.log1p(math.exp(b_h))  # softplus

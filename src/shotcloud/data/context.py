@@ -1,32 +1,25 @@
-"""Canonical per-shot context vector ``x_n`` for AA-KDE.
+"""Canonical per-shot context vector ``x_n``.
 
-The :class:`ContextEncoder` is the single source of truth for ``x_n``,
-the per-shot context vector consumed by every learnable component of
-the spatial decoder (paper §3): the offensive self-relevance score,
-the archetype mixture, the defensive feasibility relevance score,
-the residual perturbation encoder, and the count and timing heads
-(paper §4).
+The :class:`ContextEncoder` is the single source of truth for the raw
+context vector ``x_n``. It is consumed by the context MLP, by the
+shooter-similarity and support-logit components of the spatial factor,
+and by the count and timing heads.
 
-**Causal Snapshot Principle (paper §2.5).** Every coordinate of
-``x_n`` either:
+**Causality.** Every coordinate of ``x_n`` is one of:
 
-1. comes from the per-shot row itself (period, time-in-period —
-   intrinsically pregame-known by virtue of being part of the
-   game's clock state at the moment the shot is taken),
-2. comes from the joined per-game row (starter, minutes — pregame
-   known via the box-score join), or
-3. is looked up from the bundle ``S(t)`` via
-   :meth:`shotcloud.data.SnapshotStore.get_snapshot` for the
-   shot's date (role profile, position mixture, opp-efficiency
-   bucket — all fit causally on shots before the bundle's anchor),
-4. is a fixed training-window normalization (date range for
-   season-recency, mean/std for minutes-z-score) — pregame-known
-   constants computed once.
+1. a field of the shot row itself: period and time in period (the
+   game-clock state at the moment of the shot) and home/away;
+2. a field of the joined per-game row: starter, minutes, and the
+   ``recent_*`` features, which use only prior games;
+3. a lookup into the snapshot bundle ``S(t)`` active at the shot's
+   date (:meth:`shotcloud.data.SnapshotStore.get_snapshot`): role
+   profile, position mixture, and opponent-efficiency bucket, all fit
+   on shots strictly before the bundle's anchor;
+4. a fixed training-window normalization constant (date range for
+   season recency, means and standard deviations for z-scores).
 
-There is no fourth category. Anyone reading this code can verify
-:meth:`ContextEncoder.transform` does not reach into a per-game row's
-future shots, into a snapshot's future, or into anything outside the
-bundle and the row.
+Nothing else enters: :meth:`ContextEncoder.transform` reads only the
+row and the bundle at or before the row's date.
 
 Layout (see :data:`FEATURE_LAYOUT`):
 
@@ -42,7 +35,7 @@ range                         dim        meaning
 ``9``                          1        recent 3PA fraction (recency-weighted, ``[0, 1]``)
 ``10``                         1        recent usage rate (recency-weighted, z-scored)
 ``11``                         1        recent FGA per game (recency-weighted, z-scored)
-``12:20``                      8        role profile (paper §3.3a)
+``12:20``                      8        role profile
 ``20:23``                      3        position mixture over (G, W, B)
 ``23:27``                      4        opponent-efficiency one-hot
 ==========================  =========  ===================================
@@ -142,12 +135,11 @@ DEFAULT_RECENT_FGA_STD: float = 5.0
 class ContextEncoder:
     """Build per-shot context vectors ``x_n`` of shape ``(N, CONTEXT_DIM)``.
 
-    The encoder is a small immutable record holding a
-    :class:`shotcloud.data.SnapshotStore` (when run in full AA-KDE
-    mode) plus four pregame-known normalization constants. Every
-    coordinate of every produced row is derivable from the input row,
-    the snapshot bundle at the row's date, or these constants. There
-    is no in-encoder learning.
+    The encoder is an immutable record holding an optional
+    :class:`shotcloud.data.SnapshotStore` plus fixed normalization
+    constants. Every coordinate of every produced row is derivable from
+    the input row, the snapshot bundle at the row's date, or these
+    constants; the encoder has no learnable parameters.
 
     Parameters
     ----------
@@ -155,15 +147,17 @@ class ContextEncoder:
         The causal feature registry. When non-None, the encoder fills
         the snapshot-derived slices (``role_profile``,
         ``position_mixture``, ``opp_efficiency_onehot``) by looking up
-        a bundle for each row's date. When None, those slices stay
-        zero; this is a transitional path for legacy callers that
-        have not yet migrated to AA-KDE. New code should always pass
-        a ``SnapshotStore``.
+        the bundle for each row's date. When None, those slices stay
+        zero (no-snapshot mode).
     date_min, date_max : np.datetime64
         Inclusive training-window bounds, used to normalize
-        ``season_recency`` to ``[0, 1]``. Pregame-known constants.
+        ``season_recency`` to ``[0, 1]``.
     minutes_mean, minutes_std : float
         Z-score normalization for the ``minutes`` field.
+    recent_usage_mean, recent_usage_std : float
+        Z-score normalization for ``recent_usage``.
+    recent_fga_mean, recent_fga_std : float
+        Z-score normalization for ``recent_fga``.
     n_train : int
         Number of training rows used at fit time (diagnostic only).
     """
@@ -194,32 +188,47 @@ class ContextEncoder:
         recent_fga_mean: float | None = None,
         recent_fga_std: float | None = None,
     ) -> ContextEncoder:
-        """Build an encoder from a snapshot store + training stats.
+        """Build an encoder from a snapshot store and training statistics.
 
-        New AA-KDE callers should pass a ``SnapshotStore`` as the
-        first argument, optionally followed by training shots from
-        which to derive normalization stats. Legacy callers may pass
-        a DataFrame as the single positional argument; the encoder
-        will run in *no-snapshot* mode (snapshot-derived slices stay
-        zero) and derive stats from the DataFrame. Both forms produce
-        a ``CONTEXT_DIM``-wide output.
+        Pass a ``SnapshotStore`` as the first argument, optionally
+        followed by training shots from which to derive normalization
+        statistics. Alternatively, pass a DataFrame as the single
+        positional argument: the encoder then runs in no-snapshot mode
+        (snapshot-derived slices stay zero) and derives statistics from
+        that frame. Both forms produce a ``CONTEXT_DIM``-wide output.
+
+        Each normalization statistic is taken from the explicit override
+        when given, else estimated from the training shots when the
+        column is present, else set to the module default. The
+        ``recent_usage`` and ``recent_fga`` statistics are estimated on
+        strictly positive values only, so zero-imputed first-game rows
+        do not bias them.
 
         Parameters
         ----------
         snapshot_store_or_shots : SnapshotStore | DataFrame
-            Either the causal feature registry or, for legacy
-            callers, the training shots frame (no snapshot lookups
-            will be performed).
+            Either the causal feature registry or the training shots
+            frame (no-snapshot mode).
         shots : DataFrame, optional
             Training shots (the same window used to build
             ``snapshot_store``); used to derive normalization stats.
-            Ignored in legacy single-arg mode.
+            Ignored in no-snapshot mode.
         date_min, date_max : datetime-like, optional
-            Override the training-window bounds.
+            Override the training-window bounds. By default they are
+            the range of the training shots' dates, or the store's first
+            and last anchor dates when no shot dates are available.
         minutes_mean, minutes_std : float, optional
             Override the minutes z-score parameters.
+        recent_usage_mean, recent_usage_std : float, optional
+            Override the ``recent_usage`` z-score parameters.
+        recent_fga_mean, recent_fga_std : float, optional
+            Override the ``recent_fga`` z-score parameters.
+
+        Returns
+        -------
+        ContextEncoder
         """
-        # Polymorphic dispatch: DataFrame as first arg → legacy mode.
+        # A DataFrame as the first argument selects no-snapshot mode.
         store: SnapshotStore | None
         if isinstance(snapshot_store_or_shots, pd.DataFrame):
             store = None
@@ -228,14 +237,14 @@ class ContextEncoder:
             store = snapshot_store_or_shots
             stat_shots = shots
 
-        # Default date span: anchor span if we have a store, else from
-        # the stat_shots frame.
+        # Fallback date span: the store's anchor span, else a fixed span
+        # used only when neither overrides nor shot dates are available.
         if store is not None:
             anchors = store.anchor_dates
             d_min = cast("np.datetime64", anchors[0])
             d_max = cast("np.datetime64", anchors[-1])
         else:
-            d_min = np.datetime64("2014-10-01", "D")  # placeholder; overridden below
+            d_min = np.datetime64("2014-10-01", "D")
             d_max = np.datetime64("2025-06-30", "D")
 
         if date_min is not None:
@@ -305,15 +314,27 @@ class ContextEncoder:
     def transform(self, df: pd.DataFrame) -> NDArray[np.float32]:
         """Compute the per-row context array, shape ``(N, CONTEXT_DIM)``.
 
-        Each row of `df` is one shot. The function looks up the
-        snapshot bundle at the row's date and pulls the role profile,
-        position mixture, and opp-efficiency bucket from it; the rest
-        comes from row-local fields with sensible fallbacks.
+        Each row of ``df`` is one shot. When a snapshot store is set,
+        the role profile, position mixture, and opponent-efficiency
+        bucket are read from the bundle active at the row's date; the
+        remaining features come from row-local fields.
 
-        Required columns (any subset; missing columns leave their
-        feature slice as zeros): ``date``, ``period``,
-        ``time_remaining_sec``, ``player_id``, ``opponent``,
-        ``starter``, ``minutes``.
+        Recognized columns: ``date``, ``period``, ``time_remaining_sec``,
+        ``starter``, ``minutes``, ``home_away``, ``recent_3pa_frac``,
+        ``recent_usage``, ``recent_fga``, ``player_id``, ``opponent``.
+        A missing column leaves its feature slice at zero. Missing
+        values are filled with fixed fallbacks (for example, the
+        training mean for z-scored fields), and players unknown to the
+        bundle get a zero role profile and a uniform position mixture.
+
+        Parameters
+        ----------
+        df : DataFrame
+            Shot rows.
+
+        Returns
+        -------
+        ndarray of float32, shape (N, CONTEXT_DIM)
 
         Raises
         ------
@@ -402,10 +423,9 @@ class ContextEncoder:
             ).to_numpy()
 
         # ------------------------------------------------------------------
-        # Snapshot lookups: bundle the rows by snapshot index, then
-        # apply per-bundle player/opp lookups. Each bundle handles its
-        # own subset of rows. Skipped entirely in legacy
-        # no-snapshot mode (snapshot_store is None).
+        # Snapshot lookups: group rows by snapshot index, then apply
+        # per-bundle player and opponent lookups. Skipped in no-snapshot
+        # mode (snapshot_store is None).
         # ------------------------------------------------------------------
         if self.snapshot_store is None or "date" not in df.columns:
             return out
@@ -429,8 +449,8 @@ class ContextEncoder:
         # Group rows by snapshot index for efficient per-bundle processing.
         anchor_dates = self.snapshot_store.anchor_dates
         snapshot_idx = np.searchsorted(anchor_dates, dates_arr, side="right") - 1
-        # snapshot_idx[i] = bundle index for shot i; >= 0 by construction
-        # (we already filtered out pre-first-anchor dates above)
+        # snapshot_idx[i] is the bundle index for shot i; it is >= 0
+        # because pre-first-anchor dates were rejected above.
 
         player_ids = (
             df["player_id"].to_numpy() if "player_id" in df.columns else np.zeros(n, dtype=np.int64)
@@ -481,11 +501,10 @@ class ContextEncoder:
 
 @dataclass(frozen=True)
 class _LegacyOppBucket:
-    """Backward-compat shim: a fitted opp-efficiency bucket map.
+    """Fitted opponent-efficiency bucket map, independent of a snapshot store.
 
-    Retained so legacy callers that don't yet have a SnapshotStore can
-    still import the module without breaking. Any new code should use
-    :class:`ContextEncoder` directly.
+    Unused by :class:`ContextEncoder`, which reads opponent buckets from
+    the snapshot bundle.
     """
 
     opp_strength_bucket: dict[str, int] = field(default_factory=dict)

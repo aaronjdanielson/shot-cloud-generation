@@ -1,8 +1,13 @@
-"""V1 surrogate Wasserstein archetype fitter (paper §A.4, ladder rung 1).
+"""Wasserstein archetype fitting under the debiased Sinkhorn divergence.
 
-This is the **V1 surrogate** form of the Wasserstein-archetypal
-objective: archetypes are reconstructed by a *linear* convex
-combination of atoms
+Deprecated; retained to reproduce the Wasserstein-archetype analyses.
+The current spatial factor,
+:class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial`,
+does not use archetypes.
+
+:func:`fit_archetypes_v1` fits the **linear surrogate** form of the
+Wasserstein-archetypal objective: player densities are reconstructed by
+a *linear* convex combination of atoms
 
 .. math::
 
@@ -20,7 +25,7 @@ Wasserstein loss
     \\frac{1}{\\sum_p w_p}\\sum_{p}\\,w_p\\;
         S_\\varepsilon\\!\\bigl(Q_p,\\;\\tilde q_p\\bigr),
 
-where :math:`w_p` are optional per-player weights (paper §A.4 uses
+where :math:`w_p` are optional per-player weights (typically
 :math:`w_p \\propto \\sqrt{N_p}`) and :math:`S_\\varepsilon` is the
 **debiased Sinkhorn divergence**
 
@@ -35,9 +40,10 @@ solution bias of the raw entropic OT cost (Feydy et al., 2019;
 Genevay et al., 2018).
 
 The full Wasserstein-barycentric form
-:math:`\\tilde q_p = B_\\varepsilon(A_{1:K}; \\rho_p)` is the V2
-ladder rung and is deferred (paper §A.4, "Practical Approximation
-Ladder").
+:math:`\\tilde q_p = B_\\varepsilon(A_{1:K}; \\rho_p)` is available
+only with frozen atoms: :func:`fit_v2_rho_given_A` optimizes the
+barycentric weights :math:`\\rho_p` for fixed :math:`A`, using
+:func:`wasserstein_barycenter_separable`.
 
 Computational note. With cost matrix
 :math:`C[(i_y,i_x),(i_y',i_x')] = (\\Delta y)^2 + (\\Delta x)^2`,
@@ -190,7 +196,7 @@ def sinkhorn_distance_separable(
     Jacobian of the Sinkhorn fixed-point map; see Cuturi 2013, Feydy
     et al. 2019), but a much cheaper engineering approximation that
     matches it asymptotically as ``n_iter`` grows past convergence.
-    For Adam on the V1 surrogate loss it works well empirically; if
+    For Adam on the linear surrogate loss it works well in practice; if
     you want exact gradients through the iteration, set this to
     ``False`` (and budget O(n_iter * batch * grid^2) more memory).
 
@@ -346,13 +352,13 @@ def sinkhorn_divergence_separable(
 
 
 # ---------------------------------------------------------------------------
-# Entropic Wasserstein barycenter (V2 reconstruction object)
+# Entropic Wasserstein barycenter (barycentric reconstruction)
 # ---------------------------------------------------------------------------
 
 #: Default Sinkhorn iterations inside the entropic barycenter solver.
 #: Larger values give a tighter barycenter but more memory under
 #: ``last_iter_with_grad=True`` autograd. Solomon et al. 2015 use 30;
-#: 20 is a good speed/quality trade for the V2 prototype.
+#: 20 is a good speed/quality trade-off for :func:`fit_v2_rho_given_A`.
 DEFAULT_BARYCENTER_ITER: int = 20
 
 
@@ -398,7 +404,7 @@ def wasserstein_barycenter_separable(
     Memory mode. ``last_iter_with_grad=True`` (default) runs all but
     the last iteration under ``torch.no_grad()`` and detaches the
     warm-started potentials, mirroring the same truncated-backprop
-    pattern that ``sinkhorn_distance_separable`` uses for V1. This
+    pattern that ``sinkhorn_distance_separable`` uses. This
     is *not* the rigorous implicit-differentiation Jacobian (which
     would require solving a linear system in the barycenter
     fixed-point map) but the standard cheap approximation that
@@ -500,7 +506,7 @@ def wasserstein_barycenter_separable(
 
 
 # ---------------------------------------------------------------------------
-# Archetype fitter (V1 surrogate)
+# Archetype fitter (linear surrogate)
 # ---------------------------------------------------------------------------
 
 
@@ -557,11 +563,10 @@ def fit_archetypes_v1(
     device: torch.device | str = "cpu",
     verbose: bool = False,
 ) -> ArchetypeFitResult:
-    """Fit ``K`` archetypal spatial measures via the V1 surrogate.
+    """Fit ``K`` archetypal spatial measures via the linear surrogate.
 
-    Linear convex-combination reconstruction trained under the
-    debiased Sinkhorn divergence; full Wasserstein-barycentric form
-    is the V2 rung (deferred).
+    Linear convex-combination reconstruction ``ρ_p A`` trained under the
+    debiased Sinkhorn divergence; atoms and mixtures are fit jointly.
 
     Parameters
     ----------
@@ -589,13 +594,14 @@ def fit_archetypes_v1(
         Warm-start archetype basis. ``alpha`` is initialized as
         ``log(A_init + eps)``; otherwise random Gaussian.
     sample_weights : array, shape ``(P,)``, optional
-        Per-player loss weights. Defaults to uniform. The paper
-        uses ``w_p ~ sqrt(N_p)`` (training-shot count) so dense
+        Per-player loss weights. Defaults to uniform. A typical choice
+        is ``w_p ~ sqrt(N_p)`` (training-shot count) so dense
         players do not dominate the archetype geometry.
-    batch_size : int or None, default 256
+    batch_size : int or None, default 64
         Players processed per Sinkhorn pass. ``None`` runs full-batch.
         At NBA scale (P~1500, ny=56, nx=64) the full-batch broadcast
-        tensor is ~1.2 GB; ``batch_size=256`` keeps it under 200 MB.
+        tensor is ~1.2 GB; mini-batching keeps memory proportional to
+        ``batch_size``.
     use_sinkhorn_divergence : bool, default True
         Use the debiased Sinkhorn divergence
         ``S_eps = W_eps(a,b) - 0.5 W_eps(a,a) - 0.5 W_eps(b,b)``
@@ -824,7 +830,7 @@ def fit_archetypes_v1(
 
 
 # ---------------------------------------------------------------------------
-# V2 prototype: optimize ρ only with frozen V1 archetypes
+# Barycentric weights: optimize ρ only with frozen archetypes
 # ---------------------------------------------------------------------------
 
 
@@ -847,7 +853,7 @@ def fit_v2_rho_given_A(  # noqa: N802 — name mirrors the math symbol (uppercas
     device: torch.device | str = "cpu",
     verbose: bool = False,
 ) -> ArchetypeFitResult:
-    """V2 prototype — barycentric ``ρ_p`` with frozen archetypes ``A``.
+    """Fit barycentric weights ``ρ_p`` for frozen archetypes ``A``.
 
     Given fixed atoms :math:`A_1, \\ldots, A_K`, find barycentric
     coordinates :math:`\\rho_p \\in \\Delta^{K-1}` for each player such
@@ -862,11 +868,11 @@ def fit_v2_rho_given_A(  # noqa: N802 — name mirrors the math symbol (uppercas
             S_\\varepsilon\\bigl(Q_p,
                 \\mathcal B_\\varepsilon(A_{1:K}; \\rho_p)\\bigr).
 
-    The headline experiment of paper §A.4's V2 ladder rung 2:
-    isolates whether the diffuse-:math:`\\rho` / dead-atom pathology
-    seen in V1 comes from the linear ``ρ A`` reconstruction (in which
-    case V2 should produce sharper :math:`\\rho`) or from the data
-    geometry / atom set (in which case V2 won't help either).
+    Comparing these weights with the linear-surrogate mixtures from
+    :func:`fit_archetypes_v1` separates the effect of the linear
+    ``ρ A`` reconstruction from that of the data geometry and atom set:
+    if the barycentric :math:`\\rho` is no sharper, diffuse mixtures
+    are not an artifact of the linear surrogate.
 
     Returns ``ArchetypeFitResult`` with ``A`` unchanged from input
     and ``mixtures`` set to the optimized ρ.

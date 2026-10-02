@@ -1,23 +1,16 @@
-"""Shared history-bucket definitions for the H̄-stratified diagnostics.
+"""Own-history buckets for stratifying evaluation results.
 
-Two callers both want to bucket samples (val shots, val player-games)
-by the trait-derived own-causal-shot count ``Ĥ_p(t_n)``:
+Validation shots and player-games are bucketed by the player's causal
+own-shot count ``Ĥ_p(t_n)`` at the game's snapshot (a player trait).
+Pooled support is expected to matter most for cold-start and
+sparse-history rows, so stratifying by ``Ĥ`` shows where in the history
+distribution the collaborative support helps. The pooling diagnostics
+(``scripts/pooling_diagnostics.py``) and the sparse-player evaluation
+(``scripts/sparse_player_eval.py``) share these edges so their tables
+align row for row.
 
-* :mod:`scripts.pooling_diagnostics` — the pooled-mass-vs-history
-  monotonicity check (introduced 2026-05-20).
-* :mod:`scripts.sparse_player_eval` — the H̄-stratified cloud-metric
-  readout that's the headline diagnostic for the PR3 retrieval design
-  (2026-05-24): pooled support is supposed to matter mostly for
-  cold-start / sparse-history rows; the sparse-player evaluation is
-  what tells us *where* in the H̄ distribution the retrieval design
-  actually helps.
-
-The bucket edges match the pooling diagnostic's original cuts so
-the two readouts can be aligned row-for-row in a paper figure.
-
-The first bucket is ``0`` (exact zero own history — cold-start). The
-remaining buckets are half-open ``(lo, hi]`` to keep the boundary
-behavior unambiguous.
+The first bucket is ``0`` (no own history -- cold start). The remaining
+buckets are half-open ``(lo, hi]`` so boundary values are unambiguous.
 """
 
 from __future__ import annotations
@@ -45,15 +38,13 @@ BUCKET_ORDER: Final[tuple[str, ...]] = tuple(label for _, _, label in HISTORY_BU
 def history_bucket(h_hat: float) -> str:
     """Return the bucket label for an own-causal-shot count ``h_hat``.
 
-    Negative inputs (shouldn't happen — Ĥ ≥ 0 by construction) clamp
-    to the ``"0"`` bucket; values past the last edge fall in
-    ``"1001+"``.
+    ``Ĥ`` is non-negative by construction; negative inputs fall in the
+    ``"0"`` bucket and values past the last edge in ``"1001+"``.
     """
     for lo, hi, label in HISTORY_BUCKETS:
         if lo < h_hat <= hi:
             return label
-    # Fallthrough only for h_hat strictly outside the union, which is
-    # only possible for h_hat <= -0.5 (impossible Ĥ).
+    # Reached only for h_hat <= -0.5, outside every bucket.
     return BUCKET_ORDER[0] if h_hat <= 0.5 else BUCKET_ORDER[-1]
 
 

@@ -1,35 +1,34 @@
-"""Within-game shot-state GRU for the G1 residual extension (paper §10).
+"""Within-game shot-state GRU for the residual tilt.
 
-G1 augments the B2 residual tilt with a learned causal state over the
-target player's prior shots in the same game:
+:class:`WithinGameGRU` encodes the target player's earlier shots in the
+same game into a learned causal state,
 
 .. math::
 
     g_r = \\operatorname{GRU}(g_{r-1}, a_{r-1}),
 
 where :math:`a_{r-1}` is the previous shot's normalized feature vector
-(coordinate, zone, distance, time gap, period) and :math:`g_r` is fed
-into the residual encoder alongside :math:`x_n`, :math:`h_{n,r}`,
-:math:`u_{p,t}`, and :math:`c_{p,t}`.
+(coordinate, zone, distance, time gap, period). The projected final
+state is added to the residual-encoder output :math:`u_\\theta`, so it
+tilts the support logits through the same low-rank residual. It is an
+extension of the residual evaluated as an ablation; only shots before
+the current one enter the sequence.
 
-Architecture (locked first-cut):
+Architecture:
 
-* One-layer :class:`torch.nn.GRU`, hidden_size ``H`` (default 16).
+* One-layer :class:`torch.nn.GRU` with hidden size ``H`` (default 16)
+  and a zero initial state.
 * Input is the padded per-prior-shot feature tensor of shape
-  ``(B, MAX_PRIOR_SHOTS, WITHIN_GAME_SEQ_DIM)`` together with a
-  per-row length tensor of shape ``(B,)``.
-* Hidden state is initialized to zero per row.
-* Final layer is a linear projection ``nn.Linear(H, gru_out_dim,
-  bias=False)`` whose weight is zero-initialized so the GRU output
-  contributes exactly zero at step 0. This is the load-bearing
-  invariant ``G1 ≡ B2`` at initialization.
+  ``(B, MAX_PRIOR_SHOTS, WITHIN_GAME_SEQ_DIM)`` together with a per-row
+  length tensor of shape ``(B,)``.
+* The output projection ``nn.Linear(H, out_dim, bias=False)`` is
+  zero-initialized, so the GRU contributes exactly zero at
+  initialization and the model starts from the residual without the
+  GRU.
 
-Notes:
-
-* Rows with ``length == 0`` (first shot of a player-game) bypass the
-  GRU entirely and return the zero output directly. ``rnn.pack_padded_sequence``
-  rejects zero-length items, so we handle them outside the GRU call.
-* Output shape: ``(B, gru_out_dim)``.
+Rows with ``length == 0`` (the first shot of a player-game) bypass the
+GRU and return zeros, because ``pack_padded_sequence`` rejects
+zero-length sequences.
 """
 
 from __future__ import annotations
@@ -40,24 +39,15 @@ from shotcloud.data.within_game_history import MAX_PRIOR_SHOTS, WITHIN_GAME_SEQ_
 
 
 class WithinGameGRU(nn.Module):
-    """Causal within-game shot-state encoder for the G1 residual.
+    """Causal within-game shot-state encoder for the residual tilt.
 
     Parameters
     ----------
     hidden_dim : int, default 16
-        GRU hidden width. The first-cut spec uses 16; 32 is reserved as
-        a follow-up only if 16 helps.
+        GRU hidden width.
     out_dim : int, default 8
-        Output dimension of the linear projection fed into the residual
-        encoder. Match this to the residual encoder's residual rank to
-        keep the existing zero-init pipeline intact.
-
-    Forward
-    -------
-    ``forward(prior_seq, prior_lengths) -> Tensor``
-        * ``prior_seq`` shape ``(B, MAX_PRIOR_SHOTS, WITHIN_GAME_SEQ_DIM)``.
-        * ``prior_lengths`` shape ``(B,)`` int64, valid prior count per row.
-        * Returns ``(B, out_dim)`` — zero at initialization for every row.
+        Output dimension of the linear projection. Must equal the rank of
+        the residual encoder, whose output the projection is added to.
     """
 
     def __init__(self, hidden_dim: int = 16, out_dim: int = 8) -> None:
@@ -79,15 +69,30 @@ class WithinGameGRU(nn.Module):
             batch_first=True,
             bias=True,
         )
-        # Load-bearing zero-init: the projection from the GRU state to
-        # the residual feature space is zero, so the G1 augmentation
-        # contributes 0 at step 0 for every row regardless of inputs.
-        # Likelihood gradients then activate it only if causal in-game
-        # history adds information beyond the existing residual inputs.
+        # Zero-init the projection so the GRU contributes 0 at
+        # initialization for every row regardless of inputs; the
+        # likelihood gradient moves it away from zero only if in-game
+        # history adds information beyond the other residual inputs.
         self.proj = nn.Linear(hidden_dim, out_dim, bias=False)
         nn.init.zeros_(self.proj.weight)
 
     def forward(self, prior_seq: Tensor, prior_lengths: Tensor) -> Tensor:
+        """Encode each row's earlier in-game shots.
+
+        Parameters
+        ----------
+        prior_seq : Tensor of shape ``(B, MAX_PRIOR_SHOTS, WITHIN_GAME_SEQ_DIM)``
+            Padded feature sequence of the player's earlier shots in the
+            game.
+        prior_lengths : Tensor of shape ``(B,)``, int64
+            Number of valid prior shots per row.
+
+        Returns
+        -------
+        Tensor of shape ``(B, out_dim)``
+            Projected final GRU state; zero for rows with no prior shots
+            and, at initialization, for every row.
+        """
         if prior_seq.dim() != 3 or prior_seq.shape[2] != self.input_dim:
             raise ValueError(
                 f"prior_seq must have shape (B, MAX_PRIOR_SHOTS, {self.input_dim}); "

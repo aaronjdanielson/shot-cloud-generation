@@ -1,4 +1,7 @@
-"""Tier-1 evaluation metrics: zone distributions, KL divergence, NLL, KDE-gain.
+"""Grid evaluation metrics: zone distributions, KL divergence, NLL, KDE-gain.
+
+Deprecated; retained for the classical-baseline ablation runner in
+:mod:`shotcloud.legacy_pivot.eval_ablation`.
 
 Conventions
 -----------
@@ -8,7 +11,7 @@ Conventions
   (``shot_flow/src/shot_flow/evaluation/metrics.py``) for cross-paper
   comparability.
 - 5-zone (RA / Paint / Mid / Above-Break 3 / Corner 3) is the default for
-  paper reporting; the 8-zone variant matches our :mod:`~shotcloud.data.zones`
+  reporting; the 8-zone variant matches the :mod:`~shotcloud.data.zones`
   taxonomy and is exposed for finer analysis.
 - All inputs are numpy arrays in the canonical coordinate convention
   (feet, basket at origin).

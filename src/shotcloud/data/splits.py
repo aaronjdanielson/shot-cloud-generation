@@ -1,9 +1,9 @@
 """Train / val / test split utilities for shot tables.
 
-Two split modes (per [plan.md §10 decision 5](../../docs/plan.md)):
+Two split modes:
 
 - :func:`split_by_season` — partition by NBA season string (preferred for
-  paper reproducibility).
+  reproducible experiments).
 - :func:`split_fractional` — random fractional split with a fixed seed
   (useful for quick iteration on a single-season slice).
 
@@ -29,7 +29,7 @@ def split_by_season(
     """Partition ``df`` into train / val / test by ``season_column``.
 
     Seasons must be disjoint across splits. Rows whose season is not in
-    any of the three sets are dropped (with a warning if many).
+    any of the three sets are dropped.
 
     Parameters
     ----------
@@ -38,6 +38,19 @@ def split_by_season(
     train_seasons, val_seasons, test_seasons : iterable of str
         Season identifiers (e.g., ``"2023-24"``).
     season_column : str, default ``"season"``
+        Column holding the season identifier.
+
+    Returns
+    -------
+    train, val, test : pd.DataFrame
+        Row subsets with a fresh index.
+
+    Raises
+    ------
+    KeyError
+        If ``season_column`` is missing.
+    ValueError
+        If any season appears in more than one split.
     """
     if season_column not in df.columns:
         raise KeyError(
@@ -74,13 +87,29 @@ def split_fractional(
     Parameters
     ----------
     df : pd.DataFrame
+        Table to split.
     train_frac, val_frac, test_frac : float
-        Must sum to 1.0 (within float tolerance).
+        Must each lie in [0, 1] and sum to 1.0 (within float
+        tolerance). With ``group_column``, fractions apply to groups,
+        not rows.
     seed : int, default 42
+        Seed for the permutation.
     group_column : str, optional
         If given, splits at the group level so all rows of a given group
         end up in the same split (e.g., ``group_column="game_id"`` keeps
         a game's shots together). If ``None``, splits row-by-row.
+
+    Returns
+    -------
+    train, val, test : pd.DataFrame
+        Row subsets with a fresh index.
+
+    Raises
+    ------
+    ValueError
+        If the fractions are out of range or do not sum to 1.
+    KeyError
+        If ``group_column`` is given but missing.
     """
     total = train_frac + val_frac + test_frac
     if not np.isclose(total, 1.0):

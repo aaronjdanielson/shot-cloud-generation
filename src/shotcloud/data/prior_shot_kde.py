@@ -1,12 +1,11 @@
-"""Causal spatial-Hawkes feature — prior-shot KDE evaluated at zone centroids.
+"""Causal spatial-Hawkes feature: a prior-shot KDE evaluated at zone centroids.
 
-Phase 1 B1 of the Phase-0 follow-up (2026-06-09 log entry). The
-diagnostic D1 showed that within-game shot-zone transitions have a
-signed, lag-structured profile: at short lag the same-zone diagonal
-is positively excited (Hawkes-style self-excitation), at long lag it
-is negatively suppressed (cross-quarter adaptation). This module
-exposes the causal *spatial* memory of within-game shots as an
-8-dim feature evaluated at the eight zone centroids:
+To let the residual tilt capture within-game spatial self-excitation
+(Hawkes-style: a player's recent shot locations raising the likelihood
+of nearby locations for later shots), this module exposes the
+within-game spatial memory as an 8-dimensional
+feature: a Gaussian KDE of the player's earlier shots in the current
+game, evaluated at the eight zone centroids,
 
 .. math::
 
@@ -30,16 +29,16 @@ slot          name             centroid (x, y) ft
 7             Top of Key 3     (0.0, 25.0)
 ============= ================ ===================
 
-The kernel bandwidth :math:`\\sigma_h` defaults to 4 ft — close to
-the source/zone-σ field's typical own-bandwidth, large enough to
-smooth across the shot-cluster scale of D1's positive same-zone
-diagonal, small enough not to leak across the corner/wing or
-rim/paint boundaries.
+The kernel bandwidth :math:`\\sigma_h` defaults to 4 ft, comparable to
+the typical own-support bandwidth of the spatial kernel: wide enough to
+smooth within a shot cluster, narrow enough not to spread across the
+corner/wing or rim/paint boundaries.
 
-First-shot causal edge case: for the first shot of a (player, game),
-all eight slots are zero by construction; the model's residual
-encoder zero-init absorbs this without breaking the AC-KDE step-0
-invariant.
+The feature is causal: only shots strictly before shot ``r`` in the
+same player-game contribute, and the first shot of a player-game gets
+an all-zero vector. When enabled, it is appended to the prior-outcome
+summary (:mod:`shotcloud.data.prior_outcomes`) consumed by the residual
+encoder's zero-initialized outcome branch.
 """
 
 from __future__ import annotations
@@ -51,6 +50,7 @@ import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 
+#: Number of feature slots, one per zone centroid.
 PRIOR_SHOT_KDE_DIM: Final[int] = 8
 
 #: Canonical zone centroids in feet (basket at origin, x positive = right,
@@ -70,9 +70,8 @@ ZONE_CENTROIDS_FT: Final[NDArray[np.float32]] = np.array(
     dtype=np.float32,
 )
 
-#: Default kernel bandwidth in feet. Chosen to be close to the source/zone-σ
-#: field's typical own-bandwidth — smooths across the shot-cluster scale
-#: without leaking across major zone boundaries.
+#: Default kernel bandwidth in feet; see the module docstring for the
+#: rationale.
 DEFAULT_SIGMA_H_FT: Final[float] = 4.0
 
 
@@ -80,26 +79,35 @@ def compute_prior_shot_kde_features(
     shots_df: pd.DataFrame,
     sigma_h_ft: float = DEFAULT_SIGMA_H_FT,
 ) -> NDArray[np.float32]:
-    """Per-shot causal spatial-Hawkes summary in the input row order.
+    """Compute the per-shot causal spatial-Hawkes feature.
 
-    For each shot, the 8-dim feature is the causal Gaussian-KDE
-    summary of *prior* in-game shots evaluated at the eight zone
-    centroids. The first shot of each (player, game) gets the
-    all-zero feature.
+    For each shot, the feature is the mean of isotropic Gaussian
+    kernels centered on the player's *prior* shots in the same game,
+    evaluated at the eight zone centroids. Shots are ordered within a
+    player-game by ``time_remaining_sec``, ties broken by input row
+    order. The first shot of each (player, game) gets the all-zero
+    feature.
 
     Parameters
     ----------
     shots_df : DataFrame
         Must carry ``x``, ``y``, ``player_id``, ``game_id``,
-        ``time_remaining_sec`` (the loader's misnamed "time elapsed
-        in game" field).
+        ``time_remaining_sec`` (which holds elapsed game seconds; see
+        :mod:`shotcloud.data.schemas`).
     sigma_h_ft : float, default 4 ft
         Kernel bandwidth at zone-centroid evaluation. Must be > 0.
 
     Returns
     -------
     NDArray of shape ``(n_shots, PRIOR_SHOT_KDE_DIM)`` float32
-        Per-shot feature vector aligned to ``shots_df.index`` order.
+        Per-shot feature vectors in the input row order.
+
+    Raises
+    ------
+    ValueError
+        If ``sigma_h_ft`` is not positive.
+    KeyError
+        If a required column is missing.
     """
     if sigma_h_ft <= 0:
         raise ValueError(f"sigma_h_ft must be positive; got {sigma_h_ft}")
@@ -124,8 +132,7 @@ def compute_prior_shot_kde_features(
 
     out = np.zeros((n, PRIOR_SHOT_KDE_DIM), dtype=np.float32)
 
-    # Group bounds — same pattern as compute_prior_outcome_features /
-    # compute_within_game_features.
+    # Contiguous (player_id, game_id) runs in the sorted view.
     keys = (
         work_sorted["player_id"].astype(str).to_numpy()
         + "|"

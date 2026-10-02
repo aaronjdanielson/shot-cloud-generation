@@ -1,31 +1,26 @@
-"""Tier-1a adaptive bandwidth: per-(source, zone) scalar σ_{src,z}.
+"""Per-(source, zone) kernel bandwidth for the continuous spatial mixture.
 
-The simplest identifiable variant of the bandwidth axis (bandwidth
-analog of D-lite-0 in the defense work): ``2 × N_ZONES`` learnable
-scalars, sigmoid-bounded into ``[σ_min, σ_max]``, indexed per support
-shot by its **source** (own vs pooled history) and **zone** (8-zone
-NBA taxonomy).
-
-Per-shot bandwidth::
+:class:`ZoneSourceBandwidth` assigns each support shot a Gaussian kernel
+bandwidth indexed by its **source** (the player's own history or pooled
+analogue history) and its **zone** (8-zone court taxonomy). It has
+``2 × N_ZONES`` learnable scalars, each sigmoid-bounded into
+``[σ_min, σ_max]``::
 
     σ_m = σ_min + (σ_max − σ_min) · sigmoid(z_{source(m), zone(s_m)})
 
-Replaces the existing single per-row σ from
-:class:`~shotcloud.models.retrieval_collaborative_kde.RetrievalCollaborativeKDE`
-when the bandwidth field is wired into
-:class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial`.
+When attached to
+:class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial`
+it replaces the single per-row bandwidth of the support backend (e.g.
+:class:`~shotcloud.models.retrieval_collaborative_kde.RetrievalCollaborativeKDE`),
+so own and pooled support can be smoothed differently, as can zones
+with different spatial spread (rim, paint, midrange, corner three,
+above-the-break three). The mainline configuration uses this
+zone-source bandwidth.
 
-Tests the predictive hypothesis: own-history support and pooled
-support need different smoothing (own probably sharper, pooled
-smoother), and rim/paint/midrange/corner/above-the-break zones have
-different natural spatial uncertainty.
-
-At ``sigma_init = 1.5`` with the canonical bounds, all 16 raw
-parameters initialize to the same logit such that
-``σ_{src,z} ≡ 1.5`` everywhere — so the wrapper is **bit-identical** to
-the fixed-σ=1.5 path at step 0, and the choice of using a per-shot
-bandwidth instead of the per-row σ only matters once the parameters
-move during training.
+Every raw parameter is initialized to the logit that maps to
+``sigma_init``, so at initialization every support shot has bandwidth
+``sigma_init`` (up to floating-point rounding) and the mixture matches
+the fixed-σ mixture.
 """
 
 from __future__ import annotations
@@ -41,14 +36,21 @@ __all__ = ["ZoneSourceBandwidth", "zone_from_xy_torch_bandwidth"]
 
 
 def zone_from_xy_torch_bandwidth(xy: Tensor) -> Tensor:
-    """Torch-native vectorized zone assignment.
+    """Assign 8-zone labels to court coordinates in torch.
 
-    Mirrors :func:`shotcloud.viz.energy_body_overlay.zone_from_xy_torch`
-    / the numpy :func:`shotcloud.data.zones.zone_from_xy` exactly, so
-    a sweep of court coordinates produces the same labels under all
-    three. Returns int64 of shape ``(...,)`` with ``-1`` for
-    out-of-court points (clipped to a safe zone before indexing by the
-    caller).
+    Produces the same labels as :func:`shotcloud.data.zones.zone_from_xy`
+    and :func:`shotcloud.data.zones.zone_from_xy_vectorized`.
+
+    Parameters
+    ----------
+    xy : Tensor of shape ``(..., 2)``
+        Court coordinates in feet, basket at origin.
+
+    Returns
+    -------
+    Tensor of shape ``(...,)``, int64
+        Zone index in ``[0, 7]``, or ``-1`` for out-of-court points;
+        callers clamp ``-1`` to a valid index before table lookups.
     """
     x = xy[..., 0]
     y = xy[..., 1]
@@ -88,14 +90,14 @@ class ZoneSourceBandwidth(nn.Module):
     Parameters
     ----------
     sigma_min, sigma_max : float
-        Bounds (in feet) applied via sigmoid. Conservative defaults
-        (1.0, 2.5) chosen so unconstrained learned bandwidth cannot
-        widen pathologically the way shot_flow's learned σ did.
-    sigma_init : float
+        Bounds (in feet) applied via sigmoid, default ``(1.0, 2.5)``.
+        The bounds are deliberately tight so that a learned bandwidth
+        cannot widen without limit and wash out spatial structure.
+    sigma_init : float, default 1.5
         Initial bandwidth in feet. Every (source, zone) entry is
         initialized to the raw logit that maps to ``sigma_init`` under
-        the sigmoid, so the module is **bit-identical** to a fixed-σ
-        wrapper at step 0. ``sigma_init`` must satisfy
+        the sigmoid, so the module matches a fixed-σ mixture at
+        initialization. Must satisfy
         ``sigma_min ≤ sigma_init ≤ sigma_max``.
 
     Attributes
@@ -143,7 +145,6 @@ class ZoneSourceBandwidth(nn.Module):
             persistent=False,
         )
         # Initialize the raw logit so sigmoid(z) * range + min == sigma_init.
-        # Identical inversion pattern to RetrievalCollaborativeKDE.
         target = (float(sigma_init) - float(sigma_min)) / (float(sigma_max) - float(sigma_min))
         # Clamp away from {0, 1} for the log to stay finite.
         target = min(max(target, 1e-6), 1.0 - 1e-6)
@@ -185,9 +186,9 @@ class ZoneSourceBandwidth(nn.Module):
             )
 
         zone_idx = zone_from_xy_torch_bandwidth(support_xy)  # (B, M), int64
-        # Out-of-court support shots get zone == -1 — index-safe clamp to 0.
-        # Such shots are masked out of the mixture anyway, so any σ value
-        # for them is acceptable as long as it stays finite and positive.
+        # Out-of-court support shots get zone == -1; clamp to 0 so the
+        # lookup is index-safe. Any finite positive σ is acceptable for
+        # them.
         safe_zone = zone_idx.clamp_min(0)
         source_idx = torch.where(
             own_mask, torch.full_like(safe_zone, self.OWN), torch.full_like(safe_zone, self.POOLED)
@@ -202,12 +203,10 @@ class ZoneSourceBandwidth(nn.Module):
         return sigma_per_shot
 
 
-# Note for downstream readers: own_mask is sourced from
-# CollaborativeContinuousOutputs.own_mask (populated by both the L×R
-# fixed and retrieval support backends), so this module works with
-# either offensive prior. Verified by zone_from_xy_torch_bandwidth
-# parity against shotcloud.data.zones.zone_from_xy_vectorized.
+# own_mask comes from CollaborativeContinuousOutputs.own_mask, which both
+# the fixed and the retrieval support backends populate, so this module
+# works with either.
 
-# The numpy parity is asserted in tests; keep an explicit reference in
-# the file so refactors that drift the implementations are caught.
+# zone_from_xy_torch_bandwidth must agree with the NumPy classifier; the
+# reference keeps the pairing visible to anyone editing either one.
 _NUMPY_ZONE_REFERENCE = zone_from_xy_vectorized

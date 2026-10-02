@@ -1,6 +1,10 @@
-"""Learnable scalar ``α_def`` for the Phase-2 defensive product factor.
+"""Learnable scalar ``α_def`` for the defensive product factor.
 
-Mirrors :class:`~shotcloud.models.LearnableTemperature` in shape: a
+Deprecated; retained to reproduce the static defensive-KDE ablation.
+Superseded by the zone-level opponent reweighting in
+:mod:`shotcloud.models.zone_defense_reweighting`.
+
+Mirrors :class:`~shotcloud.legacy.temperature.LearnableTemperature` in shape: a
 single softplus-positive scalar applied multiplicatively to the log of
 the defensive density:
 
@@ -14,13 +18,12 @@ The decoder's softmax in ``c`` absorbs the partition function (just
 like for the temperature on the offensive prior), so implementation
 reduces to a scalar multiply per minibatch.
 
-Initialization defaults to ``α_def = 0.5`` per
-[docs/research_plan.md](../../../docs/research_plan.md) §5 — small
-enough that the defensive contribution starts subdominant to the
-offensive prior, large enough that the gradient signal on ``θ_d`` is
-non-trivial. Setting ``init=ε`` close to zero recovers the Phase-1
-model at step 0 and is useful for ablations that strictly generalize
-the previous phase.
+Initialization defaults to ``α_def = 0.5`` — small enough that the
+defensive contribution starts subdominant to the offensive prior, large
+enough that the gradient signal on ``θ_d`` is non-trivial. Setting
+``init=ε`` close to zero recovers the defense-free model at
+initialization, which is useful for ablations that strictly generalize
+it.
 
 Stacks orthogonally with :class:`LearnableTemperature` and
 :class:`LearnableKDEProductWeights` — defense is a different signal
@@ -44,9 +47,9 @@ class LearnableDefensiveScale(nn.Module):
 
     Two modes mirror :class:`LearnableTemperature`:
 
-    * **Scalar mode** (``context_dim=0``, default, Phase-2 configuration).
+    * **Scalar mode** (``context_dim=0``, the default).
       Owns one parameter ``θ_d``; ``α_def = softplus(θ_d)`` is global.
-    * **Context-conditioned mode** (Phase 3, ``context_dim>0``). Owns a
+    * **Context-conditioned mode** (``context_dim>0``). Owns a
       tiny MLP; ``α_def(x_n) = softplus(MLP(x_n))``.
 
     Parameters

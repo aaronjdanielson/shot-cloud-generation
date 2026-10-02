@@ -1,32 +1,29 @@
-"""Global determinism helpers (audit fix H5, 2026-06-10).
+"""Global seeding and determinism flags for reproducible runs.
 
-The pre-H5 codebase seeded ``torch`` and ``numpy`` inside each entry-point
-``main()`` but never set the determinism flags PyTorch needs for cross-
-machine, cross-run bit-reproducibility:
+:func:`set_global_determinism` seeds every random-number generator the
+package uses and sets the PyTorch flags required for run-to-run
+reproducibility:
 
-* ``torch.use_deterministic_algorithms(True)`` — forces PyTorch to use
-  deterministic implementations where one exists (and raise on ops that
-  don't, unless ``warn_only=True``).
-* ``torch.backends.cudnn.deterministic = True`` + ``.benchmark = False``
-  — disables cuDNN's autotuned kernel selection on CUDA.
-* ``CUBLAS_WORKSPACE_CONFIG=":4096:8"`` — required for cuBLAS determinism
-  on PyTorch ≥1.8.
-* ``PYTHONHASHSEED`` — needed for some hash-order-dependent
-  computations (e.g., dict iteration with hash-keyed inputs).
+* ``torch.use_deterministic_algorithms(True)`` -- selects deterministic
+  implementations where one exists.
+* ``torch.backends.cudnn.deterministic = True`` and
+  ``torch.backends.cudnn.benchmark = False`` -- disable cuDNN's autotuned
+  kernel selection on CUDA.
+* ``CUBLAS_WORKSPACE_CONFIG=":4096:8"`` -- required for cuBLAS determinism.
+* ``PYTHONHASHSEED`` -- fixes hash-order-dependent computations.
 
-Without these, two runs of the same script on the same machine can
-differ at the 4th–6th decimal — small enough to miss in casual
-inspection, large enough to fail strict reproducibility for an AOAS
-submission.
+Without these flags, two runs of the same script on the same machine can
+differ in the fourth to sixth decimal place.
 
-**MPS caveat.** As of PyTorch 2.x, several MPS ops (softmax,
-scatter_add, reduce-on-last-dim, …) do not have bit-deterministic
-backends and ``torch.use_deterministic_algorithms(True)`` will raise on
-them. We pass ``warn_only=True`` so MPS runs emit a one-time warning
-instead of crashing, while still flipping the flag for the
-deterministic-when-available subset.
+Several MPS ops (softmax, ``scatter_add``, reductions over the last
+dimension) have no bit-deterministic backend, so
+``torch.use_deterministic_algorithms(True)`` would raise on them. The
+default ``warn_only=True`` makes MPS runs emit a one-time warning instead
+of failing, while still selecting deterministic kernels where available.
 
-Usage from a script's ``main()``::
+Examples
+--------
+Call it at the top of a script's ``main()``::
 
     from shotcloud.utils.determinism import set_global_determinism
 
@@ -53,11 +50,11 @@ def set_global_determinism(
     device: Literal["cpu", "cuda", "mps"] | str = "cpu",
     warn_only_on_nondeterministic_ops: bool = True,
 ) -> None:
-    """Seed every RNG and flip every determinism flag PyTorch supports.
+    """Seed all random-number generators and set PyTorch determinism flags.
 
-    Calls this helper from every script's ``main()`` BEFORE any tensor
-    construction or DataLoader instantiation. Idempotent — safe to call
-    multiple times with the same seed.
+    Call once from a script's ``main()``, before any tensor construction
+    or DataLoader instantiation. Idempotent: repeated calls with the same
+    seed leave the same state.
 
     Parameters
     ----------
@@ -66,8 +63,9 @@ def set_global_determinism(
         (CPU + CUDA + MPS), and ``PYTHONHASHSEED``.
     device : {"cpu", "cuda", "mps"} or str
         Target device. Used to decide which device-specific flags to
-        flip. Passing an unknown string is treated like "cpu" (only the
-        device-agnostic flags fire).
+        set. An unrecognized string is treated like ``"cpu"``: only the
+        device-agnostic flags are set (the cuDNN flags are also set
+        whenever CUDA is available).
     warn_only_on_nondeterministic_ops : bool, default True
         Forward to :func:`torch.use_deterministic_algorithms`. ``True``
         (the default) is required for MPS, where several ops lack
@@ -77,44 +75,38 @@ def set_global_determinism(
 
     Notes
     -----
-    PyTorch MPS is NOT bit-deterministic for several ops as of
-    PyTorch 2.x. For strict bit reproducibility, train + evaluate on
-    CPU or CUDA. MPS runs in this codebase are reproducible up to ~6
-    decimal places, which is sufficient for paper-level claims but not
-    for strict regression testing.
+    MPS is not bit-deterministic for several ops. For bit-exact
+    reproducibility, train and evaluate on CPU or CUDA; MPS runs agree to
+    roughly six decimal places.
     """
     # Python + NumPy + hash-order
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
-    # The legacy global numpy RNG is seeded for back-compat with
-    # callees that haven't migrated to ``np.random.default_rng``
-    # (e.g. AdaptiveKDE's max_history sampler).
+    # The global NumPy RNG is seeded for callees that draw from it rather
+    # than from ``np.random.default_rng`` (e.g. AdaptiveKDE's max_history
+    # sampler).
     np.random.seed(seed)  # noqa: NPY002
 
-    # PyTorch base RNG (CPU). torch.manual_seed also seeds CUDA + MPS
-    # under the hood; we call the explicit setters as well for
-    # robustness on older versions.
+    # torch.manual_seed also seeds CUDA and MPS; the explicit setters are
+    # called as well for robustness across PyTorch versions.
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     if hasattr(torch, "mps") and getattr(torch.mps, "manual_seed", None) is not None:
-        # MPS has its own manual_seed since PyTorch 2.x. Older MPS
-        # branches lack the call — suppress and continue.
+        # The call can raise on builds without a usable MPS backend.
         with contextlib.suppress(Exception):
             torch.mps.manual_seed(seed)
 
-    # Deterministic-algorithms flag. warn_only=True is REQUIRED for MPS
-    # paths (scatter_add and a few reductions don't have deterministic
-    # implementations as of PyTorch 2.x). Older PyTorch (<1.8) lacks
-    # this API; the seed-only behavior is the best we can do then.
+    # warn_only=True is required on MPS, where scatter_add and some
+    # reductions have no deterministic implementation. PyTorch < 1.8 lacks
+    # this API, in which case only the seeds above apply.
     with contextlib.suppress(Exception):
         torch.use_deterministic_algorithms(True, warn_only=warn_only_on_nondeterministic_ops)
 
-    # CUDA-specific flags + workspace config.
+    # CUDA-specific flags and workspace config.
     if device == "cuda" or torch.cuda.is_available():
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-        # Required for cuBLAS determinism on PyTorch >= 1.8.
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 

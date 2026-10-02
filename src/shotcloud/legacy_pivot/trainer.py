@@ -1,26 +1,29 @@
 """Spatial NLL trainer for the low-rank tilt decoder.
 
+Deprecated; retained to reproduce the low-rank tilt decoder ablations.
+Superseded by :mod:`shotcloud.training.train_gibbs`.
+
 Trains the decoder's ``V`` matrix and the player encoder's embedding
 table jointly to minimize cross-entropy ``-log p_θ(c | x)`` over
 observed shots. Optional learnable scalars compose orthogonally on top:
 
-* ``τ = softplus(θ)`` from :class:`~shotcloud.models.LearnableTemperature`
-  (Phase 1) sharpens / flattens the offensive prior.
+* ``τ = softplus(θ)`` from
+  :class:`~shotcloud.legacy.temperature.LearnableTemperature`
+  sharpens / flattens the offensive prior.
 * ``α_def = softplus(θ_d)`` from
-  :class:`~shotcloud.models.LearnableDefensiveScale` (Phase 2) scales a
-  defensive product factor ``log q_def(c | opp)``.
-* The legacy :class:`~shotcloud.models.LearnableKDEProductWeights`
-  (KDE-product mixture weights) — kept for the paper ablation row;
-  empirically collapses to "temperature on player KDE", so prefer the
-  single-scalar Phase-1 module.
+  :class:`~shotcloud.legacy_pivot.defensive_scale.LearnableDefensiveScale`
+  scales a defensive product factor ``log q_def(c | opp)``.
+* :class:`~shotcloud.legacy.learnable_weights.LearnableKDEProductWeights`
+  trains the KDE-product mixture weights; the single-scalar temperature
+  is the more interpretable alternative.
 
 The mixture-weights and temperature options are mutually exclusive
 (both control the offensive prior). The defensive scale composes with
 either offensive option.
 
-This is the **v1 minimum viable trainer**: pure spatial NLL, Adam,
-single-pass mini-batches, no learning-rate schedule. By default we
-**track the best validation checkpoint** and restore it at the end of
+The trainer is minimal: pure spatial NLL, Adam, single-pass
+mini-batches, no learning-rate schedule. By default it
+**tracks the best validation checkpoint** and restore it at the end of
 training — without this, a long run that overfits returns an inferior
 model. Toggle via ``restore_best_val=False`` if you want the final-epoch
 state instead (useful when overfitting is genuinely desired, e.g., when
@@ -29,7 +32,7 @@ the val set is too small to trust).
 Initialization gotcha
 ---------------------
 The decoder defaults to ``V = 0`` (preserves the
-``softmax(log q_0) == q_0`` invariant at step 0). The encoder defaults
+``softmax(log q_0) == q_0`` invariant at initialization). The encoder defaults
 to **random-init** because zero-initing both factors traps the model at
 a saddle point: ``∂(u^T V)/∂V = u = 0`` and
 ``∂(u^T V)/∂u = V = 0``, so neither factor moves. The standard low-rank
@@ -250,38 +253,37 @@ def train_decoder(
         Same vocab as ``train_set``. If provided, val NLL is logged each
         epoch.
     learnable_weights : LearnableKDEProductWeights, optional
-        Legacy. If provided, the KDE-product weights ``(a_p, a_g, a_0)``
+        If provided, the KDE-product weights ``(a_p, a_g, a_0)``
         are trained jointly. ``train_set`` (and ``val_set``, if provided)
         must be constructed with ``cache_components=True``. Mutually
         exclusive with ``learnable_temperature``.
     learnable_temperature : LearnableTemperature, optional
-        Phase 1. If provided, a single scalar ``τ = softplus(θ)`` is
+        If provided, a single scalar ``τ = softplus(θ)`` is
         trained jointly and applied to ``log q_0`` per minibatch. Works
         with any base measure; no component caching needed. Mutually
         exclusive with ``learnable_weights``.
     learnable_defensive_scale : LearnableDefensiveScale, optional
-        Phase 2. If provided, a single scalar ``α_def = softplus(θ_d)``
+        If provided, a single scalar ``α_def = softplus(θ_d)``
         scales the per-shot log defensive density and is added to the
         offensive log-density inside the decoder's softmax. Requires
         the train (and val, if provided) datasets to be constructed
         with a ``defensive_kde``. Composes orthogonally with the
         offensive options (temperature or mixture weights).
     adaptive_prior : AdaptiveOffensivePrior, optional
-        Phase 4. If provided, **replaces** the dataset's offensive
-        ``log q_0`` with the relevance-weighted historical-shot
-        density ``log q̂_φ^hier(c | p, x_n)``. Mutually exclusive with
-        ``learnable_weights`` (which configures a different offensive
-        prior). May still be paired with ``learnable_temperature`` and
-        ``learnable_defensive_scale``. Requires train (and val) sets
-        to be constructed with a ``context_encoder``.
+        Not supported: :class:`AdaptiveOffensivePrior` requires a
+        per-row ``snapshot_idx`` that :class:`ShotCellDataset` does not
+        provide, so passing it raises :class:`NotImplementedError`
+        after the dataset checks. Mutually exclusive with
+        ``learnable_weights``; requires train (and val) sets to be
+        constructed with a ``context_encoder``.
     lambda_entropy : float, default 0.0
-        Phase 4 regularizer weight on
-        :func:`~shotcloud.training.entropy_regularizer`. Only effective
-        when ``adaptive_prior`` is set. ``0.005`` is a sensible non-zero
-        starting value (research_plan §7).
+        Regularizer weight on
+        :func:`~shotcloud.legacy_pivot.regularizers.entropy_regularizer`.
+        Only effective when ``adaptive_prior`` is set. ``0.005`` is a
+        sensible non-zero starting value.
     lambda_ess : float, default 0.0
-        Phase 4 regularizer weight on
-        :func:`~shotcloud.training.ess_regularizer`. Off by default;
+        Regularizer weight on
+        :func:`~shotcloud.legacy_pivot.regularizers.ess_regularizer`. Off by default;
         turn on if attention collapses to a few shots.
     n_epochs : int, default 5
     batch_size : int, default 512
@@ -328,24 +330,23 @@ def train_decoder(
     if learnable_defensive_scale is not None and val_set is not None and not val_set.has_defensive:
         raise ValueError("learnable_defensive_scale requires val_set built with defensive_kde=...")
 
-    # Phase-4 adaptive prior requires the dataset to carry x_n features.
+    # The adaptive prior requires the dataset to carry x_n features.
     if adaptive_prior is not None:
         if not train_set.has_context:
             raise ValueError("adaptive_prior requires train_set built with context_encoder=...")
         if val_set is not None and not val_set.has_context:
             raise ValueError("adaptive_prior requires val_set built with context_encoder=...")
-        # AA-KDE refactor (2026-04-29): AdaptiveOffensivePrior now requires
-        # a per-row snapshot_idx and consumes the SnapshotStore + archetype
-        # modules. The legacy trainer path here predates the refactor; the
-        # AA-KDE joint training script is the supported entry point. Fail
-        # loudly so callers don't silently use the broken path.
+        # AdaptiveOffensivePrior requires a per-row snapshot_idx and
+        # consumes the SnapshotStore + archetype modules, which this
+        # trainer does not supply. Fail loudly rather than run an
+        # incompatible path.
         raise NotImplementedError(
             "train_decoder() does not support the AA-KDE AdaptiveOffensivePrior; "
             "use the AA-KDE joint training pipeline (pending) instead. "
             "See docs/log.md 2026-04-29 for the refactor scope."
         )
 
-    # Phase-3 context-conditioned-mode requires the dataset to carry x_n features.
+    # Context-conditioned scalars require the dataset to carry x_n features.
     needs_context = (
         learnable_temperature is not None and learnable_temperature.context_dim > 0
     ) or (learnable_defensive_scale is not None and learnable_defensive_scale.context_dim > 0)

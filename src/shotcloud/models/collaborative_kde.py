@@ -1,50 +1,53 @@
-"""Collaborative adaptive KDE — the headline spatial decoder (v1.1).
+"""Collaborative adaptive KDE over a fixed set of analogue players.
 
-Implements
+:class:`CollaborativeKDE` is the fixed-grid support backend of the AC-KDE
+spatial factor (``--support-backend fixed_lr``). For a target player
+:math:`p` at snapshot :math:`t_n` it reads the top-:math:`L` analogue
+players :math:`\\mathcal N_p(t_n)` from an
+:class:`~shotcloud.models.analogue_retrieval.AnalogueRetrievalCache` and up
+to :math:`R` shots from each analogue's history, keeping only shots dated
+strictly before the snapshot's anchor date. Two forward paths share these
+supports:
 
-.. math::
+* :meth:`CollaborativeKDE.forward_continuous` returns the support shots,
+  their joint support logits :math:`A_l + B_{l,r}`, the bandwidth, and the
+  own/pooled partition consumed by
+  :class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial`.
+* :meth:`CollaborativeKDE.forward` evaluates the two-stage-attention
+  density on the court grid,
 
-    \\hat q_p^{\\mathrm{collab}}(c \\mid x_n, t_n)
-    = \\sum_{p' \\in \\mathcal N_p^{+}(t_n)} \\alpha_{p,p'}(x_n, t_n)
-      \\sum_{j \\in \\mathcal H_{p'}^{<t_n}} \\beta_{p,p',j}(x_n, t_n)
-      K_{\\sigma_p(t_m)}(x_c - s_j),
+  .. math::
 
-per the canonical spec in
-[docs/model_spec.md](../../../docs/model_spec.md). Two-stage attention
-over a retrieved analogue set, summed against a per-target isotropic
-Gaussian kernel whose bandwidth depends on the target player's
-recency-weighted evidence volume.
+      \\hat q_p^{\\mathrm{collab}}(c \\mid x_n, t_n)
+      = \\sum_{p' \\in \\mathcal N_p^{+}(t_n)} \\alpha_{p,p'}(x_n, t_n)
+        \\sum_{j \\in \\mathcal H_{p'}^{<t_n}} \\beta_{p,p',j}(x_n, t_n)
+        K_{\\sigma_p(t_n)}(x_c - s_j),
 
-v1.1 refactor (vs the v1.0 dense forward)
------------------------------------------
+  where :math:`\\mathcal N_p^{+}(t_n)` are the analogues with causal
+  history, :math:`\\alpha` is player-level attention, :math:`\\beta` is
+  shot-level attention within an analogue's causal history
+  :math:`\\mathcal H_{p'}^{<t_n}`, and :math:`K_\\sigma` is an isotropic
+  Gaussian whose bandwidth depends on the target player's causal
+  evidence volume.
 
-Three changes, jointly motivated by the v1.0 forward being ~50× slower
-than the underlying memory-bandwidth ceiling on M-series GPUs:
+Implementation
+--------------
+* **Separable kernel.** The isotropic Gaussian factors as
+  ``K_x(c_x - s_{j,x}) · K_y(c_y - s_{j,y})``, so the grid density is
+  aggregated with a batched matrix product over the ``L * R`` shot axis
+  without materializing a ``(B, L, R, n_cells)`` intermediate (see
+  :func:`~shotcloud.models._separable_kernel.separable_gaussian_density`).
+* **Global support pool.** Per-shot context, coordinates, and dates live
+  in one flat :class:`~shotcloud.models._support_pool.GlobalSupportPool`;
+  each player's history is a row of an ``(n_players, max_R)`` int64 index.
+* **Bilinear shot attention.** ``g_θ(x, z_j) = f_θ(x)^T h_θ(z_j) - λ_age Δt``
+  makes ``h_θ(z_j)`` depend only on the shot, so ``h_θ`` runs once per
+  unique shot id in the batch. The unfactored MLP ``g_θ([x; z_j])`` is
+  available as ``shot_attention_form="concat"``.
 
-1. **Separable kernel**. The dense per-shot Gaussian
-   ``K(c - s_j) = exp(-||c-s_j||²/2σ²)`` factors exactly into
-   ``K_x(c_x - s_{j,x}) · K_y(c_y - s_{j,y})``. Aggregating via a bmm
-   over the ``(L*R)`` shot axis avoids materializing the dominant
-   ``(B, L, R, n_cells)`` intermediate. See
-   :func:`shotcloud.models._separable_kernel.separable_gaussian_density`.
-2. **Global support pool + per-player int64 index**. Per-shot context,
-   coords, and dates live in a single flat
-   :class:`shotcloud.models._support_pool.GlobalSupportPool`; the
-   per-player history is an ``(n_players, max_R)`` int64 index. The
-   pool is the precondition for change 3.
-3. **Bilinear shot attention with batch-unique ``h_θ`` compute**.
-   ``g_θ(x, z_j) = f_θ(x)^T h_θ(z_j) - λ_age Δt`` factors the v1.0
-   concat MLP so ``h_θ(z_j)`` depends only on the shot. We run
-   ``h_θ`` on the unique shot ids in the batch
-   (``torch.unique(..., return_inverse=True)``) and gather back, so
-   duplicates across batch rows pay the MLP cost once. The legacy
-   concat form is preserved as an ablation knob
-   (``shot_attention_form="concat"``).
-
-Mathematical equivalence at step 0 is preserved: with the bilinear
-``h_θ``'s output layer zero-initialized, ``g_θ ≡ 0`` for every shot,
-so β is uniform within each analogue's causal history — identical
-step-0 distribution to the v1.0 concat form.
+With the ``h_θ`` output layer zero-initialized, ``g_θ ≡ 0`` and β is
+uniform within each analogue's causal history, so the bilinear and
+concat forms define the same density at initialization.
 """
 
 from __future__ import annotations
@@ -72,8 +75,9 @@ if TYPE_CHECKING:
     from shotcloud.data.snapshots import SnapshotStore
     from shotcloud.training.dataset import PlayerVocab
 
-# Trait slots from PlayerTraitsTable used at forward time.
-# Block B slots (multiplied by missingness in the table itself):
+# PlayerTraitsTable slots read at forward time (play-derived block, already
+# multiplied by the missingness indicator in the table):
+# log1p_minutes_M, log1p_fga_S, log_shot_density.
 _SLOT_LOG1P_M: int = 14
 _SLOT_LOG1P_S: int = 15
 _SLOT_LOG_DENSITY: int = 16
@@ -82,29 +86,24 @@ ShotAttentionForm = Literal["bilinear", "concat"]
 HzInit = Literal["zero", "warm"]
 AlphaPrior = Literal["none", "similarity"]
 
-# Standard deviation of the warm h_z output-layer normal init, in score
-# units. With proj_dim=32 and unit-scale f_x at init, this yields per-
-# shot scores of order O(1e-3 * sqrt(32) * f_x_scale) ≈ O(1e-4), which
-# is small enough that β remains near-uniform (KL to uniform < 1e-4 by
-# construction) but large enough that the f_x side of the bilinear
-# bootstrap receives nonzero gradient at step 0.
+# Standard deviation of the warm h_z output-layer normal init. Per-shot
+# scores stay small enough that β is near-uniform at initialization, yet
+# nonzero, so the f_x side of the bilinear score receives a gradient from
+# the first step.
 _H_Z_WARM_INIT_STD: float = 1e-3
 
 
 def _inverse_sigmoid(p: float) -> float:
-    """Inverse sigmoid (logit). Used to initialize ``a_0`` so that
-    ``σ = sigma_init`` at training start when the other coefficients
-    are at zero."""
+    """Return ``logit(p)``; sets ``a_0`` so that ``σ = sigma_init`` at initialization."""
     return float(np.log(p / (1.0 - p)))
 
 
 def _cosine_similarity_bl(u_self: Tensor, u_other: Tensor, *, eps: float = 1e-12) -> Tensor:
     """``(B, L)`` cosine similarity between paired ``(B, L, D)`` vectors.
 
-    Handles the all-zero-trait edge case (rookies with no biographical
-    record AND no usable play traits) by ``clamp_min`` on the
-    denominator — pairs with a zero side get similarity 0 instead of
-    NaN, which is the right neutral value (no signal either way).
+    The denominator is clamped, so a pair with an all-zero trait vector
+    (a player with neither biographical record nor play history) gets
+    the neutral similarity 0 instead of NaN.
     """
     num = (u_self * u_other).sum(dim=-1)
     denom = (u_self.norm(dim=-1) * u_other.norm(dim=-1)).clamp_min(eps)
@@ -114,33 +113,46 @@ def _cosine_similarity_bl(u_self: Tensor, u_other: Tensor, *, eps: float = 1e-12
 
 @dataclass(frozen=True)
 class CollaborativeOutputs:
-    """Per-batch intermediates from one CollaborativeKDE forward pass.
+    """Per-batch intermediates of one grid :meth:`CollaborativeKDE.forward` pass.
 
-    Returned when ``return_components=True``. Useful for the
-    diagnostic script and for the future paper-ablation comparisons.
+    Returned when ``return_components=True``.
+
+    Attributes
+    ----------
+    log_q_collab : Tensor of shape (B, n_cells)
+        Normalized log-density over the court grid.
+    alpha : Tensor of shape (B, L)
+        Player-level attention; rows sum to 1.
+    beta : Tensor of shape (B, L, R)
+        Shot-level attention; sums to 1 over ``R`` for each analogue with
+        causal history and is identically 0 otherwise.
+    sigma : Tensor of shape (B,)
+        Per-target bandwidth in feet.
+    analogues : Tensor of shape (B, L), int64
+        Analogue vocabulary indices.
+    has_analogue_history : Tensor of shape (B, L), bool
+        Whether each analogue has causal history, i.e. membership in
+        :math:`\\mathcal N_p^{+}(t_n)`.
     """
 
-    log_q_collab: Tensor  # (B, n_cells)
-    alpha: Tensor  # (B, L)         — player-level attention, rows sum to 1
-    beta: Tensor  # (B, L, R)       — shot-level attention; rows sum to 1 per
-    #                                 (b, l) with valid causal history,
-    #                                 else identically 0
-    sigma: Tensor  # (B,)           — per-target bandwidth in ft
-    analogues: Tensor  # (B, L)     — int64 analogue vocab indices
-    has_analogue_history: Tensor  # (B, L) bool — N_p^+(t_n) membership
+    log_q_collab: Tensor
+    alpha: Tensor
+    beta: Tensor
+    sigma: Tensor
+    analogues: Tensor
+    has_analogue_history: Tensor
 
 
 @dataclass(frozen=True)
 class CollaborativeContinuousOutputs:
-    """Cell-free continuous-mixture ingredients from one forward pass.
+    """Support-set ingredients for the cell-free continuous mixture.
 
-    Returned by :meth:`CollaborativeKDE.forward_continuous`. The
-    consumer (``ContinuousMixtureSpatial``) adds residual + defense
-    contributions to ``support_logits`` and then computes
-    :func:`shotcloud.training.spatial_losses.continuous_mixture_nll`
-    on the resulting joint scores.
-
-    The mixture density at the observed shot is
+    Returned by the ``forward_continuous`` method of both support backends
+    (:class:`CollaborativeKDE` and
+    :class:`~shotcloud.models.retrieval_collaborative_kde.RetrievalCollaborativeKDE`).
+    :class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial`
+    adds its own support-logit terms to ``support_logits`` and evaluates
+    the mixture density at the observed shot,
 
     .. math::
 
@@ -148,94 +160,147 @@ class CollaborativeContinuousOutputs:
         \\quad
         w_m = \\operatorname{softmax}_m(A + B + R + D),
 
-    where ``m = (l, r)`` flattens the analogue × support-shot axes.
+    with :func:`~shotcloud.training.spatial_losses.continuous_mixture_loglik`.
+
+    Attributes
+    ----------
+    support_xy : Tensor of shape (B, M, 2)
+        Support-shot coordinates in court feet. For :class:`CollaborativeKDE`,
+        ``M = L * R`` and ``m = (l, r)`` flattens the analogue and shot axes.
+    support_logits : Tensor of shape (B, M)
+        Pre-softmax support logits :math:`A + B`; further terms are added
+        by the caller.
+    sigma : Tensor of shape (B,)
+        Per-target bandwidth in feet.
+    support_mask : Tensor of shape (B, M), bool
+        ``True`` where the support slot holds a real, causal shot.
+    own_mask : Tensor of shape (B, M), bool
+        Subset of ``support_mask`` whose shooter is the target player.
+        Together with ``support_mask`` it partitions the valid support
+        into the own and pooled subsets used by the pooling gate.
+    support_shooter : Tensor of shape (B, M), int64
+        Vocabulary index of each support slot's shooter. Unspecified on
+        invalid slots; apply ``support_mask`` first.
+    analogue_idx : Tensor of shape (B, L), int64
+        Analogue vocabulary indices (diagnostic). Shape ``(B, 0)`` for the
+        retrieval backend.
+    alpha_scores : Tensor of shape (B, L)
+        Pre-softmax player-level scores :math:`A_l` (diagnostic). Empty for
+        the retrieval backend.
+    beta_scores : Tensor of shape (B, L, R)
+        Pre-softmax shot-level scores :math:`B_{l,r}` (diagnostic). Empty for
+        the retrieval backend.
     """
 
-    support_xy: Tensor  # (B, M, 2) — support shot coordinates (M = L * R)
-    support_logits: Tensor  # (B, M) — A_l + B_{l,r} (pre-softmax; R, D added by caller)
-    sigma: Tensor  # (B,)         — per-target bandwidth in ft
-    support_mask: Tensor  # (B, M) bool — True where the support shot is real + causal
-    own_mask: Tensor  # (B, M) bool — subset of ``support_mask`` whose shooter
-    #                                 is the target player. Together with
-    #                                 ``support_mask``, partitions the valid
-    #                                 support into own vs pooled subsets.
-    #                                 Backend-agnostic contract for the
-    #                                 pooling gate (PR3): both the L×R
-    #                                 collaborative backend and the upcoming
-    #                                 retrieval backend populate this field.
-    support_shooter: Tensor  # (B, M) int64 — vocab index of each support
-    #                                         slot's shooter. Backend-agnostic
-    #                                         per-slot identity. For invalid
-    #                                         (~support_mask) slots the value
-    #                                         is unspecified — callers must
-    #                                         apply ``support_mask`` first.
-    analogue_idx: Tensor  # (B, L)  — int64 analogue vocab indices (diagnostic;
-    #                                 fixed_lr backend only — retrieval emits
-    #                                 ``(B, 0)``).
-    alpha_scores: Tensor  # (B, L)  — A_l pre-softmax (diagnostic; fixed_lr).
-    beta_scores: Tensor  # (B, L, R) — B_{l,r} pre-softmax (diagnostic; fixed_lr).
+    support_xy: Tensor
+    support_logits: Tensor
+    sigma: Tensor
+    support_mask: Tensor
+    own_mask: Tensor
+    support_shooter: Tensor
+    analogue_idx: Tensor
+    alpha_scores: Tensor
+    beta_scores: Tensor
 
 
 class CollaborativeKDE(nn.Module):
-    """Per :doc:`docs/model_spec.md`, the q_collab spatial decoder.
+    r"""Collaborative adaptive KDE support backend over a fixed analogue grid.
+
+    For each batch row the support set is the ``L × R`` grid of the
+    target's top-``L`` analogues (from ``analogue_cache``) times up to
+    ``R`` stored shots per analogue, masked to shots dated strictly before
+    the snapshot's anchor date. The support logits are
+
+    .. math::
+
+        A_l = \phi_\theta([u_p, u_{p'}, u_p - u_{p'}, u_p \odot u_{p'}, x_n])
+              + b_{\mathrm{same}}\,[p' = p]
+              + \gamma \cos(u_p, u_{p'})
+              + \lambda_M \log(1 + M_{p'}) + \lambda_S \log(1 + S_{p'}),
+
+        B_{l,r} = g_\theta(x_n, z_{l,r}) - \lambda_{\mathrm{age}}\,\Delta t_{l,r},
+
+    where :math:`u` are causal player traits, :math:`z_{l,r}` is the
+    stored context of the support shot, :math:`\Delta t_{l,r}` its age in
+    days at the anchor date, and the similarity term is present only
+    with ``alpha_prior="similarity"``. The bandwidth is
+
+    .. math::
+
+        \sigma_p = \sigma_{\min} + (\sigma_{\max} - \sigma_{\min})\,
+        \mathrm{sigmoid}\bigl(a_0 - \mathrm{softplus}(a_M)\log(1 + M_p)
+        - \mathrm{softplus}(a_S)\log(1 + S_p) + a_R \log\rho_p\bigr),
+
+    with :math:`M_p` and :math:`S_p` the target's recency-weighted causal
+    minutes and field-goal attempts and :math:`\rho_p = (1 + S_p) / (1 + M_p)`; the
+    softplus terms make more evidence give a sharper kernel.
 
     Parameters
     ----------
     adaptive_kde : AdaptiveKDE
-        Fitted per-player history (cells, context, coords, dates).
-        Should be fit with ``max_history=R`` and ``history_policy=random``
-        per the v1 plan.
+        Fitted per-player history (context, coordinates, dates). Must be
+        fit with dates and per-shot coordinates. ``R`` is the longest
+        stored per-player history.
     snapshot_store : SnapshotStore
-        Provides anchor dates used by the causal date mask.
+        Provides the anchor dates used by the causal date mask.
     traits_table : PlayerTraitsTable
-        26-d per-(player, snapshot) trait vector.
+        Causal per-(player, snapshot) trait vectors of dimension
+        :data:`~shotcloud.data.player_traits.TRAIT_DIM`.
     analogue_cache : AnalogueRetrievalCache
-        Precomputed top-L analogues per (player, snapshot).
+        Precomputed top-``L`` analogues per (player, snapshot).
     vocab : PlayerVocab
-        Player-id ↔ idx mapping; the three tables above must all be
-        keyed to ``vocab.ids`` in the same order.
+        Player-id ↔ index mapping; the three tables above must be keyed
+        to ``vocab.ids`` in the same order.
     grid : CourtGrid
-        Court grid; the module pulls ``xcenters`` and ``ycenters`` for
-        the separable Gaussian kernel. The grid's image-layout
-        convention (``c = iy*nx + ix``) is what the returned ``log_q``
-        is ravelled to.
-    sigma_min, sigma_max : float
-        Bandwidth bounds (feet). Defaults match the anisotropic
-        kernel: ``0.75`` and ``4.0``.
-    sigma_init : float
-        Target bandwidth at step 0 (when σ-MLP coefficients are zero).
-        Default ``1.5`` matches the legacy fixed bandwidth so the
-        model reduces to "uniform analogue average × isotropic 1.5 ft
-        Gaussian" at training start.
-    phi_hidden_dim : int
-        Hidden width of the player-attention MLP φ_θ.
-    shot_attention_form : {"bilinear", "concat"}
-        ``"bilinear"`` (default) factors the shot-attention scoring as
-        ``g_θ(x, z) = f_θ(x)^T h_θ(z)`` so the per-shot ``h_θ`` is
-        computed on the batch's *unique* shot ids only. ``"concat"``
-        recovers the v1.0 ``g_θ([x; z])`` ablation form.
-    shot_hidden_dim : int
-        Hidden width of the shot-attention MLP(s) (g_θ in concat form,
-        f_θ and h_θ in bilinear form).
-    shot_proj_dim : int
-        Output dimension of the bilinear projections f_θ, h_θ. Ignored
-        for ``shot_attention_form="concat"``.
-    h_z_init : {"zero", "warm"}
-        Initialization of the bilinear shot-attention ``h_θ`` output
-        layer. ``"zero"`` (default) sets weights and bias to exactly
-        zero — this preserves the exact step-0 invariant
-        ``g_θ ≡ 0 → β uniform → log_q_bilinear == log_q_concat`` (see
-        :func:`tests.test_models_collaborative_kde.test_step0_bilinear_and_concat_produce_identical_log_q`).
-        ``"warm"`` initializes ``h_θ`` weights with small normal noise
-        (σ = 1e-3) and bias zero — β remains near-uniform at step 0
-        (KL to uniform < 1e-4) but the ``f_θ`` side of the bilinear
-        score immediately receives nonzero gradient through the chain
-        rule. Use ``"warm"`` if the strict-init dual-zero saddle slows
-        early spatial learning. Ignored for
-        ``shot_attention_form="concat"``.
-    eps : float
-        Additive smoothing constant for the per-cell density. Matches
-        the 2026-05-16 Decision-1 convention.
+        Court grid whose cell centers are used by the grid forward. The
+        returned grid log-density uses the image-layout flat index
+        ``c = iy * nx + ix``.
+    sigma_min, sigma_max : float, default 0.75, 4.0
+        Bandwidth bounds in feet. ``sigma_min == sigma_max`` fixes the
+        bandwidth at that value.
+    sigma_init : float, default 1.5
+        Bandwidth at initialization, for every player.
+    phi_hidden_dim : int, default 64
+        Hidden width of the player-attention MLP :math:`\phi_\theta`.
+    shot_attention_form : {"bilinear", "concat"}, default "bilinear"
+        ``"bilinear"`` scores shots as
+        :math:`g_\theta(x, z) = f_\theta(x)^\top h_\theta(z)`, computing
+        :math:`h_\theta` once per unique shot in the batch. ``"concat"``
+        uses an MLP on ``[x; z]`` (an ablation of the factorization).
+    shot_hidden_dim : int, default 64
+        Hidden width of the shot-attention MLPs.
+    shot_proj_dim : int, default 32
+        Output dimension of :math:`f_\theta` and :math:`h_\theta`. Ignored
+        for ``"concat"``.
+    h_z_init : {"zero", "warm"}, default "zero"
+        Initialization of the :math:`h_\theta` output layer. ``"zero"``
+        makes :math:`g_\theta \equiv 0`, so β is uniform at initialization
+        and the bilinear and concat forms coincide; :math:`f_\theta` then
+        receives no gradient until :math:`h_\theta` moves off zero.
+        ``"warm"`` draws the weights from a normal with standard deviation
+        ``1e-3``, keeping β near-uniform while giving
+        :math:`f_\theta` a nonzero gradient from the first step. Ignored
+        for ``"concat"``.
+    alpha_prior : {"none", "similarity"}, default "none"
+        With ``"similarity"``, adds the learnable term
+        :math:`\gamma \cos(u_p, u_{p'})` to the player-level scores.
+    alpha_prior_scale_init : float, default 2.0
+        Initial value of :math:`\gamma` when ``alpha_prior="similarity"``.
+    same_player_bias_init : float, default 0.0
+        Initial value of :math:`b_{\mathrm{same}}`, the bonus on the
+        analogue slot occupied by the target player. Positive values keep
+        the target's own history from being outweighed by analogues.
+    eps : float, default 1e-9
+        Total additive smoothing mass, spread uniformly over the grid
+        cells before log-normalization, so the grid density is strictly
+        positive.
+
+    Raises
+    ------
+    ValueError
+        If ``adaptive_kde`` is unfitted or lacks dates or coordinates, the
+        bandwidth bounds are inconsistent, a categorical option is
+        unknown, or the tables disagree in shape.
     """
 
     # Type hints for registered buffers (mypy).
@@ -380,18 +445,16 @@ class CollaborativeKDE(nn.Module):
 
         # Player-level scalar terms.
         # ``b_same`` boosts the analogue slot that equals the target
-        # player. Initialized to ``same_player_bias_init`` (default 0
-        # for back-compat). Per the 2026-05-17 α-prior intervention,
-        # values like +1.0 prevent the target's own causal history from
-        # being washed out by retrieval analogues.
+        # player; positive values (e.g. +1.0) keep the target's own
+        # causal history from being washed out by retrieval analogues.
         self.b_same = nn.Parameter(torch.tensor(float(same_player_bias_init), dtype=torch.float32))
         self.lambda_M = nn.Parameter(torch.zeros(()))
         self.lambda_S = nn.Parameter(torch.zeros(()))
         # Similarity-prior coefficient γ on cos(u_self, u_other). When
         # ``alpha_prior="similarity"`` it's a learnable scalar
         # initialized to ``alpha_prior_scale_init`` (typically 2.0).
-        # When ``alpha_prior="none"`` it's a no-grad zero buffer so
-        # downstream code path stays identical structurally.
+        # When ``alpha_prior="none"`` it is a zero buffer, so
+        # ``learned_scalars`` reports it in both configurations.
         self.alpha_prior: AlphaPrior = alpha_prior
         if alpha_prior == "similarity":
             self.gamma_sim = nn.Parameter(
@@ -406,15 +469,13 @@ class CollaborativeKDE(nn.Module):
         # Bilinear form (default):
         #   g_θ(x, z) = f_θ(x)^T h_θ(z) - λ_age Δt
         # The h_θ output layer is either:
-        #   - "zero":  W=0, b=0 → g_θ ≡ 0 → β uniform at step 0 (exact
-        #              equivalence to concat-form zero-init via
-        #              softmax(0). f_θ side has zero gradient at step 0
-        #              until h_θ lifts off — the "dual saddle" that
-        #              motivates the warm option below.
-        #   - "warm":  W ~ N(0, 1e-3), b=0 → β stays near-uniform
-        #              (KL to uniform < 1e-4 at init) but g_θ has small
-        #              nonzero score, so f_θ's chain-rule gradient is
-        #              nonzero from step 1.
+        #   - "zero":  W=0, b=0 → g_θ ≡ 0 → β uniform at init (same
+        #              density as the zero-initialized concat form). f_θ
+        #              receives no gradient until h_θ moves off zero.
+        #   - "warm":  W ~ N(0, std=1e-3), b=0 → β stays near-uniform
+        #              (KL to uniform < 1e-4 at init) but g_θ is small
+        #              and nonzero, so f_θ's gradient is nonzero from
+        #              the first step.
         # Concat form (ablation):
         #   g_θ([x; z]) MLP with output layer zero-init.
         if shot_attention_form == "bilinear":
@@ -448,15 +509,15 @@ class CollaborativeKDE(nn.Module):
                 g_out_layer,
             )
             self._shot_proj_dim = 0
-            # h_z_init is bilinear-only but we record the requested value
-            # for diagnostic round-trip (extra_repr, manifest reads).
+            # h_z_init only affects the bilinear form; it is recorded
+            # here so extra_repr reports the requested value.
             self.h_z_init = h_z_init
 
         # Shot-level recency-decay rate.
         self.lambda_age = nn.Parameter(torch.zeros(()))
 
-        # Bandwidth scalars (a_0, a_M, a_S, a_R). At step 0 we want
-        # σ_p(t_m) = sigma_init for every player regardless of evidence.
+        # Bandwidth scalars (a_0, a_M, a_S, a_R). At initialization
+        # σ_p = sigma_init for every player regardless of evidence.
         # The formula is
         #   σ = σ_min + (σ_max − σ_min) · sigmoid[
         #       a_0 − softplus(a_M)·log1p_M − softplus(a_S)·log1p_S + a_R·log_density
@@ -465,7 +526,7 @@ class CollaborativeKDE(nn.Module):
         # a_M = a_S = 0, because softplus(0) = ln(2) ≈ 0.693 already
         # pulls σ toward σ_min for any player with non-trivial evidence).
         # Init a_M = a_S = -10 → softplus ≈ 4.5e-5 → the evidence terms
-        # contribute negligibly at step 0, leaving σ = σ_min +
+        # contribute negligibly at init, leaving σ = σ_min +
         # (σ_max − σ_min)·sigmoid(a_0) = sigma_init.
         # When σ is locked (sigma_range == 0) the bandwidth formula
         # collapses to ``σ ≡ σ_min``; a_0 has no effect on the output,
@@ -480,11 +541,13 @@ class CollaborativeKDE(nn.Module):
         self.a_R = nn.Parameter(torch.zeros(()))
 
     @property
-    def L(self) -> int:  # noqa: N802 — matches the spec's notation `L = |N_p^(t_m)|`
+    def L(self) -> int:  # noqa: N802 — matches the notation `L = |N_p(t_n)|`
+        """Number of analogue slots per row."""
         return self._L
 
     @property
     def n_cells(self) -> int:
+        """Number of cells in the court grid."""
         return self._n_cells
 
     @property
@@ -522,14 +585,11 @@ class CollaborativeKDE(nn.Module):
         analogue_idx: Tensor,
         x_n_phi: Tensor,
     ) -> Tensor:
-        """Pre-softmax per-analogue scores ``A_l`` (paper §"continuous
-        collab"). Exposed separately so the cell-free
-        :meth:`forward_continuous` path can fold ``A_l`` into the
-        joint softmax over support shots without first running the
-        per-analogue softmax (the grid path).
+        """Pre-softmax per-analogue scores ``A_l``, shape ``(B, L)``.
 
-        Returns ``(B, L)`` float scores. Invalid-analogue masking is
-        the caller's responsibility — this method returns raw scores.
+        Separate from :meth:`_compute_alpha` so :meth:`forward_continuous`
+        can fold ``A_l`` into the joint softmax over support shots.
+        Returns raw scores; masking invalid analogues is the caller's job.
         """
         u_self = self.traits[player_idx, snapshot_idx]  # (B, TRAIT_DIM)
         u_other = self._gather_analogue_traits(analogue_idx, snapshot_idx)  # (B, L, TRAIT_DIM)
@@ -568,10 +628,11 @@ class CollaborativeKDE(nn.Module):
         x_n_phi: Tensor,
         valid_analogue_mask: Tensor,
     ) -> Tensor:
-        """Player-level attention α (post-softmax). Calls
-        :meth:`_compute_alpha_scores` and applies the per-analogue
-        masked softmax + defensive uniform-fallback for cold-start
-        rows. Used by the grid (cell-based) forward."""
+        """Player-level attention α for the grid forward, shape ``(B, L)``.
+
+        Masked softmax of :meth:`_compute_alpha_scores` over valid
+        analogues; rows with no valid analogue fall back to uniform.
+        """
         scores = self._compute_alpha_scores(player_idx, snapshot_idx, analogue_idx, x_n_phi)
         _b, L = analogue_idx.shape
         # Mask invalid analogues with -inf so softmax assigns them α = 0.
@@ -585,7 +646,7 @@ class CollaborativeKDE(nn.Module):
         return alpha
 
     def _compute_sigma(self, player_idx: Tensor, snapshot_idx: Tensor) -> Tensor:
-        """Per-target bandwidth σ_p(t_m). Returns ``(B,)``.
+        """Per-target bandwidth σ_p. Returns ``(B,)``.
 
         ``σ = σ_min + (σ_max − σ_min) · sigmoid[a_0
                   − softplus(a_M)·log1p_M − softplus(a_S)·log1p_S
@@ -655,10 +716,10 @@ class CollaborativeKDE(nn.Module):
         return score
 
     def _concat_score(self, x_n: Tensor, shot_idx: Tensor) -> Tensor:
-        """Legacy concat-MLP scorer ``g_θ([x; z])``, ablation only.
+        """Concat-MLP scorer ``g_θ([x; z])`` (ablation form).
 
-        Materializes the full ``(B, L, R, D)`` shot-context tensor and
-        runs an MLP on it. Slower but kept as the v1.0 baseline.
+        Materializes the full ``(B, L, R, D)`` shot-context tensor, so it
+        is slower than the bilinear form.
         """
         b, L, R = shot_idx.shape
         safe_idx = shot_idx.clamp_min(0)
@@ -682,28 +743,34 @@ class CollaborativeKDE(nn.Module):
         x_n: Tensor,
         return_components: bool = False,
     ) -> Tensor | tuple[Tensor, CollaborativeOutputs]:
-        """Compute ``log q_collab(c | x_n, t_n)`` for the batch.
+        """Compute the grid log-density ``log q_collab(c | x_n, t_n)``.
 
         Parameters
         ----------
         player_idx : LongTensor of shape ``(B,)``
-            Per-row vocab index of the target player.
+            Vocabulary index of the target player.
         snapshot_idx : LongTensor of shape ``(B,)``
-            Per-row snapshot index (the bundle whose anchor contains
-            the shot's date).
+            Causal snapshot index of the shot's game.
         x_n_raw : Tensor of shape ``(B, CONTEXT_DIM)``
-            Raw context (the :class:`ContextEncoder` output). Threaded
-            through for API parity with the legacy
-            ``AdaptiveOffensivePrior``; the collaborative module's
-            MLPs are unstructured and consume the learned ``x_n``.
+            Raw context (the
+            :class:`~shotcloud.data.context.ContextEncoder` output).
+            Accepted for interface compatibility with the other spatial
+            backends and unused: all attention MLPs consume the learned
+            ``x_n``.
         x_n : Tensor of shape ``(B, CONTEXT_DIM)``
-            Learned context :math:`x_n = f_{ctx}(\\tilde x_n)`.
-            Consumed by φ_θ (player attention) and f_θ / h_θ (shot
-            attention).
+            Learned context :math:`x_n = f_{ctx}(\\tilde x_n)`, consumed by
+            φ_θ (player attention) and f_θ / h_θ (shot attention).
         return_components : bool, default False
-            When True, returns ``(log_q, CollaborativeOutputs)``.
+            When True, also return the :class:`CollaborativeOutputs`.
+
+        Returns
+        -------
+        log_q : Tensor of shape ``(B, n_cells)``
+            Normalized log-density over the court grid.
+        components : CollaborativeOutputs
+            Returned only when ``return_components=True``.
         """
-        del x_n_raw  # accepted for API parity with AdaptiveOffensivePrior
+        del x_n_raw  # accepted for interface compatibility; unused
         b = player_idx.shape[0]
 
         # 1. Gather analogues for the batch.
@@ -752,7 +819,8 @@ class CollaborativeKDE(nn.Module):
             ycenters=self.ycenters,
         )
 
-        # 7. Additive smoothing + log-normalize (Decision-1 convention).
+        # 7. Additive ε-smoothing keeps every cell strictly positive, then
+        #    log-normalize.
         smoothed = q_collab.clamp_min(0.0) + (self.eps / self._n_cells)
         log_q = torch.log(smoothed) - torch.log(smoothed.sum(dim=-1, keepdim=True))
 
@@ -770,7 +838,7 @@ class CollaborativeKDE(nn.Module):
         return log_q, components
 
     # -----------------------------------------------------------------
-    # Cell-free continuous-mixture forward (paper §"continuous collab")
+    # Cell-free continuous-mixture forward
     # -----------------------------------------------------------------
 
     def forward_continuous(
@@ -780,20 +848,26 @@ class CollaborativeKDE(nn.Module):
         x_n_raw: Tensor,
         x_n: Tensor,
     ) -> CollaborativeContinuousOutputs:
-        """Produce the ingredients for the cell-free mixture
-        likelihood. Unlike :meth:`forward` (which returns a grid
-        ``(B, n_cells)`` log-density via separable kernel), this
-        method returns the support shots' coordinates + pre-softmax
-        joint scores ``A_l + B_{l,r}`` so the trainer can add
-        residual/defense contributions and then ``logsumexp`` over
-        the Gaussian kernel at the *exact* observed coordinate
-        (see :func:`shotcloud.training.spatial_losses.continuous_mixture_nll`).
+        """Return the support set and logits for the cell-free mixture.
 
-        The grid is bypassed entirely. The two-stage α · β softmax
-        is replaced by a single joint softmax over ``(l, r)``,
-        normalized externally by the consumer.
+        Unlike :meth:`forward`, no grid is involved: the method returns
+        the support-shot coordinates and the joint pre-softmax logits
+        ``A_l + B_{l,r}`` over the flattened ``M = L * R`` support axis.
+        The caller adds further support-logit terms, normalizes with a
+        single softmax over ``(l, r)`` in place of the two-stage α · β
+        softmax, and evaluates the kernel mixture at the observed
+        coordinate.
+
+        Parameters
+        ----------
+        player_idx, snapshot_idx, x_n_raw, x_n
+            As in :meth:`forward`.
+
+        Returns
+        -------
+        CollaborativeContinuousOutputs
         """
-        del x_n_raw  # accepted for API parity
+        del x_n_raw  # accepted for interface compatibility; unused
         b = player_idx.shape[0]
         analogue_idx = self._gather_analogues(player_idx, snapshot_idx)  # (B, L)
         anchor_dates_b = self.anchor_dates[snapshot_idx]  # (B,)
@@ -829,8 +903,8 @@ class CollaborativeKDE(nn.Module):
         support_xy = shot_coords.reshape(b, self._L * self._R, 2)
         del valid_analogue_mask  # available as support_mask.any(-1) downstream
 
-        # Backend-agnostic own/pooled partition for the pooling gate
-        # (PR3). For the L×R backend, "own" slots are those whose
+        # Own/pooled partition for the pooling gate. For the L×R
+        # backend, "own" slots are those whose
         # L-slot's analogue equals the target player, intersected with
         # the causal/real support mask.
         is_self_l = analogue_idx == player_idx.unsqueeze(-1)  # (B, L)
@@ -838,8 +912,8 @@ class CollaborativeKDE(nn.Module):
             is_self_l.unsqueeze(-1).expand(-1, -1, self._R).reshape(b, self._L * self._R)
         )  # (B, M)
         own_mask = is_self_m & support_mask
-        # Backend-agnostic per-slot shooter identity (PR3.2). Broadcast
-        # the per-L analogue id over R shots per analogue.
+        # Per-slot shooter identity: broadcast the per-L analogue id
+        # over the R shots of each analogue.
         support_shooter = (
             analogue_idx.unsqueeze(-1).expand(-1, -1, self._R).reshape(b, self._L * self._R)
         )
@@ -890,8 +964,7 @@ class CollaborativeKDE(nn.Module):
         )
 
 
-# Silence the M_PLAY_SLOT unused-import warning — the slot isn't used
-# directly by CollaborativeKDE, but we re-export the constant so
-# downstream diagnostics (Phase 5) have it available without an extra
-# import.
+# M_PLAY_SLOT is not used by CollaborativeKDE directly; it is imported so
+# diagnostics can read it from this module, and referenced here to keep
+# the import from being flagged as unused.
 _ = M_PLAY_SLOT

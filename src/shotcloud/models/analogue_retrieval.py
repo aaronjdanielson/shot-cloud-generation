@@ -1,23 +1,21 @@
-"""Top-L analogue retrieval cache for the collaborative KDE (Phase 3).
+"""Top-L analogue retrieval for the fixed-grid collaborative KDE.
 
-For each (target player, snapshot anchor), precompute the top-L most
-similar players in trait space. The cache is consumed by
-:class:`CollaborativeKDE` (Phase 4) — each forward pass simply gathers
-``cache[player_idx, snapshot_idx]`` to get the analogue indices for
-the batch's player-level attention.
-
-Per :doc:`docs/model_spec.md`, the retrieval is:
+For each (target player, snapshot anchor) the cache stores the ``L``
+players most similar in causal trait space,
 
 .. math::
 
-    \\mathcal N_p^{(t_m)}
-    = \\mathrm{TopL}_{p'} \\mathrm{cosine}(u_p(t_m), u_{p'}(t_m))
+    \\mathcal N_p(t_m)
+    = \\mathrm{TopL}_{p'}\\, \\cos\\bigl(u_p(t_m), u_{p'}(t_m)\\bigr),
 
-with the target player ``p`` always included in :math:`\\mathcal N_p^{(t_m)}`.
-Cold-start retrieval works automatically: when a player's play-derived
-traits are all zero, the cosine reduces to similarity on the
-biographical block (height/weight/age/position), and analogues with
-similar physical profile surface naturally.
+with the target player itself in the first slot by default.
+:class:`~shotcloud.models.collaborative_kde.CollaborativeKDE` gathers
+``analogues[player_idx, snapshot_idx]`` at each forward pass. Because the
+trait vectors are computed per snapshot from pre-anchor data, the
+retrieval is causal. A player with no play history has an all-zero
+play-derived trait block, so the similarity reduces to the biographical
+block (height, weight, age, position) and analogues with a similar
+physical profile are retrieved.
 """
 
 from __future__ import annotations
@@ -32,13 +30,21 @@ from shotcloud.data.player_traits import PlayerTraitsTable
 
 @dataclass(frozen=True)
 class AnalogueRetrievalCache:
-    """(n_players, n_snapshots, L) int64 cache of analogue player indices.
+    """Per-(player, snapshot) top-L analogue player indices.
 
-    Each row ``cache[p, m, :]`` is the top-L analogue *indices* (into
-    ``player_ids``) for target player ``player_ids[p]`` at snapshot
-    ``snapshot_anchors[m]``. Indices are sorted by descending
-    cosine similarity. When ``ensure_self`` was True (default),
-    ``cache[p, m, 0] == p`` for every (p, m).
+    Attributes
+    ----------
+    analogues : ndarray of shape (n_players, n_snapshots, L), int64
+        ``analogues[p, m, :]`` are the top-``L`` analogue indices (into
+        ``player_ids``) for target ``player_ids[p]`` at snapshot
+        ``snapshot_anchors[m]``, sorted by descending cosine similarity.
+        When built with ``ensure_self=True``, ``analogues[p, m, 0] == p``.
+    player_ids : ndarray of shape (n_players,), int64
+        Player ids defining the row order.
+    snapshot_anchors : ndarray of shape (n_snapshots,), datetime64
+        Snapshot anchor dates.
+    L : int
+        Number of analogues per (player, snapshot).
     """
 
     analogues: NDArray[np.int64]
@@ -48,10 +54,12 @@ class AnalogueRetrievalCache:
 
     @property
     def n_players(self) -> int:
+        """Number of target players."""
         return int(self.analogues.shape[0])
 
     @property
     def n_snapshots(self) -> int:
+        """Number of snapshots."""
         return int(self.analogues.shape[1])
 
 
@@ -85,17 +93,22 @@ def build_analogue_cache(
     L : int, default 15
         Number of analogues per target. Must be ≤ ``n_players``.
     ensure_self : bool, default True
-        When True, the target player is guaranteed to be the first
-        entry of every analogue list. This matches the spec's
-        ``s_{p,p}(x,t) = b_same · 1{p=p'} + ...`` self-bias term —
-        the model can prefer self via ``b_same`` only if self is in
-        the analogue set.
+        When True, the target player is the first entry of every
+        analogue list, so the target's own history is part of the
+        support and the self-bias ``b_same`` of
+        :class:`~shotcloud.models.collaborative_kde.CollaborativeKDE` has
+        a slot to act on.
 
     Returns
     -------
     AnalogueRetrievalCache
         Frozen wrapper around the int64 (n_players, n_snapshots, L)
         analogue indices.
+
+    Raises
+    ------
+    ValueError
+        If ``L`` is not positive or exceeds the number of players.
     """
     if L <= 0:
         raise ValueError(f"L must be positive, got {L}")

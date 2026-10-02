@@ -1,21 +1,42 @@
-"""Joint Gibbs trainer.
+"""Trainers for the marked point-process model.
 
-Trains the spatial, timing, and count factors jointly under the
-shared learned context :math:`x_n = f_{\\mathrm{ctx}}(\\tilde x_n)`.
-The spatial factor is :class:`ConditionalGibbsDecoder` composing the
-offensive prior, the opponent reweighting field (when present), and
-the residual tilt (when present).
+:func:`train_gibbs` fits the spatial, timing and count factors jointly on
+a :class:`~shotcloud.training.GibbsShotDataset`, under the shared learned
+context :math:`x_n = f_{\\mathrm{ctx}}(\\tilde x_n)`. The spatial factor
+is selected by ``spatial_likelihood``:
 
-Per-shot total loss::
+* ``"continuous_mixture"`` -- the AC-KDE spatial factor,
+  :class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial`
+  (or its mode-routed subclass when a ``mode_router`` is given), scored by
+  the cell-free kernel-mixture likelihood;
+* ``"mode_mixture"`` -- the mode-mixture decoder
+  :class:`~shotcloud.models.collaborative_mode_mixture.CollaborativeModeMixtureSpatial`,
+  an alternative evaluated as an ablation;
+* ``"cell"`` and ``"continuous_cell"`` -- the deprecated grid-cell
+  :class:`~shotcloud.legacy_pivot.gibbs_decoder.ConditionalGibbsDecoder`,
+  scored by exact-cell or continuous-coordinate NLL.
 
-    L_shot = -log p_Θ(c_obs | x_n)
-             -log ρ_η(τ_bin | x_n)
-             -log p_count(K_obs | x_n_game) / shots_in_game
-             + λ_tilt * ||u^T v||²
+With the default ``count_loss_normalization="per_game"`` the minibatch
+objective is
 
-The amortized count contribution sums to ``-log p_count`` per game
-across the game's shots, so an epoch-aggregate is exactly the
-per-game count log-likelihood without a separate count pass.
+.. math::
+
+    L = \\frac{1}{B} \\sum_{n \\in \\mathrm{batch}} \\bigl[
+          \\lambda_s \\ell^{\\mathrm{spatial}}_n
+        + \\lambda_t \\ell^{\\mathrm{timing}}_n
+        + \\lambda_{\\mathrm{tilt}} \\overline{R_\\theta^2}_n
+        + \\lambda_D \\overline{D^2}_n \\bigr]
+      + \\lambda_c \\frac{1}{G} \\sum_{g \\in \\mathrm{batch}}
+          \\ell^{\\mathrm{count}}_g,
+
+where the bars are means of the squared residual tilt and opponent
+reweighting over the row's support shots (or cells), and the count NLL
+is averaged over the ``G`` distinct player-games in the batch.
+
+The module also provides single-factor trainers --
+:func:`train_count_only`, :func:`train_timing_only` and
+:func:`train_presence_only` -- used to pretrain a head before it is
+loaded, and optionally frozen, in the joint trainer.
 """
 
 from __future__ import annotations
@@ -70,48 +91,47 @@ from shotcloud.training.spatial_losses import (
     expected_distance_ft,
 )
 
-#: Literal type for the ``--spatial-likelihood`` switch.
+#: Spatial likelihood selected by ``train_gibbs(spatial_likelihood=...)``.
 #:
-#:  - ``"cell"``: legacy categorical NLL on the observed cell.
+#:  - ``"cell"``: categorical NLL of the observed cell (grid-cell decoder).
 #:  - ``"continuous_cell"``: continuous-coordinate NLL via a Gaussian
-#:    observation kernel against the grid log-probs.
-#:  - ``"continuous_mixture"``: cell-free continuous-mixture NLL of
-#:    the collaborative support shots — no grid in the loss path.
-#:  - ``"mode_mixture"``: per-player-game K-mode Gaussian mixture
-#:    extracted from the attended support shots; the headline
-#:    cell-free spatial decoder for the v1.2 paper.
-SpatialLikelihood = str  # constrained at CLI boundary
+#:    observation kernel against the grid log-probabilities (grid-cell
+#:    decoder).
+#:  - ``"continuous_mixture"``: cell-free kernel-mixture NLL over the
+#:    causal support shots (the AC-KDE spatial factor).
+#:  - ``"mode_mixture"``: per-row K-mode Gaussian mixture extracted from
+#:    the attended support shots.
+SpatialLikelihood = str  # validated by train_gibbs
 
-# Legacy alias retained for back-compat with old callers.
+#: Alias of :data:`SpatialLikelihood`.
 SpatialLoss = SpatialLikelihood
 
 #: How the count NLL enters the joint loss.
 #:
-#: - ``"per_game"`` (default after 2026-06-07 audit): the per-game count
-#:   NLL is averaged across the unique games in each batch and added to
-#:   the per-shot loss mean as ``loss = loss_per_shot.mean() +
-#:   lambda_count * count_loss_per_game.mean()``. ``lambda_count = 1.0``
-#:   then puts the count head at parity with the per-shot spatial NLL
-#:   on a per-update basis — which is what every other entry in the
-#:   joint loss already does. Use this for any new run; it is the
-#:   normalization the paper's loss equation describes.
-#: - ``"per_shot"`` (legacy): the per-game count NLL is amortized as
-#:   ``-log p(K_g | x_g) / K_g`` per shot and mixed into ``loss_per_shot``.
-#:   At ``lambda_count = 1.0`` the count term contributes roughly
-#:   ``1/K̄ ≈ 4.5%`` of the per-shot spatial weight, which under-supervises
-#:   the count head; this normalization is preserved here only to
-#:   reproduce checkpoints trained before the audit.
-CountLossNormalization = str  # constrained at CLI boundary: "per_game" | "per_shot"
+#: - ``"per_game"`` (default): the per-game count NLL is averaged over the
+#:   distinct games in the batch and added to the mean per-shot loss,
+#:   ``loss = loss_per_shot.mean() + lambda_count *
+#:   count_loss_per_game.mean()``. With ``lambda_count = 1`` one game's
+#:   count NLL is weighted like one shot's spatial NLL. This is the
+#:   normalization of the paper's training objective.
+#: - ``"per_shot"``: the count NLL is amortized as
+#:   ``-log p(K_g | x_g) / K_g`` over the game's shots and added to the
+#:   per-shot loss. At ``lambda_count = 1`` the count term then carries
+#:   about ``1/K̄`` of the spatial weight; retained to reproduce models
+#:   trained with this normalization.
+CountLossNormalization = str  # "per_game" | "per_shot", validated by _epoch
 
 
 @dataclass
 class CountOnlyTrainHistory:
     """Per-epoch history for :func:`train_count_only`.
 
-    ``train_count`` / ``val_count`` are the per-game count NLL averaged
-    over the epoch's games. Calibration diagnostics
-    (``train_mean_mu`` / ``val_mean_mu`` etc.) are populated by the
-    final ``finalize_diagnostics`` epoch over the full train/val sets.
+    ``train_count`` / ``val_count`` are the count NLL averaged over games;
+    ``train_mean_mu`` / ``val_mean_mu`` the mean predicted count ``μ``; and
+    ``log_kappa`` the dispersion parameter, each recorded once per epoch
+    (training values accumulate over the epoch's minibatches, validation
+    values are computed after the epoch). ``train_mean_k`` / ``val_mean_k``
+    are the observed mean counts, for comparison with ``μ``.
     """
 
     train_count: list[float] = field(default_factory=list)
@@ -139,18 +159,18 @@ def train_count_only(
     shuffle: bool = True,
     progress: bool = False,
 ) -> CountOnlyTrainHistory:
-    """Standalone count-head training loop (no spatial decoder, no support).
+    """Train the count head alone on per-game shot counts.
 
-    Iterates over per-game ``(x_n_raw, K_obs)`` rows from
-    :class:`PerGameTable`, runs ``μ = softplus(g_η(f_ctx(x_n_raw)))`` and
-    minimizes ``-log p(K | μ, κ)`` averaged per game.
+    Iterates over per-game ``(x_n_raw, K_obs)`` rows of a
+    :class:`~shotcloud.training.PerGameTable`, computes
+    ``μ = softplus(g_η(f_ctx(x_n_raw)))`` and minimizes the
+    negative-binomial NLL ``-log p(K | μ, κ)`` averaged over games.
 
-    Intended for the *count pretraining* step of the
-    ``pretrain → freeze → spatial`` workflow (CLAUDE.md Phase 1.2c). The
-    saved ``count_head`` and ``context_mlp`` state can be loaded by the
-    joint trainer via ``--count-checkpoint`` and held fixed with
-    ``--freeze-count`` so the spatial decoder consumes a calibrated
-    detached ``μ`` rather than a co-adapted latent score.
+    This is the pretraining step for the count factor: the resulting
+    ``count_head`` and ``context_mlp`` states can be loaded by
+    :func:`train_gibbs` through ``count_checkpoint_path`` and held fixed
+    with ``freeze_count`` (and ``freeze_context_mlp``), so the spatial
+    decoder consumes a fixed count prediction.
 
     Parameters
     ----------
@@ -163,14 +183,27 @@ def train_count_only(
         Per-game raw context (typically ``train_set.per_game.x_n_raw``).
     train_per_game_k : Tensor, shape ``(n_games,)`` integer
         Per-game observed shot counts.
-    val_per_game_x_raw, val_per_game_k : optional
-        Validation per-game tensors. If both provided, val NLL is
-        computed at the end of every epoch.
+    val_per_game_x_raw, val_per_game_k : Tensor, optional
+        Validation per-game tensors. If both are given, the validation NLL
+        is computed at the end of every epoch.
+    n_epochs, batch_size, learning_rate, weight_decay
+        Adam training configuration; ``batch_size`` counts games.
+    device : str or torch.device, default "cpu"
+        Device to train on.
+    shuffle : bool, default True
+        Shuffle games each epoch.
+    progress : bool, default False
+        Print one line of losses per epoch.
 
     Returns
     -------
     CountOnlyTrainHistory
-        Per-epoch loss + calibration diagnostics.
+        Per-epoch losses and calibration diagnostics.
+
+    Raises
+    ------
+    ValueError
+        On mismatched input shapes or when no parameter requires grad.
     """
     dev = torch.device(device) if isinstance(device, str) else device
     count_head.to(dev)
@@ -256,8 +289,13 @@ def train_count_only(
 
 @dataclass
 class PresenceTrainHistory:
-    """Per-epoch history for :func:`train_presence_only` (paper §5.2,
-    Phase 3.4 PR-P1)."""
+    """Per-epoch history for :func:`train_presence_only`.
+
+    Per-bin binary cross-entropy and mean absolute error on train and
+    validation rows, plus the model's scalar parameters ``rho`` (recency
+    decay per day), ``b0`` (gate bias) and ``beta_h`` (gate history
+    slope) after each epoch.
+    """
 
     train_bce: list[float] = field(default_factory=list)
     val_bce: list[float] = field(default_factory=list)
@@ -277,10 +315,10 @@ def _build_presence_training_inputs(
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Build per-row presence training tensors from the on-court table.
 
-    For each row $(p, g)$ in the table sorted by ``game_date`` the
-    *target* is the row's 30-bin vector and the *priors* are the rows
-    in the player's group with strictly earlier dates (and matching
-    starter status when ``same_starter_only=True``).
+    For each player-game row the target is the row's ``n_bins`` on-court
+    vector and the priors are the same player's rows with strictly
+    earlier ``game_date`` (and matching starter status when
+    ``same_starter_only=True``).
 
     Returns a tuple ``(prior_bins_pad, prior_ages_days_pad, prior_mask_pad,
     position_idx, starter_idx, history_count, target_bins)``.
@@ -361,10 +399,37 @@ def train_presence_only(
     shuffle: bool = True,
     progress: bool = False,
 ) -> PresenceTrainHistory:
-    """Train :class:`~shotcloud.models.PresenceModel` on per-(game, player)
-    on-court vectors. Per-bin BCE loss; targets are the row's bin
-    vector, inputs are the player's strictly-prior games with matching
-    starter status — leave-one-out causality by construction.
+    """Train a :class:`~shotcloud.models.presence.PresenceModel` on on-court vectors.
+
+    Each player-game row's target is its per-bin on-court fraction; the
+    inputs are the same player's games with strictly earlier dates and the
+    same starter status, so no row sees its own or later games. The loss
+    is per-bin binary cross-entropy.
+
+    Parameters
+    ----------
+    presence_model : PresenceModel
+        Trained in place; must expose ``n_bins``.
+    table : DataFrame
+        Training rows with ``player_id``, ``game_date``, ``starter`` and
+        on-court columns ``bin_0`` ... ``bin_{n_bins-1}``.
+    player_to_position : dict of int to int
+        Position index per player ID; unknown players map to 0.
+    val_table : DataFrame, optional
+        Validation rows in the same format.
+    n_epochs, batch_size, learning_rate, weight_decay
+        Adam training configuration.
+    device : str or torch.device, default "cpu"
+        Device to train on.
+    shuffle : bool, default True
+        Shuffle rows each epoch.
+    progress : bool, default False
+        Print one line of losses per epoch.
+
+    Returns
+    -------
+    PresenceTrainHistory
+        Per-epoch losses and parameter values.
     """
     if not hasattr(presence_model, "n_bins"):
         raise ValueError("presence_model must expose ``n_bins`` attribute")
@@ -472,10 +537,8 @@ def train_presence_only(
 class TimingOnlyTrainHistory:
     """Per-epoch history for :func:`train_timing_only`.
 
-    ``train_timing`` / ``val_timing`` are the per-shot timing NLL
-    averaged over the epoch's shots. The 48-bin softmax timing head
-    is trained against per-shot ``tau_bin`` from
-    :class:`GibbsShotDataset` (one bin per game minute).
+    ``train_timing`` / ``val_timing`` are the timing NLL of the 48-bin
+    softmax head (one bin per game minute) averaged over shots.
     """
 
     train_timing: list[float] = field(default_factory=list)
@@ -498,19 +561,13 @@ def train_timing_only(
     shuffle: bool = True,
     progress: bool = False,
 ) -> TimingOnlyTrainHistory:
-    """Standalone timing-head training loop (no spatial decoder, no count).
+    """Train the timing head alone on per-shot timing bins.
 
-    Iterates over per-shot ``(x_n_raw, tau_bin)`` rows from
-    :class:`GibbsShotDataset` and minimizes per-shot
-    ``-log ρ_η(τ | x_n)`` against the 48-bin softmax head's predicted
-    distribution.
-
-    Intended for the timing pretrain step of the timing-validation
-    Phase (paper §5 / docs/log Phase 3): solo-train the timing head
-    on per-shot timing NLL alone with the correct loss normalization,
-    then freeze and consume as a separately-validated marked-PP
-    component. Mirrors :func:`train_count_only` for the count
-    pathway.
+    Iterates over per-shot ``(x_n_raw, tau_bin)`` rows of a
+    :class:`~shotcloud.training.GibbsShotDataset` and minimizes the
+    per-shot NLL ``-log ρ_η(τ | x_n)`` of the 48-bin softmax head. Used to
+    pretrain the timing factor separately from the spatial and count
+    factors; the timing counterpart of :func:`train_count_only`.
 
     Parameters
     ----------
@@ -524,14 +581,27 @@ def train_timing_only(
         Per-shot raw context (typically ``train_set.x_n_raw``).
     train_tau_bin : Tensor of shape ``(N_train,)`` int64
         Per-shot timing bins (typically ``train_set.tau_bin``).
-    val_x_n_raw, val_tau_bin : optional
-        Validation per-shot tensors. If both provided, val timing
-        NLL is computed at the end of every epoch.
+    val_x_n_raw, val_tau_bin : Tensor, optional
+        Validation per-shot tensors. If both are given, the validation
+        timing NLL is computed at the end of every epoch.
+    n_epochs, batch_size, learning_rate, weight_decay
+        Adam training configuration; ``batch_size`` counts shots.
+    device : str or torch.device, default "cpu"
+        Device to train on.
+    shuffle : bool, default True
+        Shuffle shots each epoch.
+    progress : bool, default False
+        Print one line of losses per epoch.
 
     Returns
     -------
     TimingOnlyTrainHistory
         Per-epoch train/val timing NLL.
+
+    Raises
+    ------
+    ValueError
+        On mismatched input shapes or when no parameter requires grad.
     """
     dev = torch.device(device) if isinstance(device, str) else device
     timing_head.to(dev)
@@ -600,15 +670,30 @@ def train_timing_only(
 
 @dataclass
 class GibbsTrainHistory:
-    """Per-epoch loss history for the joint trainer.
+    """Per-epoch loss and diagnostic history of :func:`train_gibbs`.
 
-    ``train_spatial`` / ``val_spatial`` are the **training objective**
-    spatial loss — equal to ``train_spatial_cell`` when
-    ``spatial_loss="cell"`` and to ``train_spatial_continuous`` when
-    ``spatial_loss="continuous"``. The other ``_cell`` /
-    ``_continuous`` / ``_distance_ft`` series are always logged for
-    cross-run comparability regardless of which loss was optimized
-    against.
+    Each series holds one value per epoch. Every ``train_*`` series except
+    ``train_reg`` has a ``val_*`` counterpart, filled only when a
+    validation set is given. Series that do not apply to the configured
+    model are ``NaN``.
+
+    * ``spatial`` is the optimized spatial NLL per shot: the kernel-mixture
+      NLL (also in ``spatial_mix_nll``) for the cell-free likelihoods, and
+      ``spatial_cell`` or ``spatial_continuous`` for ``"cell"`` and
+      ``"continuous_cell"``. On the grid paths both cell losses and
+      ``expected_distance_ft`` are always recorded for comparison.
+    * ``timing`` is the per-shot timing NLL; ``count`` is the count NLL
+      amortized per shot (each game's NLL divided by its shot count);
+      ``reg`` is the weighted residual-tilt and opponent-reweighting
+      penalty per shot.
+    * ``total`` is ``spatial + timing + count + reg`` per shot, without the
+      ``lambda_spatial``, ``lambda_timing`` and ``lambda_count`` weights.
+    * The remaining series are diagnostics of the support weights,
+      bandwidth, pooling gate, mode mixture, opponent reweighting and
+      matchup channel; see :class:`_EpochLosses`.
+
+    ``best_epoch`` is the epoch whose parameters were restored by
+    ``restore_best_val``.
     """
 
     train_total: list[float] = field(default_factory=list)
@@ -634,20 +719,17 @@ class GibbsTrainHistory:
     train_timing: list[float] = field(default_factory=list)
     train_count: list[float] = field(default_factory=list)
     train_reg: list[float] = field(default_factory=list)
-    #: PR-D3 cell-free defense diagnostics. NaN when defense is off.
+    #: Opponent-reweighting diagnostics. NaN when no defensive field is wired.
     train_def_score_mean: list[float] = field(default_factory=list)
     train_def_score_abs_mean: list[float] = field(default_factory=list)
     train_def_score_max_abs: list[float] = field(default_factory=list)
     train_def_cold_start_fraction: list[float] = field(default_factory=list)
     train_def_beta: list[float] = field(default_factory=list)
-    #: Tier-2a D-matchup diagnostics. NaN when the matchup channel
-    #: is off. ``matchup_effect_abs_mean`` and ``matchup_effect_max_abs``
-    #: track the per-row magnitudes of ``β_match · Δ̂``;
-    #: ``matchup_beta`` is the scalar parameter; the ESS quantiles
-    #: ``matchup_n_eff_p10/p50/p90`` describe the distribution of
-    #: per-row peer-vs-opponent evidence and are the load-bearing
-    #: signal for the "matchup only helps where evidence is strong"
-    #: falsification test.
+    #: Matchup-channel diagnostics. NaN when no matchup field is wired.
+    #: ``matchup_effect_abs_mean`` and ``matchup_effect_max_abs`` are the
+    #: per-row magnitudes of ``β_match · Δ̂``; ``matchup_beta`` is the
+    #: scalar parameter; ``matchup_n_eff_*`` summarize the per-row
+    #: effective sample size of peer-versus-opponent evidence.
     train_matchup_effect_abs_mean: list[float] = field(default_factory=list)
     train_matchup_effect_max_abs: list[float] = field(default_factory=list)
     train_matchup_beta: list[float] = field(default_factory=list)
@@ -690,25 +772,26 @@ class GibbsTrainHistory:
     val_matchup_n_eff_p50: list[float] = field(default_factory=list)
     val_matchup_n_eff_p90: list[float] = field(default_factory=list)
     best_epoch: int | None = None
-    #: Final-epoch count calibration on the train set, as produced by
-    #: :func:`shotcloud.evaluation.compute_count_calibration`. Populated
-    #: by :func:`train_gibbs` after the last epoch when
-    #: ``lambda_count > 0``. ``None`` otherwise.
+    #: Count calibration on the training set of the returned model, from
+    #: :func:`shotcloud.evaluation.compute_count_calibration`. Set when
+    #: ``lambda_count > 0``, else ``None``; ``{"error": ...}`` if the
+    #: computation failed.
     final_train_count_calibration: dict[str, object] | None = None
-    #: Final-epoch count calibration on the val set, same population
-    #: rule as the train counterpart.
+    #: Count calibration on the validation set, under the same rules.
     final_val_count_calibration: dict[str, object] | None = None
 
 
 @dataclass
 class _EpochLosses:
+    """Epoch-level means of the losses and diagnostics computed by :func:`_epoch`."""
+
     total: float
-    spatial: float  # the optimization-target spatial loss
-    # Always-computed cross-mode metrics. In ``continuous_mixture`` mode
-    # the grid-derived series are NaN (no grid log_probs are computed).
+    spatial: float  # the optimized spatial loss
+    # Grid-derived series are NaN for the cell-free likelihoods, which
+    # compute no grid log-probabilities.
     spatial_cell: float  # exact-cell NLL (grid modes only)
     spatial_continuous: float  # continuous-coord NLL (grid modes only)
-    spatial_mix_nll: float  # cell-free mixture NLL (continuous_mixture mode only)
+    spatial_mix_nll: float  # cell-free mixture NLL (mixture modes only)
     expected_distance_ft: float  # E_c[||x_c - y||] over grid (grid modes only)
     alpha_entropy: float
     beta_entropy: float
@@ -720,55 +803,49 @@ class _EpochLosses:
     min_dist_to_support_ft: float
     #: mode_mixture only: mean over rows of the average distance from
     #: each of the K mode centers to its nearest causal support shot.
-    #: Tests "modes live among the support" — soft-k-means guarantees
-    #: small values by construction; large values flag the
-    #: global-anchor / drift pathology observed with the learned-query
-    #: extractor. NaN in continuous_mixture / cell / continuous_cell.
+    #: Small values mean the modes lie among the support; the soft
+    #: k-means extractor keeps it small by construction.
     mode_to_support_dist_ft: float
     #: mode_mixture only: mean ``exp(H(π))`` across rows, where π is
     #: the K-mode softmax. ``≈ K`` means modes are used uniformly;
     #: ``≈ 1`` means one mode dominates per row (collapse).
     effective_modes: float
     #: mode_mixture only: mean over rows of the min pairwise distance
-    #: between mode centers. Collapse indicator — pairs converging on
-    #: the same point drive this toward 0.
+    #: between mode centers. Collapse indicator: modes converging on
+    #: the same point drive it toward 0.
     mode_min_pair_dist_ft: float
-    #: mode_mixture + tail_weight > 0: mean posterior responsibility
-    #: of the support-tail component. Large values mean the K-mode
-    #: mixture is undercovering and the tail is doing the explanatory
-    #: work — defeats the scientific story of compact per-row modes.
+    #: mode_mixture with tail_weight > 0: mean posterior responsibility
+    #: of the support-tail component. Large values mean the K modes
+    #: under-cover the data and the tail explains most shots.
     tail_responsibility: float
-    #: continuous_mixture + pooling gate: mean own-history mixing
-    #: weight λ over non-cold-start rows. Should rise with own-history
-    #: depth; a flat value flags the constant-pooling pathology.
+    #: continuous_mixture with a pooling gate: mean own-support weight λ
+    #: over rows with support. Expected to grow with the depth of the
+    #: player's own history.
     gate_lambda_mean: float
     sigma_mean: float
     frac_cold_start: float  # fraction of rows with no valid causal support
     timing: float
     count: float
     reg: float
-    #: PR-D3 cell-free defense diagnostics. ``NaN`` when defense is
-    #: off or the spatial mode doesn't carry a defensive field.
-    #: ``def_score_mean`` is the per-row mean of D_Δ across M_off
-    #: (should be ≈ 0 because the field is per-row centered).
-    #: ``def_score_abs_mean`` and ``def_score_max_abs`` are the
-    #: typical and worst-case per-row magnitudes — track them to
-    #: watch for runaway β_D. ``def_cold_start_fraction`` is the
-    #: fraction of rows whose defensive cache cell was empty.
-    #: ``def_beta`` is the scalar ``β_D`` (read off the field after
-    #: each epoch).
+    #: Opponent-reweighting diagnostics; ``NaN`` when no defensive field
+    #: is wired. ``def_score_mean`` is the per-row mean of D over the
+    #: support (near 0 when the field is centered per row).
+    #: ``def_score_abs_mean`` and ``def_score_max_abs`` are the typical
+    #: and largest per-row magnitudes, which reveal a growing ``β_D``.
+    #: ``def_cold_start_fraction`` is the fraction of rows without causal
+    #: defensive evidence. ``def_beta`` is the scalar ``β_D`` after the
+    #: epoch.
     def_score_mean: float
     def_score_abs_mean: float
     def_score_max_abs: float
     def_cold_start_fraction: float
     def_beta: float
-    #: Tier-2a D-matchup diagnostics. NaN when the matchup channel
-    #: is off. ``matchup_effect_abs_mean`` and ``matchup_effect_max_abs``
-    #: track per-row ``β_match · Δ̂_{p,d,z(s_m)}`` magnitudes;
+    #: Matchup-channel diagnostics; NaN when no matchup field is wired.
+    #: ``matchup_effect_abs_mean`` and ``matchup_effect_max_abs`` are
+    #: per-row magnitudes of ``β_match · Δ̂_{p,d,z(s_m)}``;
     #: ``matchup_beta`` is the scalar ``β_match`` after the epoch;
-    #: ``matchup_n_eff_{mean,p10,p50,p90}`` describe the distribution
-    #: of per-row peer-vs-opponent evidence (load-bearing for the
-    #: ESS-bucket falsification).
+    #: ``matchup_n_eff_{mean,p10,p50,p90}`` summarize the per-row
+    #: effective sample size of peer-versus-opponent evidence.
     matchup_effect_abs_mean: float
     matchup_effect_max_abs: float
     matchup_beta: float
@@ -820,11 +897,9 @@ def _collect_modules(
 def _check_finite(name: str, tensor: Tensor, batch_idx: int) -> None:
     """Raise a clear error if the tensor contains any NaN or +/-Inf.
 
-    Used as a default-on diagnostic in the trainer's hot loop. The cost
-    is two reductions per check, negligible compared to the rest of the
-    forward/backward pass; we keep it default-on because a silent NaN
-    corrupts every subsequent iteration via the optimizer and is the
-    single most painful debugging mode of the trainer.
+    On by default in the training loop: the cost is two reductions per
+    check, while a single non-finite value would otherwise propagate
+    through the optimizer into every later step.
     """
     with torch.no_grad():
         finite_mask = torch.isfinite(tensor)
@@ -866,11 +941,12 @@ def _collect_modules_for_spatial(
     timing_head: TimingSoftmaxHead,
     context_mlp: ContextMLP,
 ) -> dict[str, nn.Module]:
-    """Build the named-module dict the trainer uses for device
-    placement, Adam params, best-val snapshot/restore, and grad-NaN
-    scans. Dispatches on the spatial-model type so the cell-free
-    (continuous_mixture / mode_mixture) and grid paths share one
-    bookkeeping function."""
+    """Return the named trainable modules for a spatial decoder.
+
+    The dict drives device placement, optimizer parameters, best-val
+    snapshot/restore and gradient checks. Dispatches on the decoder type
+    so the cell-free and grid paths share one bookkeeping function.
+    """
     if isinstance(spatial, ConditionalGibbsDecoder):
         return _collect_modules(
             offensive_prior=spatial.offensive_prior,
@@ -881,9 +957,8 @@ def _collect_modules_for_spatial(
             residual_encoder=spatial.residual_encoder,
             tilt_decoder=spatial.tilt_decoder,
         )
-    # Cell-free path (continuous_mixture or mode_mixture). Both share
-    # the same upstream support attention; only the spatial-density
-    # head differs.
+    # Cell-free paths (continuous_mixture or mode_mixture) share the
+    # support backend; only the spatial-density head differs.
     modules: dict[str, nn.Module] = {
         "offensive_prior": spatial.offensive_prior,
         "count_head": count_head,
@@ -897,56 +972,30 @@ def _collect_modules_for_spatial(
             modules["location_embedding"] = spatial.location_embedding
         if spatial.pooling_gate is not None:
             modules["pooling_gate"] = spatial.pooling_gate
+        # Optional parameterized components of the AC-KDE decoder. The
+        # defensive cache and the defense / matchup feature tensors are
+        # parameter-free attributes of the decoder, moved to the device
+        # when gathered in its forward pass, so they are not listed.
         if spatial.defensive_field is not None:
-            # PR-D2a: the cell-free defensive field (when wired) joins
-            # the module dict so its parameters land in the optimizer
-            # and best-val snapshot dict. The retrieval cache + feature
-            # artifact stored on the wrapper are non-Module attributes
-            # — they don't carry parameters and are handled via the
-            # gather function's device transfer at forward time.
             modules["defensive_field"] = spatial.defensive_field
         if spatial.bandwidth_field is not None:
-            # Tier-1a source/zone bandwidth: 2×N_ZONES learnable scalars
-            # join the optimizer + best-val snapshot dict.
             modules["bandwidth_field"] = spatial.bandwidth_field
         if spatial.anisotropic_kernel is not None:
-            # Tier-2 anisotropic kernel: per-zone covariance params
-            # (16 for RT, 24 for FC) join the optimizer + best-val
-            # snapshot dict. Mirrors how bandwidth_field is registered.
             modules["anisotropic_kernel"] = spatial.anisotropic_kernel
         if spatial.matchup_field is not None:
-            # Tier-2a D-matchup: scalar β_match joins the optimizer +
-            # best-val snapshot dict. The matchup-features artifact is
-            # a non-Module attribute (no learnable parameters) and is
-            # handled via the gather inside the wrapper forward.
             modules["matchup_field"] = spatial.matchup_field
         if spatial.has_within_game_gru:
-            # G1 within-game shot GRU: GRU cell + zero-init projection.
-            # Joins the optimizer + best-val snapshot dict so its weights
-            # are trained and the eval-side reconstruction can rebuild
-            # from the saved state_dict.
             assert spatial.within_game_gru is not None  # narrowed by the flag
             modules["within_game_gru"] = spatial.within_game_gru
         if spatial.causal_zone_bias is not None:
-            # Phase 2 α1 (causal redesign, 2026-06-09): causal zone-pair
-            # edge bias on support attention. Lives as its own submodule
-            # so the optimizer trains its parameters, the best-val
-            # snapshot/restore round-trips them, and the disk save state
-            # captures them via state_dict. See
-            # :class:`shotcloud.models.CausalZoneBias` and the locked
-            # leakage rule on the wrapper class.
             modules["causal_zone_bias"] = spatial.causal_zone_bias
-        # Phase 3 mode-routed AC-KDE (2026-06-09): mode router lives
-        # on the ModeRoutedContinuousMixtureSpatial subclass. Register
-        # it so the optimizer trains the router head and the save/load
-        # pipeline round-trips its parameters.
         if isinstance(spatial, ModeRoutedContinuousMixtureSpatial):
             modules["mode_router"] = spatial.mode_router
     else:
-        # CollaborativeModeMixtureSpatial: residual location embedding
-        # is the per-shot-residual ψ; the mode-extractor owns a
-        # separate support-embedding ψ for its Q-K product plus the
-        # mode queries and context-bias MLP.
+        # CollaborativeModeMixtureSpatial: the residual location embedding
+        # is the residual tilt's ψ; the mode extractor owns a separate
+        # support embedding for its query-key product, plus the mode
+        # queries and context-bias MLP.
         if spatial.residual_location_embedding is not None:
             modules["residual_location_embedding"] = spatial.residual_location_embedding
         modules["mode_extractor"] = spatial.mode_extractor
@@ -991,7 +1040,7 @@ def _epoch(
     nan_check: bool = True,
     max_batches: int | None = None,
 ) -> _EpochLosses:
-    """Run one epoch. ``optimizer=None`` runs evaluation (no_grad)."""
+    """Run one pass over ``loader``; with ``optimizer=None``, evaluate without gradients."""
     if count_loss_normalization not in ("per_game", "per_shot"):
         raise ValueError(
             f"count_loss_normalization must be 'per_game' or 'per_shot', "
@@ -1018,20 +1067,20 @@ def _epoch(
     per_game_x_raw = dataset.per_game.x_n_raw.to(device)
     per_game_k = dataset.per_game.k_obs.to(device)
 
-    total_spatial = 0.0  # optimization target — for `total` and best-val
-    total_spatial_cell = 0.0  # NaN in continuous_mixture mode
-    total_spatial_continuous = 0.0  # NaN in continuous_mixture mode
-    total_spatial_mix_nll = 0.0  # only populated in continuous_mixture mode
+    total_spatial = 0.0  # optimized spatial loss, used for `total` and best-val
+    total_spatial_cell = 0.0  # grid modes only
+    total_spatial_continuous = 0.0  # grid modes only
+    total_spatial_mix_nll = 0.0  # mixture modes only
     total_expected_distance_ft = 0.0  # grid modes only
     total_alpha_entropy = 0.0
     total_beta_entropy = 0.0
-    n_alpha_rows = 0  # batches with collab α; mean reported per-row
+    n_alpha_rows = 0  # rows contributing an α entropy
     n_beta_rows = 0  # (b, l) pairs with valid causal history
     total_sub_uniform = 0  # shots with q(c_obs) < 1/n_cells
-    total_support_entropy = 0.0  # H(w) under joint mixture (continuous_mixture only)
-    total_eff_support = 0.0  # exp(H(w)) (continuous_mixture only)
-    total_expected_support_dist = 0.0  # Σ_m w_m ||s_m - y|| (continuous_mixture only)
-    total_min_dist_to_support = 0.0  # min_m ||s_m - y|| (continuous_mixture only)
+    total_support_entropy = 0.0  # H(w) of the support weights (mixture modes only)
+    total_eff_support = 0.0  # exp(H(w)) (mixture modes only)
+    total_expected_support_dist = 0.0  # Σ_m w_m ||s_m - y|| (mixture modes only)
+    total_min_dist_to_support = 0.0  # min_m ||s_m - y|| (mixture modes only)
     # mean over rows of avg min-dist mode→support (mode_mixture only):
     total_mode_to_support_dist = 0.0
     n_mode_to_support_rows = 0  # # rows that contributed to total_mode_to_support_dist
@@ -1048,17 +1097,16 @@ def _epoch(
     total_timing = 0.0
     total_count = 0.0
     total_reg = 0.0
-    # Cell-free defense diagnostics (continuous_mixture + defense only).
-    # All four are weighted sums; divide by ``n_shots_seen`` at the end.
+    # Opponent-reweighting diagnostics (continuous_mixture with defense).
+    # Row sums, divided by ``n_def_rows`` at the end.
     total_def_score_abs_mean = 0.0
     total_def_score_max_abs = 0.0  # per-row max |D|, batch-summed
     total_def_score_mean = 0.0
     total_def_cold_start_rows = 0
     n_def_rows = 0
-    # Tier-2a D-matchup diagnostics. ``total_matchup_*`` are weighted
-    # sums divided by ``n_match_rows`` at the epoch end;
-    # ``matchup_n_eff_pool`` holds the per-row N_eff values for
-    # percentile reporting at the end of the epoch.
+    # Matchup-channel diagnostics. ``total_matchup_*`` are row sums
+    # divided by ``n_match_rows`` at the end; ``matchup_n_eff_pool`` keeps
+    # the per-row N_eff values for the percentiles.
     total_matchup_effect_abs_mean = 0.0
     total_matchup_effect_max_abs = 0.0
     total_matchup_n_eff_mean = 0.0
@@ -1132,13 +1180,11 @@ def _epoch(
                 assert isinstance(
                     spatial, ContinuousMixtureSpatial | CollaborativeModeMixtureSpatial
                 )
-                # PR-D2a: thread opp_idx through the cell-free spatial
-                # call. The wrapper takes ``opp_idx=None`` by default
-                # for back-compat; the continuous-mixture wrapper only
-                # *consumes* it when ``has_defense`` is True. The
-                # mode-mixture wrapper ignores it. Passing it
-                # unconditionally is safe and keeps the call site
-                # uniform.
+                # Optional inputs are passed only to a decoder whose
+                # corresponding component is wired: opp_idx for defense
+                # or matchup, the prior-shot sequence for the within-game
+                # GRU, and the prior-outcome features for the outcome
+                # residual branch.
                 mix_kwargs: dict[str, Tensor] = {
                     "player_idx": player_idx,
                     "snapshot_idx": snapshot_idx,
@@ -1161,9 +1207,8 @@ def _epoch(
                     _check_finite("log_lik_mixture", mix_out.log_lik, batch_idx)
                 spatial_nll_mix = -mix_out.log_lik
                 spatial_nll = spatial_nll_mix
-                # Tilt regularizer for the cell-free residual: L2 on the
-                # per-shot R_θ(s_m) contribution (broadcast α=ones over
-                # M, so this is exactly the analog of the grid tilt L2).
+                # Residual tilt R_θ(s_m) per support shot, for the L2
+                # penalty (the cell-free analog of the grid tilt penalty).
                 r_theta = mix_out.residual_logits  # (B, M)
                 # Diagnostics off the joint mixture.
                 with torch.no_grad():
@@ -1182,10 +1227,9 @@ def _epoch(
                         mix_out.support_mask, dist, torch.full_like(dist, float("inf"))
                     )
                     min_d = dist_masked_inf.min(dim=-1).values
-                    # Cold-start rows now carry a dummy-logit ``w`` from
-                    # the upstream patch, so ``expected_d`` is finite
-                    # but meaningless for those rows. Filter them out
-                    # of both diagnostics before the mean.
+                    # Cold-start rows carry a placeholder weight, so
+                    # ``expected_d`` is finite but meaningless for them;
+                    # both diagnostics exclude rows without support.
                     expected_d = (w * dist).sum(dim=-1)
                     has_support = mix_out.support_mask.any(dim=-1)
                     min_dist_to_support = (
@@ -1199,14 +1243,11 @@ def _epoch(
                         else float("nan")
                     )
                     sigma_mean_b = float(mix_out.sigma.mean().item())
-                    # Mode-locality diagnostic (mode_mixture only). For
-                    # each row's K mode centers, compute min L2 distance
-                    # to its causal support set; average across modes
-                    # and across rows with valid support. Soft-k-means
-                    # bounds this small by construction; the
-                    # learned-query extractor's H2 pathology had modes
-                    # drifting toward global anchors and this metric
-                    # exploding.
+                    # Mode-locality diagnostic (mode_mixture only): min
+                    # distance from each mode center to the row's causal
+                    # support, averaged over modes and over rows with
+                    # support. Large values mean modes have drifted away
+                    # from the support.
                     if isinstance(spatial, CollaborativeModeMixtureSpatial):
                         modes_xy = mix_out.support_xy  # (B, K, 2) — mode centers
                         sup_xy = mix_out.collab.support_xy  # (B, M, 2)
@@ -1263,15 +1304,13 @@ def _epoch(
                     if gate_lam is not None and has_support.any():
                         gate_lambda_b = float(gate_lam[has_support].mean().item())
                         n_rows_with_gate_lambda = int(has_support.sum().item())
-                    # α, β entropies from the SUPPORT attention (always
-                    # M-shaped). For continuous_mixture, support
-                    # attention == mixture weights, so this matches the
-                    # old behavior. For mode_mixture, support attention
-                    # is upstream of the K-shaped mode weights, but the
-                    # (L, R) factorization of the support is identical
-                    # so α / β remain meaningful and comparable.
-                    # The retrieval backend has no (L, R) factorization
-                    # — leave α/β entropy at the default NaN sentinel.
+                    # α, β entropies of the support attention (always
+                    # M-shaped), factored over analogues L and history
+                    # slots R. For continuous_mixture the support
+                    # attention equals the mixture weights; for
+                    # mode_mixture it precedes the K mode weights but has
+                    # the same (L, R) factorization. The retrieval backend
+                    # has no (L, R) factorization, so both stay NaN.
                     if isinstance(spatial.offensive_prior, CollaborativeKDE):
                         sup_log_w = mix_out.support_log_weights  # (B, M)
                         sup_w = sup_log_w.exp()
@@ -1301,9 +1340,9 @@ def _epoch(
                 r_theta = components.r_theta
                 if nan_check:
                     _check_finite("log_p_spatial", log_p_spatial, batch_idx)
-                # Always compute both spatial losses + expected-distance
-                # diagnostic for cross-run comparability. The chosen
-                # ``spatial_likelihood`` selects which feeds the optimizer.
+                # Both grid losses and the expected-distance diagnostic
+                # are always computed for comparison; ``spatial_loss``
+                # selects the one that is optimized.
                 spatial_nll_cell = exact_cell_nll(log_p_spatial, cell_idx)
                 spatial_nll_continuous = continuous_coordinate_nll(
                     log_p_spatial,
@@ -1335,11 +1374,10 @@ def _epoch(
                 _check_finite("timing_log_p", timing_log_p, batch_idx)
             timing_nll = -timing_log_p
 
-            # Count NLL is per-game by nature. Compute once per unique
-            # game in the batch (deduplicated from the per-shot view) so
-            # the count head receives a single gradient per game per
-            # update, regardless of K_g. The per-game context is the
-            # game's first-shot raw context, run through the same f_ctx.
+            # The count NLL is per game: evaluate it once per distinct game
+            # in the batch, so each game contributes one term per update
+            # regardless of K_g. The per-game context is the game's
+            # pregame context, run through the same f_ctx.
             unique_games, inverse_to_unique = torch.unique(game_idx, return_inverse=True)
             game_x_raw_unique = per_game_x_raw[unique_games]
             game_x_n_unique = context_mlp(game_x_raw_unique)
@@ -1347,30 +1385,25 @@ def _epoch(
             count_log_p_unique = count_head.log_prob(game_k_unique, game_x_n_unique)
             if nan_check:
                 _check_finite("count_log_p_unique", count_log_p_unique, batch_idx)
-            # Per-game NLL for the per_game-normalization loss term.
             count_loss_per_game = -count_log_p_unique
-            # Per-shot amortized view: broadcast the per-game log-prob
-            # back to (B,) and divide by shots-in-game. Used by the
-            # per_shot legacy normalization and by the per-shot count
-            # diagnostic that the _EpochLosses ``count`` field reports.
+            # Per-shot amortized view: the game's NLL divided by its shot
+            # count. Used by the per_shot normalization and by the
+            # reported ``count`` series.
             shots_in_game = shots_per_game[game_idx]
             count_log_p = count_log_p_unique[inverse_to_unique]
             count_nll_per_shot = -count_log_p / shots_in_game
 
-            # Tilt regularizer. Grid: r_θ(c) = u^T v_c per cell.
-            # Cell-free: R_θ(s_m) = u^T ψ(s_m) per support shot. Same
-            # L2 form per-row across the residual's "output axis"
-            # (cells or support shots).
+            # Tilt penalty: mean squared residual over the row's output
+            # axis, r_θ(c) = u^T v_c per cell on the grid path and
+            # R_θ(s_m) = u^T ψ(s_m) per support shot on the cell-free path.
             if spatial.has_residual:
                 tilt_reg_per_shot = (r_theta.pow(2)).mean(dim=-1)
             else:
                 tilt_reg_per_shot = torch.zeros_like(spatial_nll)
 
-            # Defense regularizer (PR-D3). Penalizes the per-shot
-            # log-feasibility magnitude E[D_Δ²]; computed per-row as
-            # the mean over the M_off support axis. Zero when defense
-            # is off (mix_out is the cell-free wrapper output;
-            # mode_mixture wrappers don't yet carry defense_logits).
+            # Defense penalty: mean of D² over the row's support shots.
+            # Zero without a defensive field; the mode-mixture decoder
+            # has no defensive term.
             defense_reg_per_shot = torch.zeros_like(spatial_nll)
             if (
                 is_mixture_mode
@@ -1380,15 +1413,10 @@ def _epoch(
             ):
                 defense_reg_per_shot = mix_out.defense_logits.pow(2).mean(dim=-1)
 
-            # The count contribution to the optimization loss depends on
-            # the normalization mode. In ``per_game`` mode the per-game
-            # NLL is averaged separately and added to the per-shot mean;
-            # ``lambda_count = 1.0`` then weights one per-game count
-            # update at parity with one per-shot spatial update. In
-            # ``per_shot`` mode the amortized-per-shot count NLL is mixed
-            # into ``loss_per_shot`` (legacy; reproduces pre-2026-06-07
-            # checkpoints, where ``lambda_count = 1.0`` effectively
-            # weighted count NLL at ``1/K̄`` relative to spatial NLL).
+            # Count term by normalization mode (see CountLossNormalization):
+            # ``per_game`` averages the per-game NLL separately and adds
+            # it to the per-shot mean; ``per_shot`` mixes the amortized
+            # per-shot NLL into ``loss_per_shot``.
             if count_loss_normalization == "per_shot":
                 loss_per_shot = (
                     lambda_spatial * spatial_nll
@@ -1420,9 +1448,8 @@ def _epoch(
             b_size = int(player_idx.shape[0])
             n_shots_seen += b_size
             total_spatial += float(spatial_nll.sum().detach())
-            # Grid-mode metrics: sum if defined, else leave at 0 (the
-            # epoch-level mean will be NaN by construction below when
-            # we divide by 0 — guard at output).
+            # Accumulate only the metrics defined for this mode; the
+            # others are reported as NaN at the end.
             if is_mixture_mode:
                 total_spatial_mix_nll += float(spatial_nll_mix.sum().detach())
                 total_support_entropy += support_h * b_size
@@ -1465,8 +1492,7 @@ def _epoch(
             total_count += float(count_nll_per_shot.sum().detach())
             total_reg += float((lambda_tilt * tilt_reg_per_shot).sum().detach())
             total_reg += float((lambda_defense * defense_reg_per_shot).sum().detach())
-            # Defense diagnostics — only populate when defense is wired
-            # and the wrapper emitted defense_logits this batch.
+            # Defense diagnostics, when the decoder emitted defense_logits.
             if (
                 is_mixture_mode
                 and isinstance(spatial, ContinuousMixtureSpatial)
@@ -1481,8 +1507,7 @@ def _epoch(
                     total_def_score_max_abs += float(d_logits.abs().amax(dim=-1).sum().detach())
                     total_def_cold_start_rows += int(mix_out.defense_cold_start.sum().item())
                     n_def_rows += b_size
-            # D-matchup diagnostics — populate when the matchup channel
-            # is wired and the wrapper emitted matchup_logits this batch.
+            # Matchup diagnostics, when the decoder emitted matchup_logits.
             if (
                 is_mixture_mode
                 and isinstance(spatial, ContinuousMixtureSpatial)
@@ -1611,13 +1636,11 @@ def _epoch(
 
 
 def _safe_entropy(p: Tensor, *, eps: float = 1e-20) -> Tensor:
-    """Per-row entropy ``-Σ p log p`` in nats. Last dim is the
-    distribution; output is one rank lower.
+    """Entropy ``-Σ p log p`` in nats over the last dimension.
 
-    ``p`` is assumed to be a proper (rows sum-to-1) probability tensor,
-    OR zero on entire rows (the collaborative β returns all-zero rows
-    for analogues with no causal history). Zero rows produce 0 entropy
-    (handled by the ``eps`` clamp inside the log).
+    Each row of ``p`` is either a probability vector or all zeros (the
+    collaborative β is zero for analogues with no causal history); zero
+    entries contribute nothing, so all-zero rows have entropy 0.
     """
     return -(p.clamp_min(eps) * p.clamp_min(eps).log() * (p > 0).to(p.dtype)).sum(dim=-1)
 
@@ -1635,55 +1658,18 @@ def train_gibbs(
     residual_encoder: ContextResidualEncoder | None = None,
     tilt_decoder: LowRankTiltDecoder | None = None,
     location_embedding: object | None = None,
-    #: Optional history-dependent pooling gate; only consulted when
-    #: ``spatial_likelihood == "continuous_mixture"``. When provided,
-    #: the spatial density becomes the structured two-component
-    #: mixture ``λ·f_own + (1-λ)·f_pooled``.
     pooling_gate: PoolingGate | None = None,
-    #: Cell-free defense triple (PR-D2b). All three must be provided
-    #: together or all ``None``. Only consulted when
-    #: ``spatial_likelihood == "continuous_mixture"``. The trainer
-    #: passes them through to :class:`ContinuousMixtureSpatial` which
-    #: handles the gather + forward wiring (PR-D2a). Distinct from the
-    #: ``defensive_field`` kwarg above, which is the *grid-side*
-    #: :class:`AdaptiveDefensiveField` used by the cell-based path.
     defensive_field_cellfree: (
         ContinuousAdaptiveDefensiveField | ZoneReweightingDefense | None
     ) = None,
     defensive_cache: DefensiveRetrievalCache | None = None,
     defensive_features: DefenseFeatures | None = None,
-    #: Tier-2a D-matchup channel: ``β_match · Δ̂_{p,d,z(s_m)}(t)``. Both
-    #: ``matchup_field`` and ``matchup_features`` must be provided
-    #: together or both ``None``. Composes with the D-lite cell-free
-    #: channel for the ablation-C combined run; passes through to
-    #: :class:`ContinuousMixtureSpatial` which handles the gather.
     matchup_field: MatchupReweightingDefense | None = None,
     matchup_features: MatchupFeatures | None = None,
-    #: Optional Tier-1a source/zone bandwidth field. When provided,
-    #: each support shot gets its own σ_{src,z} instead of the per-row
-    #: collab σ. Only consulted when ``spatial_likelihood ==
-    #: "continuous_mixture"``; the spatial loglik already accepts both
-    #: (B,) and (B, M) σ shapes.
     bandwidth_field: ZoneSourceBandwidth | None = None,
-    #: Optional Tier-2 anisotropic kernel (Option 1 RT or Option 3 FC).
-    #: Mutually exclusive with ``bandwidth_field`` — both modify the
-    #: kernel-shape axis. When wired, replaces the isotropic kernel
-    #: entirely with per-zone covariance shaping. Only consulted when
-    #: ``spatial_likelihood == "continuous_mixture"``.
     anisotropic_kernel: RadialTangentZoneKernel | FullCovarianceZoneKernel | None = None,
-    #: K̂-standardization stats (paper 2026-06-05 calibration fix). When
-    #: both are provided AND the residual encoder consumes K̂, CMS
-    #: applies ``tilde_K = (log1p(K̂) − μ) / σ`` before the K̂ column
-    #: reaches the residual. Use K_obs-based stats from the audit (e.g.
-    #: μ=2.239, σ=0.490 for the current corpus) so the transform is
-    #: invariant to count-head calibration drift.
     khat_log1p_mean: float | None = None,
     khat_log1p_std: float | None = None,
-    #: G1 within-game shot GRU (paper §10). When provided, the module's
-    #: output is added to the residual encoder output before the
-    #: location embedding; CMS validates the shape match. Wired only
-    #: when ``residual_encoder`` is active. Defaults ``None`` =
-    #: backward-compatible no-GRU path.
     within_game_gru: nn.Module | None = None,
     n_epochs: int = 30,
     batch_size: int = 512,
@@ -1694,50 +1680,14 @@ def train_gibbs(
     lambda_timing: float = 1.0,
     lambda_count: float = 1.0,
     lambda_defense: float = 0.0,
-    #: Count-loss normalization (see :data:`CountLossNormalization`).
-    #: ``"per_game"`` (default) puts ``lambda_count`` at parity with
-    #: per-shot spatial NLL; ``"per_shot"`` reproduces the pre-2026-06-07
-    #: amortized-per-shot weighting where ``lambda_count = 1.0``
-    #: effectively under-supervised the count head by ``≈ 1/K̄``.
     count_loss_normalization: CountLossNormalization = "per_game",
-    #: Optional path to a checkpoint ``.pt`` produced by
-    #: :mod:`scripts.train_count_head`. When provided, the joint
-    #: trainer loads ``count_head`` (and ``context_mlp`` if present)
-    #: state from the checkpoint before training starts. Use with
-    #: ``freeze_count=True`` to consume a fixed calibrated μ from a
-    #: pretrained count head — the canonical paper §5.2 calibration
-    #: workflow.
     count_checkpoint_path: str | Path | None = None,
-    #: If ``True``, disable gradients on ``count_head`` parameters.
-    #: The spatial decoder still consumes the count head's detached
-    #: μ via ``c_{p,t_n} = stopgrad(μ_η(x_n))``, so the residual still
-    #: sees a count-supervised signal — it's just a *frozen* one.
     freeze_count: bool = False,
-    #: If ``True``, disable gradients on ``context_mlp`` parameters
-    #: too. Required for the count-pathway-frozen experiment of
-    #: paper §5.2: the count head's calibration depends on
-    #: ``f_ctx(x_n_raw)``, and freezing ``count_head`` alone does
-    #: *not* freeze that pathway because spatial gradients flow
-    #: through ``context_mlp``. Pin both to test "does calibrated
-    #: K̂ improve spatial when the count pathway is genuinely
-    #: frozen." Caveat: ``context_mlp`` is shared with retrieval,
-    #: residual, and timing — freezing it constrains the spatial
-    #: representation too. If the resulting spatial NLL regresses,
-    #: the principled solution is dedicated context encoders for
-    #: count vs spatial, not blanket freezing.
     freeze_context_mlp: bool = False,
-    #: Optional separate learning rate for the count-head parameter
-    #: group. ``None`` (default) puts every trainable parameter on a
-    #: single Adam group at ``learning_rate``. When set (and
-    #: ``freeze_count=False``), the count head gets its own LR while
-    #: the rest of the model stays at ``learning_rate``. Useful for
-    #: ``count_pretrain + low-LR-finetune`` (paper §5.2.C).
     count_lr: float | None = None,
     spatial_likelihood: SpatialLikelihood = "continuous_cell",
     obs_kernel_tau: float = 1.0,
     obs_kernel_normalize: bool = True,
-    # Mode-mixture (cell-free, mode-extraction) hyperparameters; only
-    # consulted when ``spatial_likelihood == "mode_mixture"``.
     mode_mixture_n_court_modes: int = 6,
     mode_mixture_query_dim: int = 32,
     mode_mixture_sigma_ft: float = 3.0,
@@ -1745,27 +1695,9 @@ def train_gibbs(
     mode_mixture_lambda_omega: float = 0.0,
     mode_mixture_tail_weight: float = 0.0,
     mode_mixture_tail_sigma_ft: float = 1.0,
-    #: Which mode-extraction operator to instantiate inside the
-    #: mode-mixture spatial decoder. ``"soft_kmeans"`` (the 2026-05-18
-    #: default) clusters the row's attended support via weighted FPS
-    #: init + a few mean-shift iterations; modes are local to the
-    #: row by construction. ``"learned_query"`` is the legacy
-    #: globally-parameterized extractor — kept for ablations.
     mode_mixture_extractor_kind: str = "soft_kmeans",
-    #: Mean-shift kernel bandwidth ``ρ`` (feet). Only consulted when
-    #: ``mode_mixture_extractor_kind == "soft_kmeans"``.
     mode_mixture_kernel_bandwidth_ft: float = 5.0,
-    #: Number of mean-shift refinement iterations after the weighted-
-    #: FPS init. Only consulted when ``mode_mixture_extractor_kind ==
-    #: "soft_kmeans"``.
     mode_mixture_n_iterations: int = 2,
-    #: Optional per-epoch snapshot callback. When provided, the
-    #: trainer calls ``snapshot_callback(epoch, module_states)`` after
-    #: each epoch's train + val pass with ``module_states`` a
-    #: ``dict[str, dict[str, Tensor]]`` mirroring the participating
-    #: modules' ``state_dict()``s. Callers (typically the training
-    #: CLI) filter by epoch and persist to disk for downstream
-    #: visualization / analysis tooling.
     snapshot_callback: (Callable[[int, dict[str, dict[str, Tensor]]], None] | None) = None,
     device: str | torch.device = "cpu",
     shuffle: bool = True,
@@ -1780,51 +1712,203 @@ def train_gibbs(
     out_spatial: list[nn.Module] | None = None,
     **legacy_kwargs: object,
 ) -> GibbsTrainHistory:
-    """Train the joint Gibbs model.
+    """Jointly train the spatial, timing and count factors.
+
+    Builds the spatial decoder selected by ``spatial_likelihood`` around
+    ``offensive_prior`` and the optional components, then optimizes all
+    trainable modules with Adam on the objective described in
+    :mod:`shotcloud.training.train_gibbs`. Modules are trained in place.
 
     Parameters
     ----------
-    offensive_prior : AdaptiveOffensivePrior
-        The :math:`q_n^{\\mathrm{off}}` factor; consumes
-        ``(player_idx, snapshot_idx, x_n)``.
-    count_head, timing_head : NegBin / 48-bin softmax heads
-        Operate on the learned ``x_n``.
+    offensive_prior : CollaborativeKDE or RetrievalCollaborativeKDE or AdaptiveOffensivePrior
+        Support backend of the spatial factor. The cell-free likelihoods
+        require :class:`~shotcloud.models.collaborative_kde.CollaborativeKDE`
+        or
+        :class:`~shotcloud.models.retrieval_collaborative_kde.RetrievalCollaborativeKDE`
+        (``"mode_mixture"`` only the former); the grid likelihoods require
+        :class:`~shotcloud.legacy_pivot.adaptive_prior.AdaptiveOffensivePrior`
+        or ``CollaborativeKDE``.
+    count_head : NegBinCountHead
+        Negative-binomial count head on the learned context.
+    timing_head : TimingSoftmaxHead
+        48-bin softmax timing head on the learned context.
     context_mlp : ContextMLP
-        ``f_{\\mathrm{ctx}}``. Residual zero-init recommended so the
-        model begins as the raw-context baseline.
-    train_set, val_set : GibbsShotDataset
-        When ``defensive_field`` is provided, both datasets must
-        carry an ``opp_vocab`` and the dataset's ``opp_idx`` tensor
-        must align with that vocab.
-    defensive_field : optional
-        Adds the opponent-conditioned reweighting :math:`a_\\delta`
-        to the spatial energy: ``log q_off + log a_δ + r_θ``. The
-        dataset must have ``has_opponents=True``.
-    residual_encoder, tilt_decoder : optional
-        Provide both or neither. When provided, the spatial logits
-        gain :math:`r_\\theta = u_\\theta(x_n)^\\top v_c`.
-    n_epochs, batch_size, learning_rate, weight_decay : Adam config.
-    lambda_tilt : float
-        Coefficient on the per-shot residual L2 penalty. Ignored
-        when ``residual_encoder is None``.
-    device : torch.device or str
-    shuffle : bool
-    progress : bool
-        Print per-epoch losses if True.
-    restore_best_val : bool
-        If True and ``val_set`` is provided, snapshot the parameters
-        whenever val spatial NLL improves and restore them before
-        returning. Mirrors the legacy trainer's ``restore_best_val``
-        contract.
+        :math:`f_{\\mathrm{ctx}}`, shared by all factors. Its residual
+        zero-initialization makes it the identity at the start of
+        training.
+    train_set : GibbsShotDataset
+        Training shots.
+    grid : CourtGrid
+        Court grid; its cell centers are used by the grid likelihoods.
+    val_set : GibbsShotDataset, optional
+        Validation shots, evaluated after every epoch.
+    defensive_field : AdaptiveDefensiveField, optional
+        Grid-path opponent reweighting
+        (:class:`~shotcloud.legacy_pivot.adaptive_defensive.AdaptiveDefensiveField`).
+        Requires datasets with an opponent vocabulary; not supported by the
+        cell-free likelihoods.
+    residual_encoder : ContextResidualEncoder, optional
+        Context encoder :math:`u_\\theta` of the residual tilt. Pair with
+        ``tilt_decoder`` on the grid path and with ``location_embedding``
+        on the cell-free paths.
+    tilt_decoder : LowRankTiltDecoder, optional
+        Grid-path cell embedding :math:`v_c` of the residual tilt.
+    location_embedding : LocationEmbedding, optional
+        Cell-free coordinate embedding :math:`\\psi(s)` of the residual
+        tilt.
+    pooling_gate : PoolingGate, optional
+        Own/pooled gate, giving the density
+        :math:`\\lambda f_{\\mathrm{own}} + (1 - \\lambda) f_{\\mathrm{pooled}}`.
+        Only valid with ``"continuous_mixture"``.
+    defensive_field_cellfree : ZoneReweightingDefense or ContinuousAdaptiveDefensiveField, optional
+        Cell-free opponent reweighting :math:`D(s_m)`, used with
+        ``"continuous_mixture"`` only. ``ZoneReweightingDefense`` requires
+        ``defensive_features`` and no cache;
+        ``ContinuousAdaptiveDefensiveField`` (an alternative evaluated as
+        an ablation) requires both ``defensive_cache`` and
+        ``defensive_features``. Requires datasets with an opponent
+        vocabulary.
+    defensive_cache : DefensiveRetrievalCache, optional
+        Causal allowed-shot cache for ``ContinuousAdaptiveDefensiveField``.
+    defensive_features : DefenseFeatures, optional
+        Causal per-(opponent, snapshot) defensive features.
+    matchup_field, matchup_features : MatchupReweightingDefense, MatchupFeatures, optional
+        Player-versus-opponent zone reweighting and its causal features.
+        Both or neither; ``"continuous_mixture"`` only. Composes
+        additively with the opponent reweighting.
+    bandwidth_field : ZoneSourceBandwidth, optional
+        Per-(source, zone) kernel bandwidth replacing the backend's
+        per-row bandwidth. ``"continuous_mixture"`` only; mutually
+        exclusive with ``anisotropic_kernel``.
+    anisotropic_kernel : RadialTangentZoneKernel or FullCovarianceZoneKernel, optional
+        Per-zone anisotropic kernel replacing the isotropic kernel.
+        ``"continuous_mixture"`` only.
+    khat_log1p_mean, khat_log1p_std : float, optional
+        Standardization of the predicted count fed to the residual,
+        :math:`(\\log(1 + \\hat K) - \\mu) / \\sigma`. Used only when the
+        residual encoder consumes :math:`\\hat K` (its ``usage_dim`` is
+        ``USAGE_KHAT_DIM`` or 1). Statistics computed from observed
+        training counts keep the transform independent of the count
+        head's calibration.
+    within_game_gru : nn.Module, optional
+        Recurrent encoder over the earlier shots of the same game, added
+        to the residual context (an alternative evaluated as an ablation).
+        Used only with ``residual_encoder`` and ``"continuous_mixture"``.
+    n_epochs : int, default 30
+        Number of epochs.
+    batch_size : int, default 512
+        Shots per minibatch.
+    learning_rate : float, default 5e-4
+        Adam learning rate.
+    weight_decay : float, default 0.0
+        Adam weight decay.
+    lambda_tilt : float, default 1e-3
+        Weight of the mean squared residual tilt; no effect without a
+        residual.
+    lambda_spatial, lambda_timing, lambda_count : float, default 1.0
+        Weights of the spatial, timing and count NLL terms.
+    lambda_defense : float, default 0.0
+        Weight of the mean squared opponent reweighting.
+    count_loss_normalization : {"per_game", "per_shot"}, default "per_game"
+        How the count NLL enters the loss; see
+        :data:`CountLossNormalization`.
+    count_checkpoint_path : str or Path, optional
+        Checkpoint written by ``scripts/train_count_head.py``. Its
+        ``"count_head"`` state (and ``"context_mlp"`` state, if present) is
+        loaded before training.
+    freeze_count : bool, default False
+        Disable gradients of the count head. A residual that consumes
+        :math:`\\hat K` always receives it detached; freezing additionally
+        keeps the count head itself fixed.
+    freeze_context_mlp : bool, default False
+        Disable gradients of ``context_mlp`` as well. Freezing the count
+        head alone does not fix its predictions, because spatial and
+        timing gradients still update the shared :math:`f_{\\mathrm{ctx}}`;
+        freezing it also fixes the context representation of every
+        factor.
+    count_lr : float, optional
+        Separate learning rate for the count head's parameter group.
+        Ignored when ``freeze_count`` is set.
+    spatial_likelihood : {"continuous_cell", "cell", "continuous_mixture", "mode_mixture"}
+        Spatial factor and its likelihood; see
+        :data:`SpatialLikelihood`. Default ``"continuous_cell"``.
+    obs_kernel_tau : float, default 1.0
+        Observation-kernel bandwidth in feet of the continuous-coordinate
+        grid loss.
+    obs_kernel_normalize : bool, default True
+        Normalize the observation kernel over cells.
+    mode_mixture_n_court_modes, mode_mixture_query_dim, mode_mixture_sigma_ft
+        Number of modes, learned-query dimension and mode bandwidth in
+        feet of the mode-mixture decoder.
+    mode_mixture_context_correction : bool, default True
+        Enable the context bias on the mode logits.
+    mode_mixture_lambda_omega : float, default 0.0
+        Weight of the support-mass bias in the learned-query extractor.
+    mode_mixture_tail_weight, mode_mixture_tail_sigma_ft : float
+        Mixing weight and bandwidth of the support-KDE tail component.
+    mode_mixture_extractor_kind : {"soft_kmeans", "learned_query"}
+        Mode-extraction operator: weighted farthest-point seeding plus
+        mean-shift over the row's support, or learned queries shared
+        across rows.
+    mode_mixture_kernel_bandwidth_ft, mode_mixture_n_iterations
+        Mean-shift bandwidth in feet and iteration count of the soft
+        k-means extractor.
+    snapshot_callback : callable, optional
+        Called as ``snapshot_callback(epoch, module_states)`` after every
+        epoch, with detached copies of each trained module's
+        ``state_dict()`` keyed by module name.
+    device : str or torch.device, default "cpu"
+        Device to train on.
+    shuffle : bool, default True
+        Shuffle training shots each epoch.
+    progress : bool, default False
+        Print one line of losses and diagnostics per epoch.
+    restore_best_val : bool, default True
+        With ``val_set``, keep the parameters of the epoch with the lowest
+        validation spatial loss and restore them before returning.
     nan_check : bool, default True
-        Enable per-batch NaN guards in the forward + backward paths.
-    max_batches : int or None
-        If set, stop each epoch after this many batches. Useful for
-        diagnostic runs.
+        Raise on non-finite activations, losses or gradients.
+    max_batches : int, optional
+        Stop each epoch after this many batches.
+    stratified_epsilon : float, default 1.0
+        Cross-zone kernel attenuation of the AC-KDE decoder; 1.0
+        disables it.
+    causal_zone_bias : CausalZoneBias, optional
+        Zone-pair bias on the support logits of the AC-KDE decoder.
+    mode_router : ModeRouter, optional
+        Builds
+        :class:`~shotcloud.models.mode_routed_spatial.ModeRoutedContinuousMixtureSpatial`
+        instead of ``ContinuousMixtureSpatial`` (an alternative evaluated
+        as an ablation). ``pooling_gate``, ``causal_zone_bias`` and
+        ``court_bounds`` are then not used.
+    court_bounds : tuple of float, optional
+        ``(x_min, x_max, y_min, y_max)`` in feet. Renormalizes each
+        isotropic kernel of the AC-KDE decoder to the court rectangle.
+    out_spatial : list, optional
+        If given, the constructed spatial decoder is appended to it, so
+        callers can save decoder-owned state that is not among the
+        modules passed in.
+    **legacy_kwargs
+        Accepts only ``spatial_loss`` in ``{"cell", "continuous"}``, an
+        alias for ``spatial_likelihood`` ``"cell"`` / ``"continuous_cell"``.
+
+    Returns
+    -------
+    GibbsTrainHistory
+        Per-epoch losses and diagnostics, plus the final count calibration
+        when ``lambda_count > 0``.
+
+    Raises
+    ------
+    ValueError
+        On invalid option values or inconsistently paired components.
+    TypeError
+        On an unsupported ``offensive_prior`` type or unknown keyword.
+    NotImplementedError
+        On component combinations a spatial likelihood does not support.
     """
-    # Legacy alias support: callers passing ``spatial_loss=`` instead of
-    # ``spatial_likelihood=`` get the legacy two-value semantics
-    # mapped to the new three-value enum.
+    # ``spatial_loss`` alias: "continuous" maps to "continuous_cell".
     if "spatial_loss" in legacy_kwargs:
         legacy_val = str(legacy_kwargs.pop("spatial_loss"))
         if legacy_val == "continuous":
@@ -1857,14 +1941,12 @@ def train_gibbs(
         )
     if obs_kernel_tau <= 0:
         raise ValueError(f"obs_kernel_tau must be > 0; got {obs_kernel_tau}")
-    # Legacy local name used inside _epoch for grid-mode dispatch.
+    # Two-valued name used by _epoch to pick the optimized grid loss.
     spatial_loss: str = "continuous" if spatial_likelihood == "continuous_cell" else "cell"
     dev = torch.device(device)
 
-    # Cell centers in image-layout flat order (c = iy*nx + ix), as one
-    # (n_cells, 2) float32 tensor on `dev`. Built once and reused every
-    # batch — the spatial loss helpers don't take ``grid`` directly so
-    # we don't have to rematerialize this each call.
+    # Cell centers in flat image-layout order (c = iy*nx + ix), built once
+    # as an (n_cells, 2) tensor and reused by the grid losses.
     cx = np.tile(grid.xcenters, grid.ny)
     cy = np.repeat(grid.ycenters, grid.nx)
     cell_centers = torch.from_numpy(np.stack([cx, cy], axis=1).astype(np.float32)).to(dev)
@@ -1911,13 +1993,11 @@ def train_gibbs(
                 f"spatial_likelihood={spatial_likelihood!r}: residual_encoder and "
                 "location_embedding must both be provided or both None."
             )
-        # Cell-free defense kind-aware validation. Mirrors the
-        # constructor checks inside ContinuousMixtureSpatial:
-        # * D-field (ContinuousAdaptiveDefensiveField) requires the
-        #   full triple ``(field, cache, features)``.
-        # * D-lite (ZoneReweightingDefense) requires ``(field, features)``
-        #   only; cache must be None.
-        # * All three None → no defense.
+        # Cell-free defense validation, mirroring ContinuousMixtureSpatial:
+        # * ContinuousAdaptiveDefensiveField requires field, cache and
+        #   features.
+        # * ZoneReweightingDefense requires field and features; no cache.
+        # * All three None means no defense.
         is_zone_lite = isinstance(defensive_field_cellfree, ZoneReweightingDefense)
         if defensive_field_cellfree is None:
             if defensive_cache is not None or defensive_features is not None:
@@ -1949,10 +2029,8 @@ def train_gibbs(
                     f"features={defensive_features is not None}"
                 )
             n_defense = 3
-        # D-matchup wiring validation. Both ``matchup_field`` and
-        # ``matchup_features`` must be provided together. Composes
-        # freely with ``n_defense`` (zero or three) for the A/B/C
-        # ablations. Only valid for continuous_mixture.
+        # Matchup channel: field and features together, continuous_mixture
+        # only; independent of the opponent reweighting.
         if (matchup_field is None) != (matchup_features is None):
             raise ValueError(
                 "matchup_field and matchup_features must both be provided or both None; "
@@ -1986,13 +2064,11 @@ def train_gibbs(
         if n_defense == 3 and val_set is not None and not val_set.has_opponents:
             raise ValueError("Cell-free defense triple requires val_set to carry an opp_vocab.")
         if spatial_likelihood == "continuous_mixture":
-            # Count-residual wiring: CMS needs ``count_head`` whenever
-            # the residual encoder's ``usage_dim`` consumes K̂ —
-            # either ``USAGE_KHAT_DIM`` (B2 mainline: usage + K̂) or
-            # ``1`` (K̂-only diagnostic). The count head's parameters
-            # are still owned by the trainer's top-level module dict
-            # (so they receive L_count gradient); CMS just consumes
-            # the head's forward.
+            # The decoder needs ``count_head`` when the residual encoder
+            # consumes K̂: ``usage_dim`` is USAGE_KHAT_DIM (usage features
+            # plus K̂) or 1 (K̂ only). The count head stays in the
+            # trainer's own module dict, so it is optimized under the
+            # count loss; the decoder only reads its detached output.
             from shotcloud.features.usage_features import USAGE_KHAT_DIM
 
             count_head_for_spatial: nn.Module | None = None
@@ -2001,13 +2077,9 @@ def train_gibbs(
                 1,
             ):
                 count_head_for_spatial = count_head
-            # Phase 3 mode-routed AC-KDE (2026-06-09): when a
-            # ``mode_router`` is provided, build the structural
-            # mode-routed subclass instead of the single-softmax CMS.
-            # The subclass rejects ``pooling_gate`` and
-            # ``causal_zone_bias`` at construction time per the
-            # 2026-06-09 design lock — those knobs are mutually
-            # exclusive with mode routing.
+            # With a ``mode_router``, build the mode-routed subclass. Mode
+            # routing replaces the pooling gate and the zone-pair bias, so
+            # the subclass rejects both; they are passed as None here.
             if mode_router is not None:
                 spatial = ModeRoutedContinuousMixtureSpatial(
                     offensive_prior=offensive_prior,
@@ -2095,12 +2167,8 @@ def train_gibbs(
     for m in modules.values():
         m.to(dev)
 
-    # Optional pretrain → freeze workflow (paper §5.2 calibration fix).
-    # ``count_checkpoint_path`` loads a state_dict from a
-    # :mod:`scripts.train_count_head` run; ``freeze_count`` disables
-    # ``count_head`` parameter gradients so the spatial decoder
-    # consumes a fixed, pre-calibrated μ via the detached
-    # ``c_{p,t_n} = stopgrad(μ_η(x_n))``.
+    # Optional pretrained count head (from scripts/train_count_head.py),
+    # optionally frozen together with the shared context MLP.
     if count_checkpoint_path is not None:
         ckpt = torch.load(count_checkpoint_path, weights_only=False, map_location=dev)
         if "count_head" not in ckpt:
@@ -2118,11 +2186,8 @@ def train_gibbs(
         for p in context_mlp.parameters():
             p.requires_grad = False
 
-    # Optimizer with optional separate LR for the count head.
-    # ``count_lr=None`` keeps the legacy single-group setup. When set,
-    # the count-head params get their own AdamW group at ``count_lr``;
-    # all other params stay at ``learning_rate``. Useful for the joint
-    # ``count_pretrain + low-LR finetune`` experiment (paper §5.2.C).
+    # A single Adam group, or a separate group for the count head at
+    # ``count_lr`` (e.g. to fine-tune a pretrained count head slowly).
     if count_lr is None or freeze_count:
         params: list[Tensor] = [
             p for m in modules.values() for p in m.parameters() if p.requires_grad
@@ -2279,9 +2344,8 @@ def train_gibbs(
                 history.best_epoch = epoch
                 best_state = {name: _module_snapshot(m) for name, m in modules.items()}
 
-        # Per-epoch snapshot callback for downstream viz / analysis.
-        # Always fires (caller filters by epoch); module_states are
-        # detached clones so they survive subsequent in-place updates.
+        # Fires every epoch (callers filter); the states are detached
+        # clones, so later in-place updates do not alter them.
         if snapshot_callback is not None:
             snapshot_callback(epoch, {name: _module_snapshot(m) for name, m in modules.items()})
 
@@ -2355,13 +2419,10 @@ def train_gibbs(
         for name, m in modules.items():
             _restore_snapshot(m, best_state[name])
 
-    # Final count-head calibration on train + val (paper §5.2). Computed
-    # after best-val restoration so the diagnostic reflects the model
-    # the caller actually gets back. Skipped when count training is
-    # disabled (lambda_count == 0) — the count head's parameters then
-    # carry no meaningful signal. Wrapped in try/except so a diagnostic
-    # failure cannot lose a full training run; any failure is reported
-    # on the resulting history field via an ``{"error": ...}`` dict.
+    # Count calibration on train and val, computed after best-val
+    # restoration so it describes the returned model. Skipped when
+    # lambda_count == 0. A failure is recorded as ``{"error": ...}``
+    # rather than raised, so a diagnostic cannot discard a training run.
     if lambda_count > 0:
         from shotcloud.evaluation import compute_count_calibration
 
@@ -2383,11 +2444,8 @@ def train_gibbs(
             except Exception as exc:
                 history.final_val_count_calibration = {"error": repr(exc)}
 
-    # Expose the resolved spatial wrapper through the optional output
-    # container so callers can serialize wrapper-owned state (e.g. the
-    # zone-pair attention bias submodule) that doesn't live on any of
-    # the inbound submodules. Backwards-compat: when ``out_spatial`` is
-    # None this is a no-op.
+    # Expose the constructed decoder so callers can save decoder-owned
+    # state that is not among the modules passed in.
     if out_spatial is not None:
         out_spatial.append(spatial)
 

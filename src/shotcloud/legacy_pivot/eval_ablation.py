@@ -1,17 +1,18 @@
-"""Classical-baseline ablation runner — first paper-shaped output.
+"""Classical-baseline ablation runner on the court grid.
 
-Computes Tier-1 metrics ([plan.md §4](../../docs/plan.md)) for four classical
-models against a held-out test set:
+Deprecated; retained to reproduce the classical KDE baseline rows. Superseded
+by the cloud-metric evaluation in :mod:`shotcloud.evaluation`.
+
+Computes NLL, zone KL, sliced-Wasserstein, and retrieval metrics for four
+classical models against a held-out test set:
 
 1. **League KDE** — same density for every player.
 2. **Player KDE (raw)** — per-player KDE, no shrinkage.
 3. **Hierarchical KDE** — per-player KDE shrunk toward the position prior.
 4. **KDE product** — geometric product of player × position × league.
 
-These four are the **classical part of the empirical ladder** from
-[plan.md §3](../../docs/plan.md). Once training is wired up, we add
-"KDE product + low-rank tilt (zero-init)" and "KDE product + low-rank
-tilt (trained)" as additional rows.
+Trained models, such as the KDE product with a low-rank tilt, are added
+as extra rows through ``extra_models``.
 
 The runner returns an :class:`AblationResult` with two DataFrames:
 
@@ -128,7 +129,7 @@ def run_ablation(
     seed: int = 42,
     progress: bool = False,
 ) -> AblationResult:
-    """Run the v1 classical-baseline ablation table.
+    """Run the classical-baseline ablation table.
 
     Parameters
     ----------
@@ -172,9 +173,9 @@ def run_ablation(
         Each entry maps a display name (e.g.,
         ``"KDE product + tilt (trained)"``) to a callable
         ``player_id → (ny, nx) density grid``. The function is invoked
-        once per test player; the same Tier-1 metrics are computed.
+        once per test player; the same metrics are computed.
         Useful for plugging in trained checkpoints — see
-        :func:`shotcloud.training.load_decoder_checkpoint`.
+        :func:`make_density_fn_from_checkpoint`.
     seed : int, default 42
         RNG seed for sampling and SW projections.
     progress : bool, default False
@@ -382,7 +383,7 @@ def run_ablation(
 
 
 def model_order() -> Sequence[str]:
-    """Stable display order for the 4 v1 models (worst → best baseline)."""
+    """Stable display order for the four classical models (worst → best baseline)."""
     return (
         "League KDE",
         "Player KDE (raw)",
@@ -405,7 +406,7 @@ def make_density_fn_from_checkpoint(
     Parameters
     ----------
     checkpoint : DecoderCheckpoint
-        Loaded via :func:`shotcloud.training.load_decoder_checkpoint`.
+        Loaded via :func:`~shotcloud.legacy_pivot.checkpoint.load_decoder_checkpoint`.
         The encoder vocab must cover every test player run_ablation
         encounters; players in the test set but not in the vocab are
         already filtered out by run_ablation's train/test player

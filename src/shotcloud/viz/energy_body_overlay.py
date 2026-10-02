@@ -1,18 +1,17 @@
-"""Energy-body shot-cloud overlays — two paper-grade hero variants.
+"""Energy-body overlays comparing predicted and observed shot clouds.
 
-Sibling module to :mod:`shotcloud.viz.energy_body`. The base module
-renders a single warm-palette energy body and is preserved unchanged
-so the existing hero figure stays bit-identical. This module adds two
-overlay renderers that share the same look but accept extra inputs:
+Companion to :mod:`shotcloud.viz.energy_body`, which renders a single
+energy body. This module provides two overlay renderers with the same
+visual style:
 
-* :func:`render_predicted_with_observed_shots` — Figure A: predicted
+* :func:`render_predicted_with_observed_shots` — the predicted
   density surface plus discrete observed-shot markers placed at
   ``(x_i, y_i, ẑ_i)`` where ``ẑ_i`` is the predicted-density value
   bilinearly interpolated at the observed shot's location. Markers
   on the predicted ridge mean "the model put high density here";
   markers on the floor mean "the model missed this shot".
 
-* :func:`render_predicted_vs_bootstrap` — Figure B: predicted density
+* :func:`render_predicted_vs_bootstrap` — the predicted density
   surface (warm palette, default plasma) **plus** a bootstrap density
   surface of the observed shots (cool palette, default cividis) in
   the same 3D frame. The two palettes are perceptually orthogonal,
@@ -24,9 +23,9 @@ Both renderers support an optional 2D-contour companion panel
 than the visual hook. The 2D panel sits to the left of the 3D body in
 a 2-axes figure.
 
-The script :mod:`scripts.plot_hero_shot_clouds` is the canonical
-caller; it handles player/game selection from the trained checkpoint
-and writes metadata JSON sidecars alongside each PNG.
+``scripts/plot_hero_shot_clouds.py`` drives both renderers: it selects
+players and games from a trained checkpoint and writes a metadata JSON
+sidecar alongside each PNG.
 """
 
 from __future__ import annotations
@@ -58,7 +57,7 @@ __all__ = [
 
 @dataclass
 class OverlayPaletteConfig:
-    """Color pairing for the dual-cloud (Figure B) renderer.
+    """Colors, transparency, and marker style for the overlay renderers.
 
     Defaults pair plasma (predicted, warm) with cividis (bootstrap,
     cool). Both palettes are perceptually uniform; their hue axes are
@@ -77,9 +76,10 @@ class OverlayPaletteConfig:
         Per-shell alpha for the warm stack. Length determines the
         number of nested shells.
     observed_shell_alphas : tuple of float
-        Per-shell alpha for the cool stack. Capped at ~0.4 by
-        default so the bootstrap surface remains visibly secondary
-        to the predicted surface (bootstraps over small K are noisy).
+        Per-shell alpha for the cool stack. Lower than the predicted
+        alphas by default so the bootstrap surface stays visibly
+        secondary to the predicted surface (bootstraps over small K
+        are noisy).
     observed_marker_color : str
         Color for observed-shot markers in
         :func:`render_predicted_with_observed_shots`. Default cyan
@@ -138,9 +138,8 @@ def _bilinear_at_points(
 
 
 # ---------------------------------------------------------------------------
-# Parameterized shell renderer (a recolored version of
-# energy_body._render_energy_shells with a single colormap input,
-# so we can stack two palettes in Figure B).
+# Shell renderer with a configurable colormap, so two palettes can share
+# one set of axes.
 # ---------------------------------------------------------------------------
 
 
@@ -214,10 +213,8 @@ def _draw_halfcourt_2d(ax: Axes, cfg: EnergyBodyConfig) -> None:
         ax, mpatches.Rectangle((-25, -5), 50, 52, fill=False, edgecolor=color, linewidth=lw)
     )
     # Three-point line: straight corner segments at x = ±22 ft joined by
-    # the 23.75 ft arc. The arc must begin where it meets the corner
-    # lines (x = ±22 → θ = arccos(22/23.75) ≈ 22°). The previous
-    # arcsin(14/23.75) ended the arc at x ≈ ±19.2, leaving a gap to the
-    # x = ±22 corner lines.
+    # the 23.75 ft arc. The arc starts where it meets the corner lines
+    # (x = ±22, θ = arccos(22/23.75) ≈ 22°) so the two join without a gap.
     corner_x, arc_r = 22.0, 23.75
     theta_start = float(np.arccos(corner_x / arc_r))
     theta = np.linspace(theta_start, np.pi - theta_start, 120)
@@ -252,8 +249,11 @@ def _draw_2d_companion(
     overlay_density: np.ndarray | None = None,
     overlay_cmap_name: str | None = None,
 ) -> None:
-    """2D contour view of the predicted density (and optional bootstrap
-    overlay), with observed-shot markers."""
+    """2D view of the predicted density with observed-shot markers.
+
+    An optional second density (the bootstrap surface) is drawn as
+    contour lines.
+    """
     extent = (xedges[0], xedges[-1], yedges[0], yedges[-1])
     # Filled predicted density with a *density-proportional alpha* so
     # low-density court regions stay transparent and the court lines
@@ -311,10 +311,10 @@ def _draw_2d_companion(
 
 @dataclass
 class GameMetadata:
-    """Per-game metadata that goes into the figure title block and the
-    sidecar JSON. Constructed by the caller (typically
-    :mod:`scripts.plot_hero_shot_clouds`) from the validation row
-    indices and the joined game logs.
+    """Per-game metadata for the figure title block and the sidecar JSON.
+
+    Built by the caller, typically from the validation rows and the
+    joined game logs. ``extra`` entries are merged into :meth:`to_dict`.
     """
 
     player_name: str
@@ -333,6 +333,7 @@ class GameMetadata:
 
     @property
     def matchup(self) -> str:
+        """Matchup string ``"AWAY @ HOME"``."""
         return f"{self.away_team} @ {self.home_team}"
 
     def title_block(self) -> tuple[str, str, str]:
@@ -350,6 +351,7 @@ class GameMetadata:
         return title, subtitle, extras
 
     def to_dict(self) -> dict[str, Any]:
+        """JSON-serializable dict of all fields, with ``extra`` merged in."""
         d = {
             "player_name": self.player_name,
             "away_team": self.away_team,
@@ -372,8 +374,7 @@ class GameMetadata:
 def _apply_title_block(
     fig: Figure, ax3d: Any, metadata: GameMetadata, cfg: EnergyBodyConfig
 ) -> None:
-    """Title + subtitle on the figure; "extras" line in the upper-left
-    annotation box of the 3D axes."""
+    """Add the title and subtitle, plus the extras line in a 3D-axes box."""
     title, subtitle, extras = metadata.title_block()
     fig.suptitle(title, color=cfg.text_color, fontsize=16, fontweight="bold", y=0.985)
     fig.text(
@@ -447,11 +448,12 @@ def _render_observed_stems(
     stem_color: str = "#0C1828",
     stem_alpha: float = 0.55,
 ) -> None:
-    """Scatter observed shots at ``(x, y, z_top)`` and draw a vertical
-    stem from the court floor (z=0) up to each marker, plus a faint
-    floor dot at ``(x, y, 0)``. The stems make each shot's (x, y)
-    location unambiguous under the 3D projection (a floating marker
-    alone is hard to localize)."""
+    """Scatter observed shots at ``(x, y, z_top)`` with stems to the floor.
+
+    Each marker gets a vertical stem from the court floor (z=0) and a
+    faint floor dot at ``(x, y, 0)``; a floating marker alone is hard to
+    localize under the 3D projection.
+    """
     for (x, y), z in zip(observed_xy, z_tops, strict=True):
         ax.plot(
             [x, x],
@@ -489,7 +491,7 @@ def _render_observed_stems(
 
 
 # ---------------------------------------------------------------------------
-# Figure A: predicted body + observed shot markers
+# Predicted body + observed shot markers
 # ---------------------------------------------------------------------------
 
 
@@ -503,16 +505,17 @@ def render_predicted_with_observed_shots(
     palette: OverlayPaletteConfig | None = None,
     companion_2d: bool = False,
 ) -> Path:
-    """Figure A: predicted plasma energy body with observed shots
-    overlaid as discrete markers at ``(x_i, y_i, ẑ_i)``.
+    """Render the predicted energy body with observed shots as markers.
+
+    Observed shots are placed at ``(x_i, y_i, ẑ_i)``, where ``ẑ_i`` is
+    the rendered height of the predicted surface at the shot.
 
     Parameters
     ----------
     predicted_xy : ndarray of shape ``(N, 2)``
-        Sampled shot coordinates from the trained spatial decoder
-        (typically ``B × K`` ravelled, where ``B`` is the number of
-        bootstrap samples per observed shot and ``K`` is the observed
-        shot count).
+        Shot coordinates sampled from the trained spatial model,
+        typically ``n_samples`` conditional draws for each of the ``K``
+        observed shots, ravelled to ``N = n_samples × K``.
     observed_xy : ndarray of shape ``(K, 2)``
         The validation game's observed shot coordinates.
     output_path : str | Path
@@ -520,13 +523,18 @@ def render_predicted_with_observed_shots(
     metadata : GameMetadata
         Title-block and sidecar fields.
     config : EnergyBodyConfig, optional
-        Inherits the canonical hero-figure render defaults.
+        Rendering parameters; defaults to the hero-figure settings.
     palette : OverlayPaletteConfig, optional
-        Marker color/size for observed shots.
+        Surface colormap and observed-shot marker style.
     companion_2d : bool, default False
-        When True, the figure has two axes side-by-side: a 2D contour
-        of the predicted density (left) and the 3D energy body
-        (right). When False (default), just the 3D body.
+        When True, the figure has two axes side-by-side: a 2D view of
+        the predicted density (left) and the 3D energy body (right).
+        When False, just the 3D body.
+
+    Returns
+    -------
+    Path
+        The path the figure was written to.
     """
     cfg = config or EnergyBodyConfig()
     pal = palette or OverlayPaletteConfig()
@@ -587,11 +595,9 @@ def render_predicted_with_observed_shots(
     _render_floor_contours(ax3d, grid_x, grid_y, density)
     _draw_halfcourt(ax3d, cfg)
 
-    # Observed shot markers at (x_i, y_i, ẑ_i). Use the smoothed
-    # density rather than the raw histogram so markers always sit on
-    # the canopy ridge near the shot's coordinate. Each marker gets a
-    # vertical stem down to the court floor (z=0) so its (x, y)
-    # location is unambiguous in the 3D projection.
+    # Observed shot markers at (x_i, y_i, ẑ_i). Interpolating the
+    # smoothed density rather than the raw histogram keeps markers on
+    # the rendered canopy near the shot's coordinate.
     if observed_xy.shape[0] > 0:
         ẑ = _bilinear_at_points(density, xedges, yedges, observed_xy[:, 0], observed_xy[:, 1])
         # Power-scale to match the rendered height field.
@@ -612,7 +618,7 @@ def render_predicted_with_observed_shots(
 
 
 # ---------------------------------------------------------------------------
-# Figure B: predicted energy body + bootstrap-observed energy body
+# Predicted energy body + bootstrap-observed energy body
 # ---------------------------------------------------------------------------
 
 
@@ -621,8 +627,7 @@ def _bootstrap_resamples(
     n_bootstraps: int,
     seed: int | np.random.SeedSequence,
 ) -> np.ndarray:
-    """Sample with replacement from observed shots ``n_bootstraps``
-    times, returning a single ``(n_bootstraps × K, 2)`` array."""
+    """Resample observed shots ``n_bootstraps`` times; returns ``(n_bootstraps × K, 2)``."""
     if observed_xy.shape[0] == 0:
         return observed_xy
     rng = np.random.default_rng(seed)
@@ -643,9 +648,10 @@ def render_predicted_vs_bootstrap(
     bootstrap_seed: int = 0,
     companion_2d: bool = False,
 ) -> Path:
-    """Figure B: predicted energy body (warm palette) plus a
-    bootstrap-observed energy body (cool palette) in the same 3D
-    frame.
+    """Render the predicted and bootstrap-observed energy bodies together.
+
+    The predicted body (warm palette) and a bootstrap density of the
+    observed shots (cool palette) share one 3D frame.
 
     Parameters
     ----------
@@ -655,8 +661,11 @@ def render_predicted_vs_bootstrap(
         Observed shots; the bootstrap surface is built by resampling
         with replacement.
     output_path : str | Path
+        Where to write the PNG. Parent directory must exist.
     metadata : GameMetadata
+        Title-block and sidecar fields.
     config : EnergyBodyConfig, optional
+        Rendering parameters; defaults to the hero-figure settings.
     palette : OverlayPaletteConfig, optional
         Predicted vs observed colormap pairing.
     n_bootstraps : int, default 200
@@ -664,8 +673,16 @@ def render_predicted_vs_bootstrap(
         density is the smoothed histogram of all ``n_bootstraps × K``
         resampled points; larger ``n_bootstraps`` yields a smoother
         cool-palette surface.
-    bootstrap_seed : int
+    bootstrap_seed : int, default 0
+        Seed for the bootstrap resampling.
     companion_2d : bool, default False
+        When True, adds a 2D panel on the left showing the predicted
+        density (filled) and the bootstrap density (contours).
+
+    Returns
+    -------
+    Path
+        The path the figure was written to.
     """
     cfg = config or EnergyBodyConfig()
     pal = palette or OverlayPaletteConfig()

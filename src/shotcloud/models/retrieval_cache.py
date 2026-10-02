@@ -1,25 +1,23 @@
-"""Per-(player, snapshot) retrieval cache for the PR3 support backend.
+"""Per-(player, snapshot) causal support retrieval for the AC-KDE backend.
 
-The :class:`shotcloud.models.RetrievalCollaborativeKDE` backend (PR3.2,
-not yet built) replaces the fixed ``L × R`` collaborative support with
-a retrieval-based candidate set:
+:class:`RetrievalCache` holds, for every (player, snapshot) pair, indices
+into a date-sorted global shot table that define the causal support set
+used by :class:`~shotcloud.models.retrieval_collaborative_kde.RetrievalCollaborativeKDE`:
 
-* **Own**: the target player's causal shots up to ``own_support_max``,
-  most-recent-first.
-* **Pooled**: shots from non-target shooters in the recency window
-  ``[anchor − recency_days, anchor)``, scored by
+* **Own**: the target player's shots dated strictly before the snapshot
+  anchor, most recent first, up to ``own_support_max``.
+* **Pooled**: shots by other players in the recency window
+  ``[anchor − pooled_recency_window_days, anchor)``, ranked by
 
-  ``cos(u_p(t), u_{p_j}(t)) + log_2(2^{-Δt / half_life})``
+  ``cos(u_p(t), u_{p_j}(t)) − ln(2) · Δt / half_life``
 
-  with cosine over per-snapshot trait vectors. Top-``pooled_support_max``
-  retained.
+  (trait cosine similarity plus the log of a half-life recency weight),
+  keeping the top ``pooled_support_max``.
 
-This module is a *pure data layer*: it precomputes per-(player,
-snapshot) indices into a sorted global shot table at the start of
-training/evaluation, and serializes the result for reuse across runs
-that share the same config hash. The model integration (PR3.2)
-consumes :class:`RetrievalCache` and gathers ``support_xy`` /
-``support_logits`` / ``own_mask`` from the precomputed indices.
+Every retained shot predates the anchor date of the snapshot, so the
+support is causal by construction. This module is a pure data layer: the
+indices are computed once and serialized for reuse by any run with the
+same configuration hash.
 
 Determinism notes:
 
@@ -46,9 +44,8 @@ from torch import Tensor
 
 from shotcloud.training.dataset import PlayerVocab
 
-#: Default support-size caps and retrieval-window settings, taken from
-#: the 2026-05-22 coverage-diagnostic readout. These are also the
-#: defaults exposed at the CLI in PR3.2.
+#: Default support-size caps and retrieval-window settings (also the
+#: command-line defaults of the training script).
 DEFAULT_OWN_SUPPORT_MAX: int = 1000
 DEFAULT_POOLED_SUPPORT_MAX: int = 500
 DEFAULT_POOLED_RECENCY_WINDOW_DAYS: int = 180
@@ -63,9 +60,9 @@ class RetrievalCacheConfig:
     Two caches with the same ``config_hash`` are guaranteed to have
     identical contents *given the same shots DataFrame and traits
     tensor*. The caller is responsible for keeping the shots fingerprint
-    in sync with the actual data file (size + mtime is the typical
-    recipe); the trait tensor is assumed deterministic given the same
-    snapshot store + bio (CollaborativeKDE builds it that way).
+    in sync with the actual data file (see :func:`shots_fingerprint`);
+    the trait tensor is assumed deterministic given the same snapshot
+    store and biographical data.
     """
 
     shots_fingerprint: str
@@ -93,7 +90,7 @@ class RetrievalCacheConfig:
                 f"got {self.pooled_recency_half_life_days}"
             )
         if self.similarity_kind != DEFAULT_SIMILARITY_KIND:
-            # Reserved for future variants; reject silently-misconfigured callers.
+            # Only one similarity is implemented; reject anything else.
             raise ValueError(
                 f"unknown similarity_kind={self.similarity_kind!r}; "
                 f"only {DEFAULT_SIMILARITY_KIND!r} is implemented"
@@ -118,11 +115,14 @@ class RetrievalCacheConfig:
 
 @dataclass
 class RetrievalCache:
-    """Precomputed retrieval indices + the global shot table they reference."""
+    """Precomputed retrieval indices and the global shot table they reference.
+
+    ``P`` is the vocabulary size and ``S`` the number of snapshots.
+    """
 
     config: RetrievalCacheConfig
-    #: ``(N_global, 2)`` float32 — coordinates of every causal shot in
-    #: the player vocab, sorted ascending by ``global_dates``.
+    #: ``(N_global, 2)`` float32 — coordinates of every shot by a
+    #: vocabulary player, sorted ascending by ``global_dates``.
     global_xy: Tensor
     #: ``(N_global,)`` int64 — epoch-day date of each global shot.
     global_dates: Tensor
@@ -159,6 +159,7 @@ class RetrievalCache:
 
     @classmethod
     def load(cls, path: Path) -> RetrievalCache:
+        """Load a cache written by :meth:`save`."""
         d = torch.load(path, weights_only=False)
         cfg_dict = d["config"]
         # JSON serialization turns the anchor_dates tuple into a list;
@@ -211,8 +212,10 @@ def _build_indices(
     traits: Tensor,  # (P, S, T)
     config: RetrievalCacheConfig,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """The retrieval per (player, snapshot). Returns the four index +
-    mask numpy arrays."""
+    """Run the retrieval for every (player, snapshot).
+
+    Returns ``(own_idx, own_mask, pooled_idx, pooled_mask)`` as NumPy arrays.
+    """
     n_snapshots = anchor_dates.shape[0]
     own_idx = np.full((n_players, n_snapshots, config.own_support_max), -1, dtype=np.int64)
     own_mask = np.zeros((n_players, n_snapshots, config.own_support_max), dtype=bool)
@@ -291,13 +294,13 @@ def build_retrieval_cache(
         The model's player vocabulary; defines the row indexing of
         the per-(player, snapshot) tensors.
     anchor_dates : np.ndarray of shape ``(S,)``
-        Snapshot anchor dates in **epoch days** (matches
-        ``CollaborativeKDE.anchor_dates``).
+        Snapshot anchor dates in **epoch days**; must equal
+        ``config.anchor_dates``.
     traits : Tensor of shape ``(P, S, T)``
-        Per-snapshot causal player-trait vectors (the same
-        ``CollaborativeKDE.traits``); cosine similarity is computed
-        in this space.
+        Per-snapshot causal player-trait vectors; pooled candidates are
+        ranked by cosine similarity in this space.
     config : RetrievalCacheConfig
+        Retrieval settings; their hash names the cache file.
     cache_dir : Path or None
         If given, the cache is loaded from
         ``cache_dir/retrieval_cache_{config.config_hash}.pt`` when
@@ -307,6 +310,16 @@ def build_retrieval_cache(
     rebuild : bool
         Force a rebuild even when a cached file exists at the
         expected path.
+
+    Returns
+    -------
+    RetrievalCache
+
+    Raises
+    ------
+    ValueError
+        If ``anchor_dates`` disagrees with ``config.anchor_dates`` or
+        ``traits`` has the wrong shape.
     """
     if anchor_dates.ndim != 1:
         raise ValueError(f"anchor_dates must be 1D; got shape {anchor_dates.shape}")
@@ -361,9 +374,11 @@ def build_retrieval_cache(
 
 
 def shots_fingerprint(shots_path: Path) -> str:
-    """A short, cheap fingerprint of the shots file: ``sha256(path,
-    size, mtime_ns)`` truncated to 16 hex chars. Used as the
-    ``shots_fingerprint`` field of :class:`RetrievalCacheConfig`."""
+    """Return a cheap fingerprint of the shots file for the cache key.
+
+    The fingerprint is ``sha256(path, size, mtime_ns)`` truncated to 16 hex
+    characters, used as :attr:`RetrievalCacheConfig.shots_fingerprint`.
+    """
     st = shots_path.stat()
     payload: dict[str, Any] = {
         "path": str(shots_path.resolve()),

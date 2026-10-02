@@ -1,37 +1,37 @@
-"""Zone-based opponent defense reweighting (D-lite) — fast PR after the
-D-field allowed-shot KDE landed as empirically non-load-bearing.
+"""Zone-level opponent reweighting of the support logits.
 
-Per-support-shot logit contribution::
+:class:`ZoneReweightingDefense` implements the opponent reweighting term
+``D`` of the AC-KDE support logits. Each support shot receives the
+additive logit::
 
-    D_m = β_D · q̃_d^{z(s_m)}(t)
+    D_m = β_D · γ_{z(s_m)} · q̃_d^{z(s_m)}(t)
 
 where:
 
 * ``z(s_m)``: 8-zone label of the offensive support shot ``s_m``;
-* ``q̃_d^z(t)``: league-centered allowed-shot zone proportion for
+* ``q̃_d^z(t)``: league-centered allowed-shot zone proportion of
   opponent ``d`` at snapshot ``t`` (block C of
-  :data:`~shotcloud.features.defense_features.DEFENSE_FEATURE_NAMES`);
-* ``β_D``: single learned scalar.
+  :data:`~shotcloud.features.defense_features.DEFENSE_FEATURE_NAMES`),
+  computed only from shots dated strictly before the snapshot anchor;
+* ``β_D``: a learned scalar, and ``γ_z`` optional learned per-zone
+  multipliers (``γ_z ≡ 1`` when disabled).
 
-Compared to
-:class:`~shotcloud.models.continuous_adaptive_defensive.ContinuousAdaptiveDefensiveField`
-(D-field):
+The mainline configuration enables the per-zone multipliers
+(``--defense-kind zone_lite_gamma`` in ``scripts/train_gibbs.py``).
 
-* No allowed-shot retrieval cache, no per-support pairwise KDE —
-  defense uses the already-built :class:`DefenseFeatures` artifact
-  directly.
-* One scalar parameter, not a small MLP.
-* Forward is ``O(B · M)`` and orders of magnitude faster.
+Compared with the kernel field
+:class:`~shotcloud.models.continuous_adaptive_defensive.ContinuousAdaptiveDefensiveField`,
+this term needs no allowed-shot retrieval cache and no pairwise kernel
+evaluation: it reads the
+:class:`~shotcloud.features.defense_features.DefenseFeatures` artifact
+directly, has at most ``1 + N_ZONES`` parameters, and its forward pass is
+``O(B · M)``.
 
-Cold-start (opponent has no causal history at snapshot) is handled
-automatically: the ``DefenseFeatures`` cell for those rows is
-all-zero, so ``β_D · 0 = 0``. No additional masking required.
+Opponents with no causal history at the snapshot have an all-zero
+feature row, so ``D_m = 0`` without additional masking.
 
-The diagnostic value of D-lite is the same falsification test as
-D-field, but with the architecture stripped to its bare minimum:
-if ``β_D`` random-walks around zero and cloud metrics do not move,
-opponent zone allowance is not load-bearing for the one-shot
-retrieval-KDE objective.
+:class:`MatchupReweightingDefense` is a player-conditional alternative
+built on peer-versus-opponent zone residuals, evaluated as an ablation.
 """
 
 from __future__ import annotations
@@ -46,8 +46,9 @@ __all__ = ["MatchupReweightingDefense", "ZoneReweightingDefense", "zone_from_xy_
 
 
 def zone_from_xy_torch(xy: Tensor) -> Tensor:
-    """Torch-native vectorized version of
-    :func:`shotcloud.data.zones.zone_from_xy`.
+    """Assign 8-zone labels to court coordinates in torch.
+
+    Vectorized equivalent of :func:`shotcloud.data.zones.zone_from_xy`.
 
     Parameters
     ----------
@@ -81,7 +82,7 @@ def zone_from_xy_torch(xy: Tensor) -> Tensor:
         & (y <= 15.0)
     )
     # Priority-order writes so each rule overrides the more general
-    # midrange default exactly as in the numpy version.
+    # midrange default, matching the NumPy implementation.
     zones = torch.full_like(x, 2, dtype=torch.int64)
     zones = torch.where(is_paint, torch.full_like(zones, 1), zones)
     zones = torch.where(is_ra, torch.full_like(zones, 0), zones)
@@ -95,37 +96,36 @@ def zone_from_xy_torch(xy: Tensor) -> Tensor:
 
 
 class ZoneReweightingDefense(nn.Module):
-    """D-lite: scalar β_D times the opponent's centered zone-allowance
-    at each support shot's zone, with optional per-zone γ_z multiplier.
+    """Opponent zone-allowance reweighting of the support logits.
 
-    Two variants:
+    The logit is ``β_D`` times the opponent's league-centered zone
+    allowance at each support shot's zone, with an optional per-zone
+    multiplier ``γ_z``:
 
-    * **D-lite-0** (``per_zone_gamma=False``, default):
-      ``D_m = β_D · q̃_d^{z(s_m)}``.
-      One learnable scalar.
-    * **D-lite-zone** (``per_zone_gamma=True``):
-      ``D_m = β_D · γ_{z(s_m)} · q̃_d^{z(s_m)}``.
-      One scalar + ``N_ZONES`` per-zone multipliers. ``γ_z`` is
-      initialized to 1.0, so at init D-lite-zone reduces *exactly*
-      to D-lite-0 (the upgrade is a clean superset).
+    * ``per_zone_gamma=False`` (default; CLI ``zone_lite``):
+      ``D_m = β_D · q̃_d^{z(s_m)}``, one learnable scalar.
+    * ``per_zone_gamma=True`` (CLI ``zone_lite_gamma``, the mainline):
+      ``D_m = β_D · γ_{z(s_m)} · q̃_d^{z(s_m)}``, one scalar plus
+      ``N_ZONES`` per-zone multipliers. ``γ_z`` is initialized to 1, so
+      at initialization this variant equals the scalar-only variant
+      exactly.
 
     Parameters
     ----------
     n_opponents : int
-        Size of the opponent vocabulary. Stored for save/load
-        round-trip parity with the D-field module; the forward does
-        not consult it because the per-row zone-allowance vector is
-        gathered by the caller.
+        Size of the opponent vocabulary. Stored so the constructor
+        signature matches the kernel-field defense; the forward pass
+        does not use it because the caller gathers the per-row
+        zone-allowance vector.
     beta_init : float, default 1e-3
-        Warm-start for the single scalar ``β_D``. Matches the
-        D-field convention so paired ablations carry comparable
-        global scales.
+        Initial value of ``β_D``. Near zero, so the term starts as an
+        approximate no-op; the same default as the kernel-field defense
+        keeps the two on comparable scales.
     per_zone_gamma : bool, default False
-        When True, adds the learnable per-zone multiplier ``γ_z``
-        (shape ``(N_ZONES,)``, initialized to all-ones). Note that
-        ``β_D`` and ``γ_z`` are jointly identified only up to a
-        global scale; the trainer's gradient flow disentangles them
-        in practice without an explicit constraint.
+        If True, add the learnable per-zone multiplier ``γ_z`` (shape
+        ``(N_ZONES,)``, initialized to ones). ``β_D`` and ``γ_z`` are
+        identified only up to a common scale; no constraint is imposed
+        to fix it.
     """
 
     def __init__(
@@ -140,7 +140,8 @@ class ZoneReweightingDefense(nn.Module):
         self._per_zone_gamma = bool(per_zone_gamma)
         self.beta_D = nn.Parameter(torch.tensor(float(beta_init), dtype=torch.float32))
         if self._per_zone_gamma:
-            # Initialize to 1.0 so D-lite-zone == D-lite-0 at step 0.
+            # Initialize to 1 so the term equals the scalar-only variant
+            # at initialization.
             self.gamma_z = nn.Parameter(torch.ones(N_ZONES, dtype=torch.float32))
         else:
             # No γ_z parameter — keep the module dict clean.
@@ -148,6 +149,7 @@ class ZoneReweightingDefense(nn.Module):
 
     @property
     def per_zone_gamma(self) -> bool:
+        """Whether the per-zone multipliers ``γ_z`` are enabled."""
         return self._per_zone_gamma
 
     def forward(
@@ -156,7 +158,7 @@ class ZoneReweightingDefense(nn.Module):
         query_xy: Tensor,
         def_features: Tensor,
     ) -> Tensor:
-        """Compute per-support-shot D-lite logit.
+        """Compute the per-support-shot reweighting logit.
 
         Parameters
         ----------
@@ -166,7 +168,7 @@ class ZoneReweightingDefense(nn.Module):
             Per-row defense features (already gathered by
             ``(opp_idx, snapshot_idx)`` upstream). The centered-zone
             block (slice ``_ZONE_CENTERED_SLICE``) is the only block
-            consumed by D-lite.
+            used.
 
         Returns
         -------
@@ -204,8 +206,12 @@ class ZoneReweightingDefense(nn.Module):
 
 
 class MatchupReweightingDefense(nn.Module):
-    """D-matchup (Tier 2a): scalar β_match times the per-row, per-zone
-    residualized similar-player defensive response Δ̂_{p,d,z}(t).
+    """Player-conditional matchup reweighting of the support logits.
+
+    The logit is a learned scalar ``β_match`` times the per-row, per-zone
+    residualized response ``Δ̂_{p,d,z}(t)`` of similar players against
+    the opponent. An alternative to :class:`ZoneReweightingDefense`,
+    evaluated as an ablation.
 
     Per-support-shot logit contribution::
 
@@ -219,30 +225,28 @@ class MatchupReweightingDefense(nn.Module):
       :class:`shotcloud.features.matchup_features.MatchupFeatures`;
     * ``β_match``: single learned scalar.
 
-    Compared to :class:`ZoneReweightingDefense` (D-lite-zone):
+    Compared with :class:`ZoneReweightingDefense`:
 
-    * Same compute shape — gather Δ̂ by support zone, multiply by a
-      learned scalar — but the per-row Δ̂ vector is itself a
-      player-conditional residualized aggregate, not just opponent-
-      conditional. This is the "how does this defense affect players
-      *like* this player" signal the D-lite zone-allowance term
-      cannot express by construction.
-    * No ``γ_z`` per-zone multiplier in this first pass. The per-zone
-      shape comes from Δ̂ itself; adding γ_z would double-count zone
-      structure and complicates identification with the no-defense
-      baseline.
+    * The computation has the same shape (gather by support zone,
+      multiply by a learned scalar), but ``Δ̂`` is a player-conditional
+      residualized aggregate rather than an opponent-only quantity: it
+      describes how the defense affects players similar to this one,
+      which the zone-allowance term cannot express.
+    * There is no per-zone multiplier ``γ_z``. The per-zone shape comes
+      from ``Δ̂`` itself; adding ``γ_z`` would double-count zone
+      structure and weaken identification relative to the no-defense
+      model.
 
-    Cold-start handling: cells with no causal peer-vs-opponent
-    evidence have ``Δ̂ = 0`` exactly (zeroed in the feature builder),
-    so ``β_match · 0 = 0`` and those rows contribute nothing — the
-    cold-start-safe fallback.
+    Cells with no causal peer-versus-opponent evidence have ``Δ̂ = 0``
+    exactly (zeroed by the feature builder), so those rows contribute
+    nothing.
 
     Parameters
     ----------
     beta_init : float, default 1e-3
-        Warm-start for the single scalar ``β_match``. Matches the
-        D-lite ``β_D`` convention so paired ablations carry
-        comparable global scales at init.
+        Initial value of ``β_match``, matching the ``β_D`` default of
+        :class:`ZoneReweightingDefense` so the two start on comparable
+        scales.
     """
 
     def __init__(self, *, beta_init: float = 1e-3) -> None:
@@ -255,7 +259,7 @@ class MatchupReweightingDefense(nn.Module):
         query_xy: Tensor,
         delta_hat: Tensor,
     ) -> Tensor:
-        """Compute per-support-shot D-matchup logit.
+        """Compute the per-support-shot matchup logit.
 
         Parameters
         ----------

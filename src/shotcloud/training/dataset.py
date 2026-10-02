@@ -1,17 +1,12 @@
-"""Player / opponent vocabularies for the joint Gibbs trainer.
+"""Player and opponent vocabularies.
 
-The pre-pivot per-shot dataset (``ShotCellDataset``) moved to
-:mod:`shotcloud.legacy_pivot.shot_cell_dataset` on 2026-05-15.
-The current production dataset is
-:class:`~shotcloud.training.GibbsShotDataset`.
-
-This module retains only the two vocab classes, which are
-essential to both the legacy pre-pivot dataset and the current
-``GibbsShotDataset``. Both are bidirectional string-normalized
-maps that match the convention used by :class:`HierarchicalKDE`
-and :class:`AdaptiveKDE` — callers can construct a vocab from
-KDE keys (strings) and look up by raw pandas values
-(``np.int64``, ``np.str_``, plain ``str``) without typing friction.
+Both vocabularies are bidirectional, string-normalized maps between raw
+IDs and contiguous integer indices, matching the key convention of
+:class:`~shotcloud.kde.HierarchicalKDE` and :class:`~shotcloud.kde.AdaptiveKDE`.
+A vocabulary can therefore be built from KDE keys (strings) and queried
+with raw pandas values (``np.int64``, ``np.str_``, ``str``). They are used
+by :class:`~shotcloud.training.GibbsShotDataset` and by the per-shot
+dataset in :mod:`shotcloud.legacy_pivot.shot_cell_dataset`.
 """
 
 from __future__ import annotations
@@ -24,10 +19,10 @@ from dataclasses import dataclass
 class PlayerVocab:
     """Bidirectional ``player_id ↔ index`` mapping.
 
-    Player IDs are normalized via ``str()`` at construction *and* at
-    lookup, matching the convention used by :class:`HierarchicalKDE`
-    and :class:`AdaptiveKDE`. Indices are contiguous ``[0, n_players)``
-    so they can drive an ``nn.Embedding`` or index a per-player table.
+    Player IDs are normalized via ``str()`` at construction and at
+    lookup. Indices are contiguous in ``[0, n_players)`` and follow the
+    sorted order of the string IDs, so they can index an
+    ``nn.Embedding`` or a per-player table.
     """
 
     id_to_idx: dict[str, int]
@@ -35,6 +30,7 @@ class PlayerVocab:
 
     @classmethod
     def from_ids(cls, player_ids: Sequence[object]) -> PlayerVocab:
+        """Build a vocabulary from raw IDs; duplicates are collapsed."""
         unique = sorted({str(p) for p in player_ids})
         id_to_idx = {pid: i for i, pid in enumerate(unique)}
         return cls(id_to_idx=id_to_idx, ids=tuple(unique))
@@ -43,12 +39,14 @@ class PlayerVocab:
         return len(self.ids)
 
     def to_idx(self, player_id: object) -> int:
+        """Return the index of ``player_id``; raise ``KeyError`` if absent."""
         key = str(player_id)
         if key not in self.id_to_idx:
             raise KeyError(f"player {player_id!r} not in vocab")
         return self.id_to_idx[key]
 
     def to_id(self, idx: int) -> str:
+        """Return the string ID at index ``idx``."""
         return self.ids[idx]
 
 
@@ -57,7 +55,7 @@ class OpponentVocab:
     """Bidirectional ``opponent_id ↔ index`` mapping.
 
     Same string-normalization convention as :class:`PlayerVocab`.
-    Indices are contiguous ``[0, n_opponents)``.
+    Indices are contiguous in ``[0, n_opponents)``.
     """
 
     id_to_idx: dict[str, int]
@@ -65,6 +63,7 @@ class OpponentVocab:
 
     @classmethod
     def from_ids(cls, opponent_ids: Sequence[object]) -> OpponentVocab:
+        """Build a vocabulary from raw IDs; duplicates are collapsed."""
         unique = sorted({str(o) for o in opponent_ids})
         id_to_idx = {oid: i for i, oid in enumerate(unique)}
         return cls(id_to_idx=id_to_idx, ids=tuple(unique))
@@ -73,10 +72,12 @@ class OpponentVocab:
         return len(self.ids)
 
     def to_idx(self, opponent_id: object) -> int:
+        """Return the index of ``opponent_id``; raise ``KeyError`` if absent."""
         key = str(opponent_id)
         if key not in self.id_to_idx:
             raise KeyError(f"opponent {opponent_id!r} not in vocab")
         return self.id_to_idx[key]
 
     def to_id(self, idx: int) -> str:
+        """Return the string ID at index ``idx``."""
         return self.ids[idx]

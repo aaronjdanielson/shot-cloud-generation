@@ -1,12 +1,11 @@
 """Timing/count models for the marked point process.
 
-Defines a structural protocol :class:`TimingModel` and a v1 stub
-:class:`ConstantRateTimingModel`.
+Deprecated; retained for :class:`~shotcloud.legacy_pivot.marked_process.ShotCloudProcess`.
+Superseded by :class:`~shotcloud.models.NegBinCountHead` and
+:class:`~shotcloud.models.TimingSoftmaxHead`.
 
-The role-aware timing model from ``role_aware_marked_point_process_for_shot_clouds.md``
-§2 will be implemented as a separate concrete class consuming the same
-protocol; the stub here is sufficient to wire the marked-point-process
-scaffolding end-to-end.
+Defines a structural protocol :class:`TimingModel` and a constant-rate
+implementation, :class:`ConstantRateTimingModel`.
 """
 
 from __future__ import annotations
@@ -45,10 +44,10 @@ class TimingModel(Protocol):
 
 @dataclass
 class ConstantRateTimingModel:
-    """Stub timing model: ``K ~ Poisson(mean_shots)``, ``τ_i iid Uniform[0, T]``.
+    """Constant-rate timing model: ``K ~ Poisson(mean_shots)``, ``τ_i iid Uniform[0, T]``.
 
-    Used to wire :class:`~shotcloud.models.ShotCloudProcess` end-to-end
-    before the role-aware timing model is built. Ignores ``context``.
+    Ignores ``context``; a minimal timing model for
+    :class:`~shotcloud.legacy_pivot.marked_process.ShotCloudProcess`.
 
     Parameters
     ----------

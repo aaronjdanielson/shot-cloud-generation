@@ -1,1 +1,1 @@
-"""Shared utilities: geometry, grid helpers, RNG, IO."""
+"""Shared utilities (global seeding and determinism)."""

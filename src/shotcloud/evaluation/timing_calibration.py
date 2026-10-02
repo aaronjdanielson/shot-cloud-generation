@@ -1,10 +1,9 @@
-"""Timing-head calibration + baseline-comparison diagnostics (paper §5.2 timing).
+"""Calibration and baseline comparison for the timing head.
 
-Phase 3 of the 2026-06-07 audit. The timing factor is a 48-bin
-categorical over per-shot game minute. We evaluate the trained
-:class:`TimingSoftmaxHead` against three histogram baselines so the
-paper can either validate timing as an empirical factor or demote it
-with evidence:
+The timing factor is a 48-bin categorical over the game minute of each
+shot. :func:`compute_timing_calibration` evaluates a trained
+:class:`~shotcloud.models.timing_head.TimingSoftmaxHead` against three
+histogram baselines:
 
 * **global** — single 48-bin distribution fit to all training shots.
 * **starter / bench** — two histograms, indexed by the starter slot of
@@ -12,16 +11,14 @@ with evidence:
 * **minutes-conditioned** — four histograms, indexed by quartile of
   the per-shot minutes-zscored slot of ``x_n_raw``.
 
-All three are built on the training set and evaluated on the held-out
-val set (no leakage). Calibration metrics: per-shot NLL (the
-optimization target), 48-bin L1 between the predicted aggregate and
-the observed val histogram, quarter-aggregated 4-bin L1, and
-predictive p10/p50/p90.
-
-The trained head's NLL is the value to beat. The 48-bin and
-quarter-aggregated L1 metrics characterize *calibration* (whether the
-predicted distribution matches the observed marginal) independently
-of conditional sharpness.
+All three are built on the training set and evaluated on the
+validation set. The reported metrics are per-shot NLL (the training
+objective), the 48-bin L1 distance between the predicted aggregate and
+the observed validation histogram, the quarter-aggregated 4-bin L1, and
+predictive p10/p50/p90. NLL measures conditional sharpness against the
+baselines; the two L1 metrics measure *calibration* (whether the
+predicted distribution matches the observed marginal) independently of
+sharpness.
 """
 
 from __future__ import annotations
@@ -34,24 +31,23 @@ from torch import Tensor
 from shotcloud.models.context_mlp import ContextMLP
 from shotcloud.models.timing_head import TimingSoftmaxHead
 
-#: Per-context slot indices in the raw 27-dim ``x_n_raw`` vector — see
-#: ``CLAUDE.md`` for the canonical layout.
+#: Starter and minutes-z-score slot indices in the raw ``x_n_raw`` vector
+#: (see :data:`shotcloud.data.context.FEATURE_LAYOUT`).
 _STARTER_IDX: int = 6
 _MINUTES_Z_IDX: int = 7
 
 #: Default number of minutes-conditioned quantile buckets.
 _N_MINUTES_BUCKETS: int = 4
 
-#: Default number of timing bins (paper §5: one per game minute).
+#: Default number of timing bins (one per game minute).
 _N_TIMING_BINS: int = 48
 
 
 def _empirical_histogram(tau_bin: Tensor, n_bins: int) -> Tensor:
-    """Build a smoothed empirical histogram from a 1-D bin index
-    tensor. Returns a probability vector of shape ``(n_bins,)``.
-    Adds a small additive count (``+1``) to every bin to keep
-    log-probabilities finite under finite-sample queries; this is
-    standard Laplace smoothing.
+    """Laplace-smoothed histogram of a 1-D bin-index tensor.
+
+    Adds one count to every bin so log-probabilities stay finite. Returns
+    a probability vector of shape ``(n_bins,)``.
     """
     if tau_bin.dim() != 1:
         raise ValueError(f"tau_bin must be (N,); got {tuple(tau_bin.shape)}")
@@ -165,22 +161,52 @@ def compute_timing_calibration(
     n_minutes_buckets: int = _N_MINUTES_BUCKETS,
     device: torch.device | str | None = None,
 ) -> dict[str, Any]:
-    """Calibration + baseline-comparison summary for ``timing_head``.
+    """Calibration and baseline-comparison summary for ``timing_head``.
 
-    Returns a JSON-serializable dict with timing NLL of the trained
-    head + three baselines, 48-bin L1 between predicted aggregate
-    distribution and observed val histogram, quarter-aggregated 4-bin
-    L1, and predictive p10/p50/p90 (averaged across val shots).
+    Parameters
+    ----------
+    timing_head : TimingSoftmaxHead
+        Timing head under evaluation.
+    context_mlp : ContextMLP
+        Context MLP producing the head's input. Both modules are
+        switched to ``.eval()`` for the evaluation and their previous
+        training mode is restored on exit.
+    train_x_n_raw : Tensor of shape (N_train, context_dim)
+        Raw context of the training shots, used to fit the baselines.
+    train_tau_bin : Tensor of shape (N_train,)
+        Timing-bin index of each training shot.
+    val_x_n_raw : Tensor of shape (N_val, context_dim)
+        Raw context of the validation shots.
+    val_tau_bin : Tensor of shape (N_val,)
+        Timing-bin index of each validation shot.
+    n_bins : int, default 48
+        Number of timing bins.
+    n_minutes_buckets : int, default 4
+        Number of quantile buckets for the minutes-conditioned baseline.
+    device : torch.device or str, optional
+        Device for the computation. Defaults to the timing head's
+        current device.
 
-    The verdict the caller wants from this is:
+    Returns
+    -------
+    dict
+        JSON-serializable summary: the per-shot NLL of the trained head
+        and of each baseline, the head's NLL advantage over the global
+        and minutes-conditioned baselines, the 48-bin and
+        quarter-aggregated L1 distances between the predicted aggregate
+        distribution and the observed validation histogram, and the
+        predictive p10/p50/p90 bin indices averaged across validation
+        shots.
 
-    * If trained-head NLL beats all three baselines by a meaningful
-      margin AND its predicted aggregate matches the observed val
-      histogram within tight 48-bin L1 → timing validates as an
-      empirical marked-PP factor.
-    * If trained-head NLL is at or near the minutes-conditioned
-      baseline → timing is a scaffold that adds little beyond a
-      simple lookup; the paper should demote it honestly.
+    Raises
+    ------
+    ValueError
+        If the context tensors are not 2-D with room for the starter and
+        minutes slots, or their context dimensions differ.
+
+    Notes
+    -----
+    The quarter-aggregated L1 assumes ``n_bins == 48``.
     """
     if train_x_n_raw.dim() != 2 or train_x_n_raw.shape[1] < max(_STARTER_IDX, _MINUTES_Z_IDX) + 1:
         raise ValueError(

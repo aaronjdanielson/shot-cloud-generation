@@ -2,18 +2,17 @@
 
 Derives ``"big"`` / ``"wing"`` / ``"guard"`` position labels for each
 player from their **restricted-area shot rate** — the fraction of their
-shots taken within 4 ft of the basket. Adapted from
-[shot_flow/scripts/precompute_kde_maps.py](/Users/aarondanielson/Dropbox/shot_flow/scripts/precompute_kde_maps.py)
-where this approach was validated against the full neural ablation.
+shots taken within 4 ft of the basket. The method and its default
+thresholds follow the companion shot_flow project
+(``scripts/precompute_kde_maps.py``).
 
-**Why this over a roster CSV.** Self-contained, reproducible from the
-shot data alone, no external API dependency or staleness. NBA position
-labels are themselves squishy — a 2025 wing might play "big" minutes
-when small lineups are deployed. RA rate measures actual shot behavior,
-which is exactly what the model's position-group KDE prior wants to
-capture.
+Inferring groups from shot data, rather than from a roster table, keeps
+the labels reproducible from the shot data alone with no external
+dependency. Listed NBA positions are also imprecise (a nominal wing may
+play as a big in small lineups), whereas the RA rate measures the
+shooting behavior that position-level pooling is meant to capture.
 
-Default thresholds match shot_flow:
+Default thresholds:
 
 ==========  ===============  ============================
 Group       RA rate          Typical NBA positions
@@ -35,12 +34,18 @@ from typing import Final
 import numpy as np
 import pandas as pd
 
+#: Minimum RA rate for the ``"big"`` group.
 DEFAULT_BIG_THRESHOLD: Final[float] = 0.35
+#: Minimum RA rate for the ``"wing"`` group.
 DEFAULT_WING_THRESHOLD: Final[float] = 0.20
+#: Label assigned to players with too few shots.
 DEFAULT_FALLBACK: Final[str] = "wing"
+#: Minimum number of shots for an RA-rate-based label.
 DEFAULT_MIN_SHOTS: Final[int] = 10
+#: Restricted-area radius in feet.
 RA_RADIUS_FT: Final[float] = 4.0
 
+#: Position-group labels.
 POSITION_GROUPS: Final[tuple[str, ...]] = ("big", "wing", "guard")
 
 
@@ -53,10 +58,14 @@ def ra_rate_per_player(
 ) -> pd.Series:
     """Compute each player's restricted-area rate (fraction of shots within 4 ft).
 
-    Returns a Series indexed by ``player_id``. Inputs missing ``x``, ``y``
-    are skipped. A player with no in-data shots simply doesn't appear in
-    the output — callers that want to handle missing players use
-    :func:`derive_positions_from_ra_rate` instead.
+    Returns a Series named ``"ra_rate"`` indexed by player ID. Rows
+    with missing coordinates are skipped, so a player with no located
+    shots does not appear in the output.
+
+    Raises
+    ------
+    KeyError
+        If any of the coordinate or player columns is missing.
     """
     for col in (x_col, y_col, player_col):
         if col not in shots_df.columns:
@@ -113,9 +122,9 @@ def derive_positions_from_ra_rate(
 ) -> dict[Hashable, str]:
     """Return ``{player_id: position_group}`` derived from RA rate.
 
-    Players with fewer than ``min_shots`` shots get the ``fallback`` label
-    (default ``"wing"``, the league-average bucket). Player IDs are
-    preserved with their original type (``int``, ``str``, etc.).
+    Players with fewer than ``min_shots`` located shots get the
+    ``fallback`` label (default ``"wing"``, the league-average bucket).
+    Player IDs keep their original type (``int``, ``str``, etc.).
     """
     if min_shots < 1:
         raise ValueError(f"min_shots must be ≥ 1; got {min_shots}")

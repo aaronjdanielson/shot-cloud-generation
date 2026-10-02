@@ -1,12 +1,14 @@
-"""Phase 4 — regularizers for the context-adaptive KDE relevance weights.
+"""Regularizers for the context-adaptive KDE relevance weights.
+
+Deprecated; retained for :func:`~shotcloud.legacy_pivot.trainer.train_decoder`.
 
 Three loss-augmenting terms, all functions of the per-shot relevance
 softmax ``π_φ,j(x_n)`` produced by
-:class:`~shotcloud.models.RelevanceScore`. Each is a pure function with
+:class:`~shotcloud.models.relevance.RelevanceScore`. Each is a pure function with
 no learnable state; the trainer applies ``λ * R(π, ...)`` and adds the
 result to the spatial NLL.
 
-Default scaling factors (locked in :doc:`docs/research_plan.md` §7):
+Default scaling factors:
 
 ==================  ===========  ===============================
 term                default ``λ`` purpose

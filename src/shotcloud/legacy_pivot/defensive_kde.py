@@ -1,5 +1,9 @@
 """Per-opponent KDE of shots **allowed** by each defense.
 
+Deprecated; retained to reproduce the static defensive-KDE ablation.
+Superseded by the zone-level opponent reweighting in
+:mod:`shotcloud.models.zone_defense_reweighting`.
+
 A team's defensive density ``q̂_def(c | opp)`` is fit on the spatial
 distribution of shots taken *against* that team — i.e., the locations
 the defense permits attempts. This is a different signal from any
@@ -11,7 +15,7 @@ offensive prior:
   given how they cover the floor.
 
 The two are orthogonal in our model. They compose multiplicatively
-inside the softmax via the Phase-2 scalar ``α_def``:
+inside the softmax via the scalar weight ``α_def``:
 
 .. math::
 
@@ -64,10 +68,9 @@ class DefensiveKDE:
     Python strings, ``np.str_``, or any hashable type.
 
     The class deliberately does **not** include shrinkage to a "league
-    defense" prior in v1: with 30 teams in the NBA each accumulating
+    defense" prior: with 30 teams in the NBA each accumulating
     thousands of shots-allowed per season, the per-opponent fits are
     not data-starved the way the per-player offensive fits are.
-    Adding hierarchical shrinkage is a Phase 3+ option.
     """
 
     grid: CourtGrid

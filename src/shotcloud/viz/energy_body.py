@@ -14,8 +14,6 @@ Public API
     Smoothed 2D density grid (used by other viz modules too).
 :func:`render_energy_body`
     Top-level renderer; writes a PNG and returns its path.
-
-Adapted from ``plotting_instructions/shot_cloud_energy_body_final.py``.
 """
 
 from __future__ import annotations
@@ -35,10 +33,10 @@ from shotcloud.grids import CourtGrid
 
 
 def _default_render_grid() -> CourtGrid:
-    """Canonical render-resolution grid (100x104 over the full half-court).
+    """Render-resolution grid (100 x 104 cells over the half-court).
 
-    Higher resolution than the model grid (typically 64x56) because the
-    renderer wants smooth surfaces; the model wants a tractable softmax.
+    Finer than the default model grid (64 x 56) so rendered surfaces
+    are smooth.
     """
     return CourtGrid(xlim=(-25.0, 25.0), ylim=(-5.0, 47.0), nx=100, ny=104)
 
@@ -47,9 +45,12 @@ def _default_render_grid() -> CourtGrid:
 class EnergyBodyConfig:
     """Rendering parameters for :func:`render_energy_body`.
 
-    The ``grid`` field carries the spatial discretization (extent + resolution).
-    Other fields control the volumetric rendering style. Defaults reproduce
-    the canonical hero figure.
+    The ``grid`` field carries the spatial discretization (extent and
+    resolution); ``density_smoothing`` (Gaussian blur width in grid cells)
+    and ``density_power`` (exponent mapping density to surface height)
+    control the density estimate; the remaining fields control particle
+    counts, camera angle, figure size, colors, and the random seed.
+    Defaults reproduce the paper's hero figure.
     """
 
     grid: CourtGrid = field(default_factory=_default_render_grid)

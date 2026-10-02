@@ -1,10 +1,11 @@
-r"""Mode-routed AC-KDE spatial decoder (Phase 3, 2026-06-09).
+r"""Mode-routed AC-KDE spatial decoder.
 
-Implements the architecture spec from the 2026-06-09 user-locked
-design note: replace the single global support softmax with a query-
-side mode router :math:`\pi_k(x_n)` plus K within-mode softmaxes
-:math:`\omega_{m|k}`, where the modes are the eight fixed NBA
-basketball zones. The forward density is
+:class:`ModeRoutedContinuousMixtureSpatial` replaces the single global
+support softmax of
+:class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial`
+with a query-side mode router :math:`\pi_k(x_n)` and ``K`` within-mode
+softmaxes :math:`\omega_{m|k}`, where the modes are the eight fixed court
+zones. The density is
 
 .. math::
     f(y \mid x_n, h_n, S_{p,t})
@@ -12,31 +13,28 @@ basketball zones. The forward density is
           \sum_{m: z(s_m)=k} \omega_{m|k}(x_n)
             \cdot K(y; s_m, \sigma).
 
-This is structurally different from the additive Graphormer-style
-bias :class:`shotcloud.models.continuous_mixture_spatial.CausalZoneBias`
-— rim shots no longer compete directly with corner-3s inside the
-same softmax normalizer. Motivated by the 2026-06-09
-support/retrieval audit (see ``docs/log.md``), which showed strong
-positive correlations between cloud error and support composition
-descriptors (`support_zone_entropy`, `support_three_rate`,
-`support_corner_rate`) but weak correlations with support volume —
-the signal of mixed-regime support, not insufficient support.
+Unlike the additive zone-pair bias
+:class:`~shotcloud.models.continuous_mixture_spatial.CausalZoneBias`,
+routing stops support shots in different zones (for example rim shots
+and corner threes) from competing for mass inside one softmax
+normalizer, which targets support sets that mix several shooting
+regimes. It is an alternative to the single-softmax decoder, evaluated
+as an ablation.
 
-Locked leakage rule (carried from the 2026-06-09 invalid α1 run)
-----------------------------------------------------------------
-*No attention logit, gate, residual, or kernel modifier may depend
-on* :math:`y_n` *except through the normalized density evaluation
-itself.* The mode router consumes ``x_n`` only; the within-mode
-attention uses logits derived from ``x_n`` + ``support_xy``.
-Enforced structurally by
-:func:`test_mode_router_invariant_to_observed_shot`.
+Causality
+---------
+No attention logit, gate, residual, or kernel modifier depends on the
+observed location :math:`y_n` except through the normalized density
+evaluation itself. The mode router consumes ``x_n`` only, and the
+within-mode attention uses the same support logits as the parent
+decoder, none of which read ``shot_xy``.
 
-Empty-mode policy (locked option (a))
--------------------------------------
+Empty modes
+-----------
 For each row, modes with no causal support are masked out and the
-router probability is renormalized over available modes only. No
-uniform-floor tail, no implicit cold-start density per mode. Cold-
-start (no support at all) hits the inherited CMS cold-start floor.
+router probability is renormalized over the available modes; there is
+no per-mode uniform floor. Rows with no support at all receive the
+parent decoder's cold-start log-likelihood floor.
 """
 
 from __future__ import annotations
@@ -87,18 +85,20 @@ class ModeRouter(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, N_ZONES),
         )
-        # Zero-init the final layer so π_k starts uniform at step 0.
-        # This isn't a bit-identical-to-O1 invariant (the structural
-        # normalization is different), but it gives the router a
-        # neutral starting point so the first gradients are clean.
+        # Zero-init the final layer so π_k starts uniform. The decoder still
+        # differs from the single-softmax decoder at initialization (the
+        # normalization is structurally different), but the router starts
+        # from a neutral point.
         final_layer = self.head[-1]
         assert isinstance(final_layer, nn.Linear)
         nn.init.zeros_(final_layer.weight)
         nn.init.zeros_(final_layer.bias)
 
     def forward(self, x_n: Tensor) -> Tensor:
-        """Return raw mode logits ``(B, N_ZONES)``. The caller is
-        responsible for the per-row availability masking and softmax."""
+        """Return raw mode logits of shape ``(B, N_ZONES)``.
+
+        The caller applies the per-row availability mask and softmax.
+        """
         logits: Tensor = self.head(x_n)
         return logits
 
@@ -106,29 +106,38 @@ class ModeRouter(nn.Module):
 class ModeRoutedContinuousMixtureSpatial(ContinuousMixtureSpatial):
     r"""Mode-routed continuous-mixture spatial decoder.
 
-    Inherits all of :class:`ContinuousMixtureSpatial`'s submodule
-    wiring (offensive prior, defense, residual, bandwidth, kernel,
-    count head, etc.) and overrides forward to apply mode routing
-    instead of the single-softmax / pooling-gate back end.
+    Accepts the constructor arguments of
+    :class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial`
+    (offensive prior, defense, residual, bandwidth, kernel, count head,
+    ...) plus a required keyword ``mode_router`` (:class:`ModeRouter`),
+    and overrides ``forward`` to apply mode routing instead of the
+    single-softmax / pooling-gate back end.
 
-    Differences from CMS in the forward path
-    ----------------------------------------
-    * **No pooling gate.** Own and pooled support are combined into
-      one set and partitioned by ``z(s_m)``. The 2026-06-09 design
-      lock picked option (iii) — one global density, mode routing
-      over combined support — to keep the first ablation clean.
-      Wiring a ``pooling_gate`` is rejected at construction time.
-    * **No causal_zone_bias.** Mode routing supersedes the additive
-      Graphormer-style bias; allowing both would duplicate signal.
-      Also rejected at construction time.
-    * **Per-mode within-subset softmax** replaces the global subset
-      softmax: ``ω_{m|k} = softmax_{m : z(s_m)=k}(logits_m)``.
-    * **Mode router** ``π_k(x_n)`` is renormalized over available
-      modes (option (a), 2026-06-09 lock).
+    Differences from the parent forward pass:
+
+    * **No pooling gate.** Own and pooled support are combined into one
+      set and partitioned by ``z(s_m)``, giving a single density with
+      mode routing over the combined support. Passing ``pooling_gate``
+      raises ``ValueError``.
+    * **No causal zone bias.** Mode routing supersedes the additive
+      zone-pair bias, and using both would duplicate the signal.
+      Passing ``causal_zone_bias`` raises ``ValueError``.
+    * **Per-mode subset softmax** replaces the global subset softmax:
+      ``ω_{m|k} = softmax_{m : z(s_m)=k}(logits_m)``.
+    * **Mode router** ``π_k(x_n)`` is renormalized over the modes that
+      have support in the row.
+
+    Raises
+    ------
+    ValueError
+        If ``pooling_gate`` or ``causal_zone_bias`` is given, or
+        ``mode_router`` is missing.
+    TypeError
+        If ``mode_router`` is not a :class:`ModeRouter`.
     """
 
     def __init__(self, *args: object, **kwargs: object) -> None:
-        # Reject knobs that are explicitly OFF for mode-routed v1.
+        # Reject components that mode routing replaces.
         if kwargs.get("pooling_gate") is not None:
             raise ValueError(
                 "ModeRoutedContinuousMixtureSpatial does not use a pooling gate; "
@@ -168,10 +177,10 @@ class ModeRoutedContinuousMixtureSpatial(ContinuousMixtureSpatial):
     ) -> ContinuousMixtureOutputs:
         r"""Per-row mode-routed log-density at ``shot_xy``.
 
-        Forward path
+        Parameters are as in the parent ``forward``. The computation is:
 
         1. Assemble support logits ``E_m`` from the same components as
-           the parent CMS forward (defense + matchup + residual).
+           the parent forward (defense, matchup, residual).
         2. Compute the mode router :math:`\pi_k(x_n)`, then mask out
            modes with no causal support and renormalize.
         3. For each mode :math:`k`, compute within-mode attention
@@ -192,7 +201,7 @@ class ModeRoutedContinuousMixtureSpatial(ContinuousMixtureSpatial):
             attention :math:`\pi_{z(s_m)} \omega_{m | z(s_m)}` for
             sampling-side compatibility.
         """
-        # ---- 1. Assemble support logits — same as CMS. ----
+        # ---- 1. Assemble support logits, as in the parent. ----
         collab = self.offensive_prior.forward_continuous(player_idx, snapshot_idx, x_n_raw, x_n)
         logits = collab.support_logits  # (B, M)
         support_xy = collab.support_xy
@@ -362,9 +371,9 @@ class ModeRoutedContinuousMixtureSpatial(ContinuousMixtureSpatial):
                 masked_logits_k = masked_logits_k.clone()
                 masked_logits_k[row_empty_k, 0] = 0.0  # avoid -inf - -inf = nan
             log_w_k = masked_logits_k - torch.logsumexp(masked_logits_k, dim=-1, keepdim=True)
-            # Per-mode log-density. For empty rows the mask passes nothing
-            # so continuous_mixture_loglik returns garbage; we manually
-            # set log_f_k_b to -inf so logsumexp_k drops the contribution.
+            # Per-mode log-density. Rows where mode k is empty produce a
+            # meaningless value here; it is replaced by -inf below so
+            # logsumexp_k drops the contribution.
             if log_kernel_eff is not None:
                 log_f_k_b = continuous_mixture_loglik(
                     log_w_k,
@@ -395,7 +404,7 @@ class ModeRoutedContinuousMixtureSpatial(ContinuousMixtureSpatial):
         # ---- 5. Mode-weighted log-density. ----
         log_lik = torch.logsumexp(mode_log_pi + log_f_k, dim=-1)  # (B,)
 
-        # Cold-start floor — same as parent CMS.
+        # Cold-start floor, as in the parent.
         if cold_start.any():
             log_lik = torch.where(
                 cold_start,
@@ -404,18 +413,14 @@ class ModeRoutedContinuousMixtureSpatial(ContinuousMixtureSpatial):
             )
 
         # ---- 6. Build outputs. ----
-        # support_log_weights: marginal attention for sampling compat.
+        # support_log_weights: marginal attention, used by the samplers.
         # w_m = π_{z(s_m)} · ω_{m | z(s_m)}; for support shots in mode k,
         # log w_m = log π_k + log ω_{m|k}.
-        # Compute by gathering log_pi[z_s] and the corresponding log_w_k.
         z_s_clamp = z_s.clamp_min(0).long()
         # log π for each support shot's mode.
         log_pi_per_m = mode_log_pi.gather(1, z_s_clamp)  # (B, M)
-        # log ω for each support shot — gather from the per-mode log_w_k
-        # arrays. Easiest: re-do the subset softmax with masked_fill and
-        # gather using mode_k indexing. Already computed above per k;
-        # rebuild as a (B, M, K) tensor then gather. To avoid the loop,
-        # use mode_member to mask once per k.
+        # log ω for each support shot: rebuild the per-mode subset softmaxes
+        # as a (B, M, K) stack and gather each shot's own-mode entry.
         log_w_per_k = []
         for k in range(N_ZONES):
             mode_k_mask = mode_member[..., k]

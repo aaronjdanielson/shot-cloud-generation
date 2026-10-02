@@ -1,15 +1,11 @@
-"""Count-head calibration diagnostics (paper §5.2).
+"""Calibration diagnostics for the negative-binomial count head.
 
-The 2026-06-07 audit established that the joint-trained count head
-under the old per-shot-amortized loss collapsed to ``μ ≈ 1.1`` against
-``K̄_train ≈ 9.57``. This module provides a single function that
-summarizes the count head's calibration on a per-game test set, used
-both by :mod:`scripts.train_count_head` (final pretrain diagnostic)
-and by :mod:`scripts.train_gibbs` (joint-training-final-epoch
-diagnostic).
-
-The returned dict is JSON-serializable and intended for ``manifest /
-diagnostics`` artifacts; printable summary is left to the caller.
+:func:`compute_count_calibration` summarizes how well a
+:class:`~shotcloud.models.count_head.NegBinCountHead` predicts per-game
+shot counts on a held-out set: mean ratio, point-prediction error,
+negative-binomial NLL, an OLS calibration line, and Monte Carlo
+predictive quantiles. The returned dict is JSON-serializable, for
+inclusion in run manifests and diagnostics files.
 """
 
 from __future__ import annotations
@@ -35,34 +31,52 @@ def compute_count_calibration(
 ) -> dict[str, Any]:
     """Calibration summary for ``count_head`` on a per-game eval set.
 
+    The context MLP maps the raw context to ``x_n``, which the count
+    head maps to ``(μ, κ)``.
+
     Parameters
     ----------
-    count_head, context_mlp : the modules under evaluation. Both are
-        switched to ``.eval()`` inside this function and restored on
-        exit.
-    per_game_x_raw : (n_games, CONTEXT_DIM) raw per-game context.
-    per_game_k : (n_games,) integer observed counts.
-    n_quantile_samples : Monte Carlo sample size for the predictive
-        p10/p50/p90 (NegBin has no closed-form icdf).
-    device : where to run the forward pass. Defaults to the count
-        head's current device.
+    count_head : NegBinCountHead
+        Count head under evaluation.
+    context_mlp : ContextMLP
+        Context MLP producing the head's input. Both modules are
+        switched to ``.eval()`` for the evaluation and their previous
+        training mode is restored on exit.
+    per_game_x_raw : Tensor of shape (n_games, CONTEXT_DIM)
+        Raw per-game context vectors.
+    per_game_k : Tensor of shape (n_games,)
+        Observed integer shot counts.
+    n_quantile_samples : int, default 512
+        Monte Carlo sample size for the predictive p10/p50/p90 (the
+        negative binomial has no closed-form inverse CDF).
+    device : torch.device or str, optional
+        Device for the forward pass. Defaults to the count head's
+        current device.
 
     Returns
     -------
-    dict with keys:
+    dict
+        With keys:
 
-    * ``n_games``: number of evaluated games.
-    * ``mean_K_obs`` / ``mean_mu``: scalar means.
-    * ``ratio_mu_over_K``: ``mean_mu / mean_K_obs``. ``≈ 1`` is
-      calibrated; ``< 0.2`` is the pre-audit failure mode.
-    * ``MAE`` / ``RMSE``: per-game prediction error of ``μ`` against
-      ``K_obs``.
-    * ``nll_per_game``: mean NegBin NLL on the eval set.
-    * ``calibration_slope`` / ``calibration_intercept``: OLS fit
-      ``K_obs ~ a + b·μ``. ``b ≈ 1, a ≈ 0`` is calibrated.
-    * ``kappa`` / ``log_kappa``: scalar dispersion parameter.
-    * ``p10_p50_p90_predicted_mean``: predictive quantile means
-      across games (Monte Carlo).
+        * ``n_games``: number of evaluated games.
+        * ``mean_K_obs`` / ``mean_mu``: scalar means.
+        * ``ratio_mu_over_K``: ``mean_mu / mean_K_obs``; ``≈ 1`` for a
+          calibrated head.
+        * ``MAE`` / ``RMSE``: per-game prediction error of ``μ`` against
+          ``K_obs``.
+        * ``nll_per_game``: mean NegBin NLL on the eval set.
+        * ``calibration_slope`` / ``calibration_intercept``: OLS fit
+          ``K_obs ~ a + b·μ``; ``b ≈ 1, a ≈ 0`` for a calibrated head.
+        * ``log_kappa``: the raw dispersion parameter; ``kappa``: the
+          dispersion ``κ = softplus(log_kappa)``.
+        * ``p10_p50_p90_predicted_mean``: predictive quantiles averaged
+          across games (Monte Carlo).
+
+    Raises
+    ------
+    ValueError
+        If ``per_game_x_raw`` is not 2-D or ``per_game_k`` is not a 1-D
+        tensor with one entry per game.
     """
     if per_game_x_raw.dim() != 2:
         raise ValueError(
@@ -94,10 +108,9 @@ def compute_count_calibration(
             mu, kappa = count_head(x_n)
             log_p = count_head.log_prob(k, x_n)
             # ``NegativeBinomial.sample()`` routes through Gamma, whose
-            # ``aten::_standard_gamma`` op is not implemented on MPS as of
-            # PyTorch 2.4 (https://github.com/pytorch/pytorch/issues/141287).
-            # Move μ, κ to CPU for the sampling step; the forward NLL
-            # stays on the original device.
+            # ``aten::_standard_gamma`` op is not implemented on MPS
+            # (https://github.com/pytorch/pytorch/issues/141287). Sample
+            # on CPU; the forward NLL stays on the original device.
             mu_cpu = mu.detach().cpu()
             kappa_cpu = kappa.detach().cpu()
             nb_cpu = torch.distributions.NegativeBinomial(

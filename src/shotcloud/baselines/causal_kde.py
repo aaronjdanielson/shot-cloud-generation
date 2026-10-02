@@ -1,24 +1,22 @@
-"""Causal grid KDE baseline (paper §5.2 / Figure~4).
+"""Causal grid KDE baseline.
 
-Wraps :class:`~shotcloud.kde.HierarchicalKDE` with a thin, evaluation-only
-interface so the baseline can be scored against the same metric pipeline
-as the AC-KDE checkpoint:
+Wraps :class:`~shotcloud.kde.HierarchicalKDE` in an evaluation-only
+interface, so the baseline can be scored with the same metric pipeline as
+the AC-KDE:
 
-* :meth:`fit` filters shots to ``date <= train_end_date`` (causal by
-  construction for any val game whose ``game_date`` is strictly after)
-  and fits the underlying player + position + league grids.
-* :meth:`density_at_xy` evaluates the per-player hierarchically-shrunk
-  density at a set of query coordinates by table lookup on the court
-  grid (with bilinear interpolation between cell centers for smoother
-  density-surface scoring at coarse smoothing scales).
-* :meth:`sample_cloud` produces a synthetic shot cloud of size ``K``
-  by drawing cells from the density and uniform coordinates within the
+* :meth:`CausalGridKDEBaseline.fit` keeps shots with
+  ``date <= train_end_date`` (causal for any evaluation game strictly
+  after the cutoff) and fits the player, position and league grids.
+* :meth:`CausalGridKDEBaseline.density_at_xy` evaluates the player's
+  shrunk density at query coordinates, by bilinear interpolation between
+  cell centers or by nearest-cell lookup.
+* :meth:`CausalGridKDEBaseline.sample_cloud` draws a synthetic shot cloud
+  by sampling cells from the density and uniform coordinates within each
   chosen cell.
 
-The baseline is intentionally minimal: a per-player KDE with shrinkage
-to the position prior, no within-game context, no defense, no residual.
-That is the point --- it is the simple non-neural reference the AC-KDE
-needs to beat to claim improvement.
+The baseline is deliberately minimal: a per-player KDE with shrinkage to
+the position density, and no game context, within-game history, opponent
+reweighting or learned residual.
 """
 
 from __future__ import annotations
@@ -43,19 +41,19 @@ class CausalGridKDEBaseline:
     grid : CourtGrid
         Court discretization for the underlying KDE.
     bandwidth : float, default 1.5
-        Gaussian bandwidth in feet, matching the AC-KDE mainline default.
+        Gaussian bandwidth in feet, equal to the AC-KDE's initial
+        bandwidth.
     kappa : float, default 500.0
-        Shrinkage strength toward the position prior. Players with
+        Shrinkage strength toward the position density. Players with
         ``N_p`` effective shots get density
         ``α q_p + (1-α) q_position`` with ``α = N_p / (N_p + κ)``.
-    recency_half_life_days : float | None, default None
-        Optional exponential recency weighting on training shots.
+    recency_half_life_days : float or None, default None
+        Optional exponential recency weighting of training shots,
+        relative to the cutoff date.
     fallback_to_position : bool, default True
-        For player-games whose player_id is unknown at fit time
-        (cold-start), substitute the position density when an inferred
-        position is supplied at query time; otherwise the league
-        density. Off-grid queries always evaluate to the
-        league-density floor.
+        For players unseen at fit time, use the position density when a
+        ``position_hint`` is supplied at query time; otherwise (or when
+        the position is unknown) use the league density.
     """
 
     grid: CourtGrid
@@ -81,7 +79,8 @@ class CausalGridKDEBaseline:
         """Fit on shots with ``date <= train_end_date``.
 
         ``shots_df`` is the standard loader output and must carry
-        ``date``, ``x``, ``y``, ``player_id``, and ``position_group``.
+        ``date``, ``x``, ``y``, ``player_id`` and ``position_group``; rows
+        without a position are dropped. Returns ``self``.
         """
         required = ("date", "x", "y", "player_id", "position_group")
         for col in required:
@@ -131,10 +130,25 @@ class CausalGridKDEBaseline:
     ) -> NDArray[np.float64]:
         """Predicted density at query coordinates ``xy`` of shape ``(N, 2)``.
 
+        Parameters
+        ----------
+        player_id : object
+            Player whose density is evaluated.
+        xy : NDArray of shape ``(N, 2)``
+            Query coordinates in feet.
+        position_hint : object, optional
+            Position used for players unseen at fit time.
+        bilinear : bool, default True
+            Interpolate bilinearly between cell centers; otherwise use the
+            value of the containing cell.
+
         Returns
         -------
-        NDArray of shape ``(N,)`` --- density (probability per ft²) at each
-        query point. Off-grid queries get the league-density-at-floor value.
+        NDArray of shape ``(N,)``
+            Density (probability per ft²) at each query point. Queries
+            outside the interpolation range receive a floor: the minimum
+            of the player's density with ``bilinear=True``, the minimum of
+            the league density otherwise.
         """
         density_grid = self._player_density_grid(player_id, position_hint)
         density = density_grid / self.cell_area  # mass-per-cell → density per ft²
@@ -162,9 +176,10 @@ class CausalGridKDEBaseline:
     ) -> NDArray[np.float64]:
         """Draw ``n_shots`` synthetic locations from the player's density.
 
-        The sampler does a categorical draw over cells weighted by the
-        density-grid mass, then samples a uniform coordinate inside the
-        chosen cell. Shape: ``(n_shots, 2)``.
+        Cells are drawn with probability proportional to their mass, then
+        a uniform coordinate is drawn inside each chosen cell. Returns an
+        array of shape ``(n_shots, 2)`` in feet (empty when
+        ``n_shots <= 0``).
         """
         if n_shots <= 0:
             return np.zeros((0, 2), dtype=np.float64)
@@ -189,8 +204,8 @@ def _bilinear_density(
 ) -> NDArray[np.float64]:
     """Bilinear interpolation of a density grid at query coords.
 
-    Off-grid points fall back to the density floor (the per-cell minimum
-    so a query outside the court does not blow up a log-likelihood).
+    Points outside the range of cell centers receive the minimum of
+    ``density``, so a query off the court keeps a finite log-likelihood.
     """
     xc = grid.xcenters
     yc = grid.ycenters

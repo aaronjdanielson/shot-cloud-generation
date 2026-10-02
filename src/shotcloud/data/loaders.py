@@ -96,8 +96,8 @@ def _nba_stats_to_canonical(df: pd.DataFrame) -> pd.DataFrame:
     if "y" in df.columns:
         df["y"] = pd.to_numeric(df["y"], errors="coerce").astype(np.float64) / 10.0
 
-    # Parse date — NBA exports it either as "YYYYMMDD" int (legacy uppercase
-    # column) or as an ISO-ish string. Defensive parser handles both.
+    # Parse date: NBA exports carry it either as a packed YYYYMMDD integer
+    # (uppercase GAME_DATE column) or as an ISO-like string.
     if "date" in df.columns:
         if pd.api.types.is_integer_dtype(df["date"]):
             df["date"] = pd.to_datetime(df["date"].astype(str), format="%Y%m%d", errors="coerce")
@@ -160,14 +160,12 @@ def _attach_opponent(df: pd.DataFrame) -> pd.DataFrame:
 
     For each game, the two participating teams' identifiers are
     aggregated; each shot's opponent is the *other* team's identifier
-    in that game. Mirrors the convention from ``shot_flow``'s data
-    pipeline (``opponent_team_id``).
+    in that game.
 
     No-op if ``opponent`` is already present, or if either ``game_id``
     or ``team`` is missing. Games with only one team's shots in the
     table — typical at the head of a truncated read where games span
-    the truncation boundary — get ``opponent = NA`` (those shots are
-    not useful for Phase-2 defensive density anyway).
+    the truncation boundary — get ``opponent = NA``.
 
     Preserves the dtype of ``team``: integer-valued teams produce a
     pandas nullable ``Int64`` opponent column.
@@ -269,7 +267,7 @@ def load_shots(
 
     if actual == "nba_stats":
         df = _nba_stats_to_canonical(df)
-    # canonical format passes through; we still parse types defensively.
+    # Canonical tables pass through without renaming or type coercion.
 
     # Make sure required columns now exist.
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]

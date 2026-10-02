@@ -1,9 +1,10 @@
-"""Causal player trait builder for the collaborative KDE (Phase 2).
+"""Causal player trait vectors for the collaborative KDE.
 
-Builds the 26-dim per-(player, snapshot) trait vector defined in
-[docs/model_spec.md](../../../docs/model_spec.md), §"Causal player
-traits". The trait vector is consumed by analogue retrieval (Phase 3)
-and by the player-level attention φ_θ (Phase 4).
+Builds a 26-dimensional trait vector per (player, snapshot). Trait
+vectors drive analogue retrieval (:mod:`shotcloud.models.analogue_retrieval`)
+and the shooter-similarity term of the collaborative KDE. Every
+play-derived slot at snapshot ``m`` uses only games and shots strictly
+before that snapshot's anchor date.
 
 Trait vector layout — exactly 26 dims (see :data:`SLOT_NAMES`):
 
@@ -39,15 +40,17 @@ Missingness indicator:
    25  m_play                (1 if player had any FGA before anchor)
 ```
 
-Block A is z-scored *per snapshot* so similarity is "tall/heavy/old
-for this era" rather than absolute. NaN biographical values are
-imputed to the post-z-score mean (zero) so cold-start players sit at
-the league-average coordinate when biometric data is missing.
+Block A's continuous slots are z-scored across all players in the
+vocabulary at each snapshot, with age evaluated at the snapshot's
+anchor date (height and weight are static, so their z-scores are the
+same at every snapshot). Missing biographical values are imputed to the
+post-z-score mean (zero), placing such players at the population-average
+coordinate.
 
-Block B is multiplied by ``m_play`` so cold-start players get exact
-zeros across the play-derived block. The model can distinguish
-"missing because cold-start" from "zero because that's the player's
-actual play pattern" via the explicit ``m_play`` slot at index 25.
+Block B is multiplied by ``m_play`` so players with no prior field-goal
+attempts get exact zeros across the play-derived block. The explicit
+``m_play`` slot at index 25 lets a consumer distinguish "no history"
+from "a genuine zero in the player's play pattern".
 """
 
 from __future__ import annotations
@@ -70,8 +73,8 @@ from shotcloud.data.snapshots import ROLE_PROFILE_DIM, SnapshotStore
 #: Total dimension of the per-(player, snapshot) trait vector.
 TRAIT_DIM: Final[int] = 26
 
-#: Symbolic slot names, length matching :data:`TRAIT_DIM`. The trait
-#: builder asserts ``len(SLOT_NAMES) == TRAIT_DIM`` at module import.
+#: Symbolic slot names, one per trait slot; checked against
+#: :data:`TRAIT_DIM` at import.
 SLOT_NAMES: Final[tuple[str, ...]] = (
     "height_z",
     "weight_z",
@@ -100,9 +103,11 @@ assert len(SLOT_NAMES) == TRAIT_DIM, (
     f"SLOT_NAMES has {len(SLOT_NAMES)} entries; expected {TRAIT_DIM}"
 )
 
-# Trait-block index ranges (used in tests and downstream consumers).
-BLOCK_A_END: Final[int] = 8  # slots 0..7 inclusive
-BLOCK_B_END: Final[int] = 25  # slots 8..24 inclusive
+#: End (exclusive) of Block A, the biographical slots 0-7.
+BLOCK_A_END: Final[int] = 8
+#: End (exclusive) of Block B, the play-derived slots 8-24.
+BLOCK_B_END: Final[int] = 25
+#: Index of the ``m_play`` missingness indicator.
 M_PLAY_SLOT: Final[int] = 25
 
 #: Hollinger-style usage coefficient on free-throw attempts.
@@ -111,7 +116,7 @@ _USAGE_FT_WEIGHT: Final[float] = 0.44
 
 @dataclass(frozen=True)
 class PlayerTraitsTable:
-    """(n_players, n_snapshots, 26) causal-trait tensor + metadata.
+    """Causal trait tensor of shape ``(n_players, n_snapshots, TRAIT_DIM)``.
 
     Attributes
     ----------
@@ -119,7 +124,8 @@ class PlayerTraitsTable:
         Causal trait values. Row ``p`` is keyed by ``player_ids[p]``;
         column ``m`` is keyed by ``snapshot_anchors[m]``.
     player_ids : NDArray[int64], shape ``(n_players,)``
-        Player IDs in the same order the AdaptiveKDE / PlayerVocab uses.
+        Player IDs, in the order of the ``vocab_ids`` passed to
+        :func:`build_player_traits_table`.
     snapshot_anchors : NDArray[datetime64[D]], shape ``(n_snapshots,)``
         Snapshot anchor dates in the order of ``SnapshotStore.bundles``.
     """
@@ -130,18 +136,22 @@ class PlayerTraitsTable:
 
     @property
     def n_players(self) -> int:
+        """Number of players (rows)."""
         return int(self.traits.shape[0])
 
     @property
     def n_snapshots(self) -> int:
+        """Number of snapshots (columns)."""
         return int(self.traits.shape[1])
 
     @property
     def trait_dim(self) -> int:
+        """Width of each trait vector."""
         return int(self.traits.shape[2])
 
     @property
     def slot_names(self) -> tuple[str, ...]:
+        """Names of the trait slots (:data:`SLOT_NAMES`)."""
         return SLOT_NAMES
 
 
@@ -162,19 +172,18 @@ def _recency_aggregate_per_snapshot(
 
     Returns a dataframe with columns ``[player_id, M, S, usage_rate]``,
     one row per player with at least one game before ``ref_date``.
-    Players with no games before the anchor are absent (caller handles
-    them via the missingness indicator).
+    Players with no games before the anchor are absent; the caller
+    handles them via the missingness indicator. With recency weights
+    ``w_g = 2^(-(t - date(g)) / half_life_days)`` over games strictly
+    before ``t = ref_date``:
 
-    Definitions (matching docs/model_spec.md):
-
-    * M = Σ_g λ^(t − date(g)) · minutes_g
-    * S = Σ_g λ^(t − date(g)) · FGA_g
+    * M = Σ_g w_g · minutes_g
+    * S = Σ_g w_g · FGA_g
     * usage_rate = Σ_g w_g · (FGA + 0.44·FTA + TOV)_g / Σ_g w_g · minutes_g
     """
-    # Normalize ref_date to pd.Timestamp for arithmetic with the
-    # game_logs game_date column (which may be datetime64 of varying
-    # precision). The subtraction below uses total_seconds/86400 to
-    # avoid pandas' refusal to cast DatetimeArray → datetime64[D].
+    # Work in pd.Timestamp because game_date may be datetime64 of any
+    # precision; day deltas go through total_seconds / 86400 because
+    # pandas will not cast a DatetimeArray to datetime64[D].
     ref_ts = pd.Timestamp(ref_date)
     game_dates = pd.to_datetime(game_logs["game_date"], errors="coerce")
     mask = (game_dates < ref_ts) & game_dates.notna()
@@ -219,13 +228,13 @@ def _z_score_with_nan_imputation(
     """Z-score a 1-D array, imputing NaN to the post-z-score mean (0)."""
     finite_mask = np.isfinite(values)
     if not finite_mask.any():
-        # Pathological: no valid values. Return zeros.
+        # No finite values: every entry is imputed to zero.
         return np.zeros_like(values, dtype=np.float32)
     finite_vals = values[finite_mask]
     mean = float(finite_vals.mean())
     std = float(finite_vals.std())
     if std < 1e-9:
-        # Degenerate: zero variance. Return zeros (the z-score is undefined).
+        # Zero variance: the z-score is undefined, so return zeros.
         return np.zeros_like(values, dtype=np.float32)
     z = (values - mean) / std
     z[~finite_mask] = 0.0  # NaN → post-z-score mean
@@ -240,13 +249,18 @@ def build_player_traits_table(
     *,
     recency_half_life_days: float = 30.0,
 ) -> PlayerTraitsTable:
-    """Build the canonical causal trait table for the collaborative KDE.
+    """Build the causal trait table for the collaborative KDE.
+
+    For each snapshot, Block A is filled from ``bio_df`` and Block B
+    from the snapshot bundle (position mixture, role profile) and from
+    recency-weighted aggregates of ``game_logs_df`` over games strictly
+    before the bundle's anchor date.
 
     Parameters
     ----------
     snapshot_store : SnapshotStore
-        Provides anchor dates + per-snapshot role_profiles and
-        position_mixtures (causal by construction).
+        Provides the anchor dates and the per-snapshot role profiles and
+        position mixtures, each fit on shots before its anchor.
     vocab_ids : sequence of int
         The player IDs the model addresses. Output rows are aligned
         to this order. Players not in ``bio_df`` get NaN bio fields
@@ -260,8 +274,13 @@ def build_player_traits_table(
         tov). Other columns ignored.
     recency_half_life_days : float, default 30.0
         Exponential half-life for recency-weighted aggregates of
-        minutes, FGA, and usage. Matches the existing
-        ``game_logs.py`` default.
+        minutes, FGA, and usage. Matches
+        :data:`shotcloud.data.game_logs.DEFAULT_RECENCY_HALFLIFE_DAYS`.
+
+    Returns
+    -------
+    PlayerTraitsTable
+        Traits of shape ``(len(vocab_ids), n_snapshots, TRAIT_DIM)``.
     """
     player_ids = np.asarray(vocab_ids, dtype=np.int64)
     n_players = len(player_ids)
@@ -315,10 +334,9 @@ def build_player_traits_table(
         traits[:, m_idx, 2] = age_z
         traits[:, m_idx, 3:8] = pos_onehot
 
-        # Block B inputs from the snapshot bundle. The bundle may not
-        # include every player in the vocab — players with no shots
-        # before the anchor are absent. Look up by player_id; default
-        # to zero (the missingness mask zeros these out anyway).
+        # Block B inputs from the snapshot bundle. Players with no shots
+        # before the anchor are absent from the bundle and default to
+        # zero; the missingness mask zeros them out in any case.
         bundle_ids = np.asarray(bundle.player_ids, dtype=np.int64)
         # Vectorized map vocab_id → bundle_idx (or -1 if absent).
         bundle_idx_lookup: dict[int, int] = {int(pid): bi for bi, pid in enumerate(bundle_ids)}
@@ -371,7 +389,7 @@ def build_player_traits_table(
         block_b_raw[:, 8] = log_density
         block_b_raw[:, 9:] = role_full
 
-        # Apply missingness multiplication per spec.
+        # Zero the play-derived block for players without prior FGA.
         traits[:, m_idx, BLOCK_A_END:BLOCK_B_END] = block_b_raw * m_play[:, None]
         traits[:, m_idx, M_PLAY_SLOT] = m_play
 

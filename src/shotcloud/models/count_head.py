@@ -1,4 +1,4 @@
-"""Negative-binomial count head ``p_η^count(K_n | x_n)`` (paper §5).
+"""Negative-binomial count head ``p_η^count(K_n | x_n)``.
 
 Models the per-game shot-attempt count :math:`K_n` as
 
@@ -8,21 +8,21 @@ Models the per-game shot-attempt count :math:`K_n` as
 
 where :math:`\\mu_\\eta(x_n) = \\mathrm{softplus}(g_\\eta(x_n))` is a small
 context-dependent MLP and :math:`\\kappa` is a single global learnable
-dispersion. The negative binomial is the natural choice over a
-Poisson because shot-count data is overdispersed; the parameter
-:math:`\\kappa` controls how much: variance is :math:`\\mu + \\mu^2/\\kappa`
-in this parameterization, recovering Poisson as :math:`\\kappa \\to \\infty`.
+dispersion. The negative binomial is preferred over a Poisson because
+shot counts are overdispersed; :math:`\\kappa` controls how much: the
+variance is :math:`\\mu + \\mu^2/\\kappa`, recovering the Poisson as
+:math:`\\kappa \\to \\infty`.
 
-Internally we convert :math:`(\\mu, \\kappa)` to torch's
+Internally :math:`(\\mu, \\kappa)` is converted to torch's
 ``(total_count, probs)`` parameterization
-(``total_count = κ``, ``probs = μ / (μ + κ)``) and call
-:class:`torch.distributions.NegativeBinomial.log_prob` for a
-numerically-stable gradient-friendly likelihood.
+(``total_count = κ``, ``probs = μ / (μ + κ)``), and the likelihood is
+evaluated with :class:`torch.distributions.NegativeBinomial`.
 
-Module-owned parameters: the MLP weights (one hidden layer,
-``hidden_dim=32`` by default — capacity-limited like the residual
-encoder) and the scalar ``log_kappa``. Forward returns a per-row
-``(μ, κ)`` pair; :meth:`log_prob` returns a per-row log-likelihood.
+The parameters are the MLP weights (one hidden layer, ``hidden_dim=32``
+by default, deliberately small like the residual encoder) and the
+scalar ``log_kappa``, with :math:`\\kappa = \\mathrm{softplus}(\\text{log\\_kappa})`.
+The head consumes only the context vector; it has no player-identity
+input.
 """
 
 from __future__ import annotations
@@ -37,36 +37,28 @@ from shotcloud.data.context import CONTEXT_DIM
 
 
 class NegBinCountHead(nn.Module):
-    """Per-game NegBin count head ``p(K_n | x_n)`` (paper §5).
+    """Per-game negative-binomial count head ``p(K_n | x_n)``.
 
     Parameters
     ----------
     context_dim : int, default :data:`CONTEXT_DIM` (27)
         Input dimension of the learned context vector.
     hidden_dim : int, default 32
-        Hidden width of the ``μ_η`` MLP. Same capacity discipline as
-        :class:`ContextResidualEncoder`.
+        Hidden width of the ``μ_η`` MLP, kept small like
+        :class:`~shotcloud.models.ContextResidualEncoder`.
     init_log_kappa : float, default 0.0
-        Initial value of the learnable ``log_kappa`` parameter.
-        ``softplus(0) ≈ 0.693`` gives a moderately overdispersed
-        starting point; larger values recover Poisson, smaller values
-        produce heavier-tailed counts.
-    init_mean : float | None, default ``None``
-        If set, warm-start ``fc2.bias`` to ``log(exp(init_mean) - 1)``
-        so that at initialization ``μ_η(x_n) ≈ init_mean`` for typical
-        ``x_n``. Mitigates the under-trained-count-head failure mode
-        observed in 20-epoch joint runs where the spatial gradient
-        dominates and ``μ`` stays near ``softplus(0) ≈ 0.69``. Pass
-        the training-set ``K̄`` (≈ 9.6 for the current NBA corpus).
-
-    Forward
-    -------
-    ``forward(x_n) -> (μ, κ)`` — both shape ``(B,)``, both positive.
-    ``κ`` is broadcast to ``(B,)`` from a single learnable scalar.
-
-    log_prob
-    --------
-    ``log_prob(K, x_n) -> (B,)`` differentiable per-row log-likelihood.
+        Initial value of the raw dispersion parameter ``log_kappa``;
+        ``κ = softplus(log_kappa)``, so the default gives
+        ``κ ≈ 0.693``, a strongly overdispersed starting point. Larger
+        values move toward the Poisson.
+    init_mean : float or None, default None
+        If set, initialize ``fc2.bias`` to ``log(exp(init_mean) - 1)``
+        so that ``μ_η(x_n) ≈ init_mean`` at initialization for typical
+        ``x_n``. Without it the initial mean is near
+        ``softplus(0) ≈ 0.69``, far below realistic shot counts, and in
+        joint training the count head can stay under-fitted while the
+        spatial loss dominates. The training-set mean count is the
+        natural value.
     """
 
     def __init__(
@@ -96,19 +88,30 @@ class NegBinCountHead(nn.Module):
         if init_mean is None:
             nn.init.zeros_(self.fc2.bias)
         else:
-            # inv-softplus(y) = log(exp(y) - 1). Use expm1 for stability.
-            # At init `g(x) ≈ fc2.bias` (since fc2.weight is small kaiming
-            # and h is moderate), so μ = softplus(g) ≈ init_mean.
+            # inv-softplus(y) = log(exp(y) - 1), via expm1 for stability.
+            # At init g(x) ≈ fc2.bias (fc2.weight is small and h moderate),
+            # so μ = softplus(g) ≈ init_mean.
             inv_softplus = math.log(math.expm1(init_mean))
             nn.init.constant_(self.fc2.bias, inv_softplus)
 
-        # Global learnable log-dispersion. Shared across rows; the
-        # paper writes κ as a single scalar parameter, not κ(x_n).
-        # TODO(if validation shows it's needed): per-context κ via
-        # a second MLP head.
+        # Global learnable dispersion shared across rows: κ is a single
+        # scalar, not a function of x_n.
         self.log_kappa = nn.Parameter(torch.tensor(init_log_kappa))
 
     def forward(self, x_n: Tensor) -> tuple[Tensor, Tensor]:
+        """Return the negative-binomial parameters ``(μ, κ)`` per row.
+
+        Parameters
+        ----------
+        x_n : Tensor of shape ``(B, context_dim)``
+            Learned context vector.
+
+        Returns
+        -------
+        mu, kappa : Tensor of shape ``(B,)``
+            Positive mean and dispersion; ``kappa`` is the global scalar
+            broadcast to ``(B,)``.
+        """
         if x_n.dim() != 2 or x_n.shape[1] != self.context_dim:
             raise ValueError(
                 f"x_n must have shape (B, context_dim={self.context_dim}); got {tuple(x_n.shape)}"
@@ -116,12 +119,11 @@ class NegBinCountHead(nn.Module):
         h = torch.nn.functional.gelu(self.fc1(x_n))
         log_mu = self.fc2(h).squeeze(-1)  # (B,)
         mu = torch.nn.functional.softplus(log_mu)
-        # ``.contiguous()`` is load-bearing here: without it, kappa is a
-        # stride-0 broadcast view of a scalar, and on the MPS backend
-        # ``torch.distributions.NegativeBinomial.log_prob`` produces ±Inf
-        # for ~all batch entries when ``total_count`` has stride 0
-        # (PyTorch MPS bug; CPU and CUDA are unaffected). Materializing a
-        # contiguous (B,) tensor is the load-bearing workaround.
+        # ``.contiguous()`` is required: without it kappa is a stride-0
+        # broadcast view of a scalar, and on the MPS backend
+        # ``torch.distributions.NegativeBinomial.log_prob`` returns ±Inf
+        # for nearly all batch entries when ``total_count`` has stride 0
+        # (a PyTorch MPS issue; CPU and CUDA are unaffected).
         kappa = torch.nn.functional.softplus(self.log_kappa).expand_as(mu).contiguous()
         return mu, kappa
 
@@ -134,10 +136,11 @@ class NegBinCountHead(nn.Module):
             Observed shot counts. Cast to float internally; must be
             non-negative integers.
         x_n : Tensor of float, shape ``(B, context_dim)``
+            Learned context vector.
 
         Returns
         -------
-        Tensor of float, shape ``(B,)``.
+        Tensor of float, shape ``(B,)``
         """
         if K.dim() != 1 or K.shape[0] != x_n.shape[0]:
             raise ValueError(

@@ -1,10 +1,10 @@
 """Causal player-presence model :math:`q_\\mathrm{pres}(b\\mid p,t,s,\\mathrm{pos})`.
 
-A small interpretable model of the per-(player, game-date, starter,
-position) on-court fraction per 2-minute bin (paper §5.2 timing
-limitation, Phase 3.4 of the 2026-06-07 audit). Structurally
-parallel to the AC-KDE pooling gate (own/pooled mixture under a
-history-driven gate):
+A small, interpretable model of a player's on-court fraction in each
+2-minute bin of a game, given the player, game date, starter status and
+position. It can supply an optional on-court presence feature to the
+timing head. Its structure parallels the
+AC-KDE pooling gate, an own/pooled mixture under a history-driven gate:
 
 .. math::
 
@@ -26,19 +26,21 @@ where:
 * :math:`\\lambda_{p,s}(t)=
   \\sigma(b_0+\\mathrm{softplus}(\\tilde\\beta_h)\\,
   \\log(1+N^{<t}_{p,s}))` is the history-driven gate with learned
-  :math:`b_0,\\tilde\\beta_h` — identical functional form to AC-KDE's
-  :class:`~shotcloud.models.PoolingGate` so the timing-exposure side
-  of the paper mirrors the spatial side.
+  :math:`b_0,\\tilde\\beta_h`, the same functional form as the
+  closed-form history schedule of
+  :class:`~shotcloud.models.pooling_gate.PoolingGate`.
 
-Each bin :math:`z_{p,g,b}\\in[0,1]` is a fraction; the supervision
-signal is per-bin BCE between the predicted curve
-:math:`q_\\mathrm{pres}(b)` and the held-out observed fraction
+The prior-game inputs to :math:`q_\\mathrm{self}` and
+:math:`N^{<t}_{p,s}` must come from games strictly before the query date,
+which makes the model causal. Each target :math:`z_{p,g,b}\\in[0,1]` is an
+observed fraction, and the model is trained with per-bin binary
+cross-entropy between :math:`q_\\mathrm{pres}(b)` and
 :math:`z_{p,g,b}`.
 
-The module is intentionally small: 1 + 1 + 1 + (N_POSITIONS × 2 ×
-N_BINS) = roughly 184 learnable scalars. Capacity is fixed by the
-data structure, not by hidden width — the paper's "no large neural
-component" stance for the timing-exposure factor.
+The module is deliberately small: ``3 + n_positions × n_starter ×
+n_bins`` learnable scalars (183 with the defaults). Its capacity is set
+by the data layout rather than by a hidden width; there is no large
+neural component.
 """
 
 from __future__ import annotations
@@ -48,15 +50,13 @@ from typing import Final
 import torch
 from torch import Tensor, nn
 
-#: Number of 2-minute bins (matches
-#: :data:`scripts.build_oncourt_table.N_BINS` and the pbp histogram).
+#: Number of 2-minute bins (matches ``N_BINS`` in
+#: ``scripts/build_oncourt_table.py``, which builds the on-court table).
 PRESENCE_N_BINS: Final[int] = 30
 
-#: Hard position classes for the pool lookup. Three classes — guard,
-#: wing, big — derived in shotcloud via
-#: :mod:`shotcloud.data.positions`; this constant just establishes the
-#: pool table's first axis. Cold-start unknown positions get index 0
-#: (the guard fallback) — same convention the rest of shotcloud uses.
+#: Hard position classes for the pool lookup: guard, wing, big (see
+#: :mod:`shotcloud.data.positions`). This constant sets the pool table's
+#: first axis; unknown positions map to index 0 (guard).
 PRESENCE_N_POSITIONS: Final[int] = 3
 
 #: Starter axis is binary: 0 = bench, 1 = starter.
@@ -69,24 +69,22 @@ class PresenceModel(nn.Module):
     Parameters
     ----------
     n_bins : int, default :data:`PRESENCE_N_BINS`
+        Number of time bins per game.
     n_positions : int, default :data:`PRESENCE_N_POSITIONS`
+        Number of position classes in the pool table.
     n_starter : int, default :data:`PRESENCE_N_STARTER`
+        Number of starter-status classes in the pool table.
     rho_init : float, default 1/45.0
         Initial value of :math:`\\rho` (per-day decay). 1/45 puts the
-        recency half-life at roughly 30 days, the same value the
-        shotcloud collaborative pipeline uses by default.
+        recency half-life at roughly 30 days.
     b0_init : float, default -1.0
         Initial gate bias. With :math:`\\beta_h=0`, the gate starts at
-        :math:`\\sigma(-1)\\approx 0.27`, slightly pool-favored so a
-        zero-history player relies on the pool.
+        :math:`\\sigma(-1)\\approx 0.27`, favoring the pool so a
+        zero-history player relies mostly on it.
     beta_h_init : float, default 0.5
         Pre-softplus initial value of :math:`\\tilde\\beta_h`.
         ``softplus(0.5) ≈ 0.97`` — a strong history slope so the gate
         opens up to the self curve once the player accumulates games.
-
-    Forward
-    -------
-    See :meth:`forward`.
     """
 
     def __init__(
@@ -171,9 +169,10 @@ class PresenceModel(nn.Module):
 
         Returns
         -------
-        Tensor of shape ``(B, n_bins)``. Rows with ``prior_mask.sum() == 0``
-        (no real priors) get zeros — the gate's :math:`\\lambda=0`
-        then leaves the output as the pool curve.
+        Tensor of shape ``(B, n_bins)``
+            Rows with ``prior_mask.sum() == 0`` (no real priors) are zero,
+            so in :meth:`forward` such rows reduce to the gated pool term
+            :math:`(1-\\lambda)\\,q_\\mathrm{pool}`.
         """
         if prior_bins.dim() != 3 or prior_bins.shape[-1] != self.n_bins:
             raise ValueError(
@@ -189,8 +188,8 @@ class PresenceModel(nn.Module):
         # w(Δt) = exp(-ρ · Δt) · mask
         w = torch.exp(-self.rho * prior_ages_days.clamp_min(0.0)) * prior_mask  # (B, K_max)
         denom = w.sum(dim=-1, keepdim=True)  # (B, 1)
-        # Cold-start row (no prior games): denom == 0; produce zeros and
-        # let the history gate route the output to the pool.
+        # Cold-start row (no prior games): denom == 0; produce zeros so the
+        # output reduces to the gated pool term.
         safe_denom = torch.where(denom > 0, denom, torch.ones_like(denom))
         weighted_bins = (prior_bins * w.unsqueeze(-1)).sum(dim=1)  # (B, n_bins)
         return weighted_bins / safe_denom
@@ -206,8 +205,20 @@ class PresenceModel(nn.Module):
     ) -> Tensor:
         """Compute :math:`q_\\mathrm{pres}(b)` for a batch of queries.
 
-        All tensors must share the leading batch dim ``B``. Returns
-        ``(B, n_bins)`` in :math:`[0, 1]`.
+        Parameters
+        ----------
+        prior_bins, prior_ages_days, prior_mask : Tensor
+            Prior-game on-court vectors, ages and mask; see
+            :meth:`self_curve`.
+        position_idx, starter_idx : Tensor of shape ``(B,)``, int64
+            Position class and starter status indexing the pool table.
+        history_count : Tensor of shape ``(B,)``
+            Number of prior games :math:`N^{<t}_{p,s}` feeding the gate.
+
+        Returns
+        -------
+        Tensor of shape ``(B, n_bins)``
+            Predicted on-court fraction per bin, in :math:`[0, 1]`.
         """
         q_self = self.self_curve(prior_bins, prior_ages_days, prior_mask)
         q_pool = self.pool_curve(position_idx, starter_idx)

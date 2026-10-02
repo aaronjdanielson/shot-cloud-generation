@@ -1,17 +1,19 @@
 """Save / load helpers for trained ``(encoder, decoder, vocab)`` triples.
 
+Deprecated; retained for the low-rank tilt decoder trained by
+:func:`~shotcloud.legacy_pivot.trainer.train_decoder`.
+
 A checkpoint is a single ``.pt`` file containing the decoder's ``V``
 matrix, the encoder's embedding table(s), the player vocabulary, and
 the hyperparameters needed to rehydrate compatible module instances.
 
 Encoder kinds supported (`encoder_kind` in the payload):
 
-* ``"PlayerEmbeddingEncoder"`` — original v1, single embedding table.
-* ``"PlayerPositionEncoder"`` — position-aware additive variant
-  introduced 2026-04-26 to surface position into the neural correction.
+* ``"PlayerEmbeddingEncoder"`` — single player-embedding table.
+* ``"PlayerPositionEncoder"`` — additive player and position
+  embeddings, which surface position into the neural correction.
 
-Loading is forward-compatible: if a future version saves a different
-``encoder_kind``, the loader raises a clear error rather than silently
+An unrecognized ``encoder_kind`` raises an error rather than silently
 loading the wrong shape.
 """
 

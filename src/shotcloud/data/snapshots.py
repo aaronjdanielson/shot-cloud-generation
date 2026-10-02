@@ -1,36 +1,29 @@
-"""Snapshot store: causal feature registry for the Gibbs spatial decoder.
+r"""Snapshot store: causal registry of features derived from training data.
 
-This module is the architectural enforcement of the *Causal Snapshot
-Principle* (paper §2.3, ``sec:causal-framework``):
-
-    Every spatial prior, role feature, archetype basis, and contextual
-    statistic is evaluated relative to a temporal snapshot t in which
-    every component is constructed using only the information
-    filtration F_<t. Equivalently:
-
-        q(c | x_t) = q(c | F_<t, x_t).
-
-A :class:`SnapshotStore` caches a sequence of :class:`SnapshotBundle`
-objects, one per monthly anchor date. Every consumer of training-data-
-derived features (the per-player history pool used by the self-KDE,
-the archetype surfaces, the per-opponent allowed-shot pool, the role
-profile, the position mixture, and the opponent-efficiency bin)
-reaches into the model at inference time exclusively through
+A :class:`SnapshotStore` holds a sequence of :class:`SnapshotBundle`
+objects, one per anchor date (typically monthly). Each bundle carries
+the slow-moving features valid at its anchor: per-player role profiles
+and position mixtures, per-opponent efficiency bins, per-player and
+per-opponent indices of prior shots, and, optionally, archetype
+surfaces and mixtures for the legacy grid-cell decoder. Consumers read
+these features only through::
 
     bundle = snapshot_store.get_snapshot(game_date)
 
-which returns the bundle with the largest anchor `t_i <= game_date`. The
-build pass guarantees that every value in `bundle` was computed using
-only shots/game-logs with date strictly less than `bundle.anchor_date`.
+which returns the bundle with the largest anchor ``t_i <= game_date``.
 
-This is load-bearing infrastructure, not a utility. The single
-:func:`SnapshotBundle.assert_causal` method is what gives Proposition 1
-(Temporal Validity) operational teeth: a one-line check per anchor
-that catches the entire Class-A leakage taxonomy.
+**Causality contract.** Every value in a bundle is computed from shots
+dated strictly before the bundle's anchor, so a feature read for a shot
+on date :math:`t` depends only on the information filtration
+:math:`\mathcal F_{<t}`:
 
-See [docs/architecture.md](../../../docs/architecture.md) for the
-single-page system map and
-[CLAUDE.md](../../../CLAUDE.md) for the binding development rules.
+.. math::
+
+    q(c \mid x_t) = q(c \mid \mathcal F_{<t}, x_t).
+
+:meth:`SnapshotBundle.assert_causal` verifies the contract for a
+bundle's indexed shot pools; the remaining fields are computed from the
+same date-filtered sub-frame by :func:`build_snapshot_store_from_shots`.
 """
 
 from __future__ import annotations
@@ -43,21 +36,20 @@ import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 
-#: Width of the per-player role profile vector r_p (paper §3.3a):
+#: Width of the per-player role profile vector r_p:
 #: (rim_rate, paint_rate, midrange_rate, corner3_rate, atb3_rate,
 #:  mean_dist, std_dist, shot_entropy). Computed by
 #: :func:`shotcloud.data.role_profile.build_role_profiles`.
 ROLE_PROFILE_DIM: Final[int] = 8
 
-#: Width of the per-player soft position mixture pi_p^pos (paper §3.3a):
-#: a 3-simplex over {guard, wing, big}.
+#: Width of the per-player soft position mixture pi_p^pos, a
+#: distribution over (guard, wing, big).
 POSITION_MIXTURE_DIM: Final[int] = 3
 
-#: Number of opponent-efficiency buckets (paper §3.3, ContextEncoder).
-#: Quartiles of allowed-shot make-rate per opponent at the snapshot
-#: anchor; this is an *efficiency* bin (FG% allowed), not a geometric
-#: defense summary --- the geometric signal is carried separately by
-#: the per-opponent allowed-shot pool feeding ``a_delta``.
+#: Number of opponent-efficiency buckets: quartiles of the FG% each
+#: opponent allowed on shots before the snapshot anchor. This is an
+#: *efficiency* summary, not a geometric one; the spatial effect of the
+#: opponent is modeled separately by opponent reweighting.
 N_OPP_EFFICIENCY_BINS: Final[int] = 4
 
 
@@ -65,11 +57,10 @@ N_OPP_EFFICIENCY_BINS: Final[int] = 4
 class SnapshotBundle:
     """Causal feature bundle valid at exactly one anchor date.
 
-    Every field satisfies the F_<t invariant: every value was
-    computed using only shots and game-logs from dates strictly
-    before :attr:`anchor_date`. The class is the architectural
-    interface by which AA-KDE consumes training-derived features at
-    training and inference time.
+    Every field satisfies the F_<t invariant: each value is computed
+    only from shots dated strictly before :attr:`anchor_date`. The
+    model reads training-derived features through this interface at
+    both training and inference time.
 
     Attributes
     ----------
@@ -95,9 +86,9 @@ class SnapshotBundle:
         Sorted array of opponent codes (e.g., team abbreviations)
         active at this anchor.
     opp_efficiency_bins : NDArray[np.int8]
-        Per-opponent strength bucket index in
-        ``{0, 1, ..., N_OPP_EFFICIENCY_BINS-1}``; aligned with
-        :attr:`opp_codes`.
+        Per-opponent efficiency bucket index in
+        ``{0, 1, ..., N_OPP_EFFICIENCY_BINS-1}`` (0 = lowest FG%
+        allowed); aligned with :attr:`opp_codes`.
     player_history_index : dict[int, NDArray[np.int64]]
         Per-player int64 indices into the source shot table. All
         indices point to shots with date strictly before
@@ -110,18 +101,16 @@ class SnapshotBundle:
     archetype_surfaces : NDArray[np.float32] | None
         Archetype basis ``A_k^(t_i)``, shape ``(K, n_cells)``, each
         row a probability distribution over court cells. None when
-        the bundle is built without the archetype-fit step
-        (e.g., before :mod:`scripts.pretrain_snapshots` ships, or
-        in tests where the archetype layer is not exercised).
+        the bundle is built without an archetype fit (the default of
+        ``scripts/pretrain_snapshots.py``).
     archetype_mixtures : NDArray[np.float32] | None
         Per-player archetype mixture weights ``rho_p^(t_i)``, shape
         ``(P, K)``, each row a simplex over the K archetypes. The
         row at index ``i`` corresponds to player ``player_ids[i]``.
-        Used to seed the :class:`shotcloud.models.ArchetypeMixture`
-        learned head ``rho_xi(p, x_n)`` at training start (paper
-        §6.3). Only populated by the archetype-fit step from the
-        terminal snapshot's mixtures; intermediate snapshots may
-        leave it None to save space.
+        Used to initialize the learned head ``rho_xi(p, x_n)`` of
+        :class:`shotcloud.legacy_pivot.archetypes.ArchetypeMixture`.
+        None unless the archetype fit returns mixtures for this
+        anchor.
     archetype_player_ids : NDArray[np.int64] | None
         Player IDs aligned with ``archetype_mixtures`` rows. May
         differ from :attr:`player_ids` if some players were
@@ -234,39 +223,39 @@ class SnapshotBundle:
         return None
 
     def opp_idx(self, opp: str) -> int | None:
-        """Return the row index of opp in this bundle, or None if absent."""
+        """Return the row index of ``opp`` in this bundle, or None if absent."""
         idx = int(np.searchsorted(self.opp_codes, str(opp)))
         if idx < len(self.opp_codes) and str(self.opp_codes[idx]) == str(opp):
             return idx
         return None
 
     def role_profile(self, player_id: int) -> NDArray[np.float32] | None:
-        """Get role profile for a player; None if not active at this anchor."""
+        """Return the player's role profile; None if not active at this anchor."""
         i = self.player_idx(player_id)
         if i is None:
             return None
         return cast("NDArray[np.float32]", self.role_profiles[i])
 
     def position_mixture(self, player_id: int) -> NDArray[np.float32] | None:
-        """Get position mixture for a player; None if not active at this anchor."""
+        """Return the player's position mixture; None if not active at this anchor."""
         i = self.player_idx(player_id)
         if i is None:
             return None
         return cast("NDArray[np.float32]", self.position_mixtures[i])
 
     def opp_strength_bin(self, opp: str) -> int | None:
-        """Get opponent's strength bin (0..3); None if not seen at this anchor."""
+        """Return the opponent's efficiency bin; None if not seen at this anchor."""
         i = self.opp_idx(opp)
         if i is None:
             return None
         return int(self.opp_efficiency_bins[i])
 
     def history_for(self, player_id: int) -> NDArray[np.int64]:
-        """Return causal shot indices for a player. Empty array if player has none."""
+        """Return the player's causal shot indices (empty if none)."""
         return self.player_history_index.get(int(player_id), np.array([], dtype=np.int64))
 
     def defensive_history_for(self, opp: str) -> NDArray[np.int64]:
-        """Return causal opp-allowed shot indices. Empty array if opp has none."""
+        """Return the shot indices allowed by ``opp`` (empty if none)."""
         return self.defensive_history_index.get(str(opp), np.array([], dtype=np.int64))
 
     # ------------------------------------------------------------------
@@ -276,21 +265,20 @@ class SnapshotBundle:
     def assert_causal(self, shots: pd.DataFrame) -> None:
         """Raise AssertionError if any indexed shot has date >= anchor_date.
 
-        This is the operational form of Proposition 1 (Temporal
-        Validity, paper §2.5): every shot index referenced by this
-        bundle must point to a row in `shots` whose date is strictly
-        before :attr:`anchor_date`. A passing assertion guarantees
-        the entire Class-A leakage taxonomy is closed for this
-        bundle.
+        Every shot index referenced by :attr:`player_history_index` and
+        :attr:`defensive_history_index` must point to a row of
+        ``shots`` dated strictly before :attr:`anchor_date`.
 
         Parameters
         ----------
         shots : DataFrame
             The source shot table that the bundle indexes into. Must
-            contain a `date` column convertible to numpy datetime64.
+            contain a ``date`` column convertible to numpy datetime64.
 
         Raises
         ------
+        ValueError
+            If ``shots`` has no ``date`` column.
         AssertionError
             With a per-violation message listing the offending
             player or opponent and the leak count.
@@ -327,8 +315,8 @@ class SnapshotStore:
 
     The store implements the time-causal lookup
     ``S(t) = bundle at i(t), i(t) = max{i : t_i <= t}`` via binary
-    search on anchor dates, and is the single architectural object
-    through which AA-KDE consumes causal-by-construction features.
+    search on anchor dates, and is the single object through which the
+    model reads causal, training-data-derived features.
 
     Bundles must be passed in chronological order. The store
     enforces strict monotonicity of anchor dates at construction.
@@ -354,6 +342,7 @@ class SnapshotStore:
                 )
 
     def __len__(self) -> int:
+        """Number of bundles."""
         return len(self.bundles)
 
     @property
@@ -395,9 +384,8 @@ class SnapshotStore:
     def assert_causal(self, shots: pd.DataFrame) -> None:
         """Run :meth:`SnapshotBundle.assert_causal` on every bundle.
 
-        Cheap (linear in the total number of indexed shots across all
-        bundles); pretrain pipelines and unit tests should call this
-        as a final guarantee before persisting the store.
+        Linear in the total number of indexed shots across bundles;
+        call it before persisting a store.
         """
         for bundle in self.bundles:
             bundle.assert_causal(shots)
@@ -408,21 +396,23 @@ class SnapshotStore:
 # ----------------------------------------------------------------------
 
 
+#: Role-profile hook: maps a causal shot sub-frame to ``{player_id: r_p}``.
 RoleProfileFn = Callable[[pd.DataFrame], dict[int, NDArray[np.float32]]]
+#: Position-mixture hook: maps a causal shot sub-frame to
+#: ``{player_id: pi_p^pos}``.
 PositionMixtureFn = Callable[[pd.DataFrame], dict[int, NDArray[np.float32]]]
+_ArchetypeTriple = tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.int64]]
 #: Archetype fit takes ``(filtered_shots, anchor_date)`` and returns either:
 #: * ``None`` (no archetype fit at this anchor),
-#: * surfaces ``A`` of shape ``(K, n_cells)`` (back-compat: surfaces only), or
+#: * surfaces ``A`` of shape ``(K, n_cells)`` (surfaces only), or
 #: * a triple ``(A, rho, player_ids)`` carrying surfaces, per-player
 #:   mixture weights of shape ``(P, K)``, and the int64 player IDs that
-#:   align with ``rho``'s rows. The triple form lets the snapshot
-#:   bundle persist mixtures for downstream initialization of
-#:   :class:`shotcloud.models.ArchetypeMixture`.
+#:   align with ``rho``'s rows, so the bundle can persist mixtures for
+#:   initializing :class:`shotcloud.legacy_pivot.archetypes.ArchetypeMixture`.
 #:
-#: ``anchor_date`` is supplied so the callable can persist per-anchor
-#: checkpoints (see ``pretrain_snapshots.py --checkpoint-dir``); it is
-#: safe to ignore if no checkpointing is needed.
-_ArchetypeTriple = tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.int64]]
+#: ``anchor_date`` lets the callable persist per-anchor checkpoints
+#: (``scripts/pretrain_snapshots.py --checkpoint-dir``); callables that
+#: do not checkpoint may ignore it.
 ArchetypeFitFn = Callable[
     [pd.DataFrame, np.datetime64],
     "NDArray[np.float32] | _ArchetypeTriple | None",
@@ -454,44 +444,49 @@ def build_snapshot_store_from_shots(
     1. Filters `shots` to rows with ``date < t_i``.
     2. Computes per-player and per-opponent shot indices into the
        original shot table (the causal pools).
-    3. Computes per-opponent strength bins from the filtered
-       opponent-efficiency (FG% allowed) quartile boundaries.
-    4. Optionally calls `role_profile_fn(filtered_shots)` to get role
-       profiles, and `position_mixture_fn(filtered_shots)` to get
-       soft position assignments. When None, fills zeros / uniform.
-    5. Optionally calls `archetype_fit_fn(filtered_shots, anchor_date)`
-       to compute archetype surfaces. When None, leaves
-       :attr:`SnapshotBundle.archetype_surfaces` as None. The
-       anchor date is supplied so the callable can drive per-anchor
-       checkpointing.
-    6. Packs everything into a frozen :class:`SnapshotBundle` and
-       appends to the store.
+    3. Assigns each opponent an efficiency bin from the quartiles of
+       FG% allowed over the filtered shots (all zeros when fewer than
+       ``N_OPP_EFFICIENCY_BINS`` opponents are present).
+    4. Optionally calls ``role_profile_fn(filtered_shots)`` for role
+       profiles and ``position_mixture_fn(filtered_shots)`` for soft
+       position assignments (renormalized to the simplex; invalid rows
+       become uniform). Without a hook, role profiles are zero and
+       position mixtures uniform.
+    5. Optionally calls ``archetype_fit_fn(filtered_shots, anchor_date)``
+       for archetype surfaces (and mixtures). Without it,
+       :attr:`SnapshotBundle.archetype_surfaces` is None.
+    6. Packs everything into a frozen :class:`SnapshotBundle`.
 
-    The pluggable function arguments let downstream modules (and
-    tests) develop against the snapshot interface without first
-    landing the full pretraining script :doc:`scripts/pretrain_snapshots`.
+    The hooks keep this module independent of the profile and
+    archetype implementations; tests can pass simple stubs.
 
     Parameters
     ----------
     shots : pd.DataFrame
         Output of :func:`shotcloud.data.load_shots` or equivalent.
-        Must have columns ``player_id``, ``date``. ``opponent`` and
-        ``made`` are required for the defensive pool and the
-        opp-efficiency bins; absent columns degrade gracefully.
+        Must have columns ``player_id`` and ``date``. ``opponent`` is
+        needed for the defensive pools and ``opponent`` plus ``made``
+        for the efficiency bins; without them those fields are empty or
+        zero.
     anchor_dates : sequence of datetime64
         Strictly-increasing monthly anchors (or other cadence). The
         store can only answer queries for dates `>= anchor_dates[0]`.
     role_profile_fn, position_mixture_fn, archetype_fit_fn : callable, optional
-        Computation hooks. Each receives the *filtered* (causal)
-        sub-frame for the current anchor and returns the
-        corresponding object. None defaults make the call into a
-        no-op stub.
+        Computation hooks. Each receives the filtered (causal)
+        sub-frame for the current anchor; ``archetype_fit_fn`` also
+        receives the anchor date.
 
     Returns
     -------
     SnapshotStore
-        Anchors with no qualifying shots are silently skipped. If
-        all anchors have no qualifying shots, the function raises.
+        Anchors with no prior shots are skipped.
+
+    Raises
+    ------
+    ValueError
+        If ``shots`` is empty or lacks ``date`` or ``player_id``, if
+        ``anchor_dates`` is empty or not strictly increasing, or if no
+        anchor has any prior shots.
     """
     if len(shots) == 0:
         raise ValueError("empty shots frame")
@@ -569,8 +564,8 @@ def build_snapshot_store_from_shots(
                         f"position_mixture_fn returned shape {arr.shape} "
                         f"for player {pid}; expected ({POSITION_MIXTURE_DIM},)"
                     )
-                # Negative or NaN entries from a bad position_mixture_fn
-                # would otherwise propagate into the bundle; clamp + guard.
+                # Clamp negative entries and fall back to uniform when the
+                # mass is zero or non-finite, so the bundle stays valid.
                 arr = np.clip(arr, 0.0, None)
                 s = float(arr.sum())
                 if not np.isfinite(s) or s <= 1e-8:

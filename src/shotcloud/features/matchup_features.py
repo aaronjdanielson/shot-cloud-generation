@@ -1,4 +1,4 @@
-"""Per-(group, snapshot, opponent) matchup Δ̂ feature pipeline (Tier 2a-v2).
+"""Per-(group, snapshot, opponent) matchup Δ̂ feature pipeline.
 
 Builds the residualized similar-player defensive response feature
 
@@ -18,15 +18,17 @@ shrunk by
     \\qquad
     \\kappa_{k,d}(t) = \\frac{N^{\\mathrm{eff}}_{k,d}(t)}{N^{\\mathrm{eff}}_{k,d}(t) + \\tau}.
 
-The "players like p" at snapshot ``t`` are now defined as
-**discrete K-means groups** over the trait vector
-(:class:`shotcloud.data.player_traits.PlayerTraitsTable`), not the
-per-(p, t) top-L cosine peer set the v1 build used. Group ``k`` at
-snapshot ``t`` aggregates ~n_players/K members; for K=5 and ~1500
-players, each (group, opp, zone) cell sees ~5–10× more shots than the
-v1 per-player setup, which was too noisy for the third-order
-interaction the residualization isolates (see the 2026-06-03 log
-entry).
+The "players like p" at snapshot ``t`` are **discrete K-means groups**
+over the trait vector
+(:class:`~shotcloud.data.player_traits.PlayerTraitsTable`). Pooling a
+group of roughly ``n_players / K`` members gives each
+(group, opponent, zone) cell enough shots to estimate the third-order
+interaction that the residualization isolates, which per-player cells
+are too sparse to resolve.
+
+The features feed
+:class:`~shotcloud.models.zone_defense_reweighting.MatchupReweightingDefense`,
+an alternative opponent channel evaluated as an ablation.
 
 Aggregation (group-level):
 
@@ -47,23 +49,27 @@ Limit cases:
   exactly, so ``Δ^int = (P^allow − P^lg) − (P^allow − P^lg) = 0``
   identically. The matchup term collapses to a no-op — this is the
   orthogonal-decomposition identity made explicit.
-* ``K`` large: groups shrink toward per-player; signal becomes
-  identification-limited (the v1 per-player setup empirically).
-* The sweet spot is moderate K (default 5) where each group is large
-  enough for low-variance Δ̂ but small enough to expose real
-  player-type-conditional structure.
+* ``K`` large: groups shrink toward single players and the cells
+  become too sparse to identify the interaction.
+* Moderate ``K`` (default 5) balances a low-variance Δ̂ against
+  resolving player-type-conditional structure.
 
 The output ``delta_hat`` is broadcast to per-player shape
 ``(n_players, n_snapshots, n_opps, N_ZONES)`` by gathering
 ``delta_hat_group[group(p, t), t, d, :]`` — players in the same group
-share the same Δ̂ row by construction. The trainer's per-row gather
-in :class:`MatchupReweightingDefense` is unchanged.
+share the same Δ̂ row by construction, so the per-row gather in
+:class:`~shotcloud.models.zone_defense_reweighting.MatchupReweightingDefense`
+is indexed per player.
 
-Cache-key parity is the load-bearing invariant: the config hash
-covers the shots fingerprint, the opponent vocabulary hash, the
-anchor-date tuple, ``grouping_K``, ``grouping_seed``, and the
-``(window_days, half_life_days, tau, seed)`` quad. Changing any of
-these changes the hash; the trainer rebuilds on mismatch.
+Causality: the features at a snapshot anchor use only shots dated
+strictly before the anchor, and the group assignments use only that
+snapshot's causal traits.
+
+The config hash covers every input that changes the feature values --
+the shots fingerprint, the trait-table hash, the opponent vocabulary
+hash, the anchor-date tuple, ``grouping_K``, ``grouping_seed``, and
+``(window_days, half_life_days, tau, seed)`` -- so a cached artifact is
+reused only when all of them match.
 """
 
 from __future__ import annotations
@@ -85,44 +91,37 @@ from shotcloud.data.zones import N_ZONES, zone_from_xy_vectorized
 from shotcloud.training.dataset import OpponentVocab, PlayerVocab
 
 #: Default recency window (in days) for causal peer-shot aggregation.
-#: Matches the D-lite defense feature window so the two defense
-#: channels are temporally aligned for the A vs B vs C ablation.
+#: Matches the defensive feature window so the two opponent channels
+#: are temporally aligned.
 DEFAULT_MATCHUP_WINDOW_DAYS: int = 365
 
 #: Default exponential recency half-life (in days). Matches the
-#: D-lite half-life.
+#: defensive feature half-life.
 DEFAULT_MATCHUP_HALF_LIFE_DAYS: float = 90.0
 
-#: Default shrinkage scale τ for κ = N_eff / (N_eff + τ). At τ=20,
-#: a group-vs-opponent cell needs ~20 recency-weighted shots before
-#: its Δ̂ reaches half of Δ^int. With K=5 groups and ~300 players
-#: per group, N^eff per (group, opp) cell is typically in the
-#: low-hundreds, so the default τ leaves κ in [0.85, 0.95] — light
-#: shrinkage on well-populated cells, heavy on cold cells.
+#: Default shrinkage scale τ for κ = N_eff / (N_eff + τ). A
+#: group-vs-opponent cell needs τ recency-weighted shots before its Δ̂
+#: reaches half of Δ^int, so well-populated cells are shrunk lightly
+#: and sparse cells heavily.
 DEFAULT_MATCHUP_TAU: float = 20.0
 
-#: Default number of K-means groups over the trait vector. At K=5
-#: and ~1500 players the average group is ~300 players → ~5–10× more
-#: shots per (group, opp, zone) cell than the v1 per-player setup
-#: that empirically underperformed D-lite-zone.
+#: Default number of K-means groups over the trait vector.
 DEFAULT_MATCHUP_GROUPING_K: int = 5
 
-#: Default seed for the K-means clusterer. Deterministic given seed +
-#: traits + K; carried in the config hash so cache invalidates on
-#: change.
+#: Default seed for the K-means clusterer. Assignments are deterministic
+#: given seed, traits, and K; the seed is part of the config hash.
 DEFAULT_MATCHUP_GROUPING_SEED: int = 0
 
 
 @dataclass(frozen=True)
 class MatchupFeaturesConfig:
-    """Configuration for the (group-level) matchup-features build.
+    """Configuration for the group-level matchup-features build.
 
-    The hash covers everything that can change the feature values:
-    the shots fingerprint, the opponent vocabulary hash, the
-    anchor-date tuple, the trait-table hash (so re-clustering on
-    different traits invalidates), the K-means K + seed, and the
-    (window, half_life, tau, seed) quad. A change to any of these
-    invalidates the cached artifact.
+    :attr:`config_hash` covers every field: the shots fingerprint, the
+    trait-table hash (so re-clustering on different traits invalidates
+    the cache), the opponent vocabulary hash, the anchor-date tuple,
+    the K-means ``grouping_K`` and ``grouping_seed``, and
+    ``(window_days, half_life_days, tau, seed)``.
     """
 
     shots_fingerprint: str
@@ -169,9 +168,8 @@ class MatchupFeaturesConfig:
 def traits_table_hash(traits: PlayerTraitsTable) -> str:
     """Stable 16-char SHA-256 hash of the trait tensor's bytes.
 
-    Used by :class:`MatchupFeaturesConfig` to invalidate the cache
-    when the underlying trait values change (e.g. snapshot store
-    rebuilt, game logs extended, bio table updated).
+    Stored in :class:`MatchupFeaturesConfig` so the cache is invalidated
+    whenever the underlying trait values change.
     """
     arr = np.ascontiguousarray(traits.traits, dtype=np.float32)
     return hashlib.sha256(arr.tobytes()).hexdigest()[:16]
@@ -186,24 +184,23 @@ def assign_player_groups(
     """K-means cluster the trait vector at each snapshot into K groups.
 
     Returns a ``(n_players, n_snapshots)`` int64 array of group
-    assignments in ``[0, K)``. Per-snapshot clustering is causal-by-
-    construction (each column uses only that snapshot's trait values,
-    which are themselves built from data with date < anchor in
-    :func:`build_player_traits_table`).
+    assignments in ``[0, K)``. Clustering is causal by construction:
+    each column uses only that snapshot's trait values, which are built
+    from data dated before the anchor by
+    :func:`~shotcloud.data.player_traits.build_player_traits_table`.
 
-    The trait vector is already z-score-normalized inside
-    :class:`PlayerTraitsTable`, so KMeans operates on standardized
-    features directly.
+    The trait vector is z-score normalized in
+    :class:`~shotcloud.data.player_traits.PlayerTraitsTable`, so K-means
+    operates on standardized features directly.
 
     Parameters
     ----------
     traits : PlayerTraitsTable
         Causal trait tensor; shape ``(n_players, n_snapshots, trait_dim)``.
     K : int
-        Number of groups. ``K=1`` is the league-marginal limit
-        (matchup term collapses to zero); ``K`` ≥ ``n_players`` is
-        rejected (each player would be its own group, defeating the
-        purpose).
+        Number of groups. ``K=1`` is the league-marginal limit, in which
+        the matchup term is identically zero. ``K`` larger than
+        ``n_players`` is rejected.
     seed : int
         K-means random_state. Determines initialization; for K-means++
         with a fixed seed the assignment is deterministic.
@@ -211,6 +208,11 @@ def assign_player_groups(
     Returns
     -------
     NDArray[np.int64] of shape ``(n_players, n_snapshots)``
+
+    Raises
+    ------
+    ValueError
+        If ``K < 1`` or ``K > n_players``.
     """
     if K < 1:
         raise ValueError(f"K must be ≥ 1; got {K}")
@@ -223,15 +225,14 @@ def assign_player_groups(
 
     groups = np.zeros((n_players, n_snapshots), dtype=np.int64)
     if K == 1:
-        # All players in one group at every snapshot. With the
-        # group-level aggregation, P^vs = P^allow exactly → Δ^int = 0.
-        # The output stays at all-zeros; matchup term is a no-op.
+        # A single group gives P^vs = P^allow exactly, so Δ^int = 0 and
+        # the matchup term is a no-op.
         return groups
 
     for m in range(n_snapshots):
         X = traits.traits[:, m, :].astype(np.float64)
-        # NaN-safe: any rows with NaN are zero-filled (matches the
-        # imputation convention upstream in build_player_traits_table).
+        # Zero-fill NaNs, matching the imputation convention of
+        # build_player_traits_table.
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
         # n_init=10 to mitigate K-means local-minima sensitivity; with
         # a fixed seed each init is reproducible.
@@ -249,19 +250,17 @@ class MatchupFeatures:
     delta_hat : Tensor of shape ``(n_players, n_snapshots, n_opps, N_ZONES)``
         Float32. Shrunk residualized matchup effect. Cells with no
         causal peer-vs-opponent evidence (``N^eff = 0``) are exactly
-        zero, so the downstream ``β_match · Δ̂`` term is a no-op for
-        those rows — cold-start-safe by construction.
+        zero, so a downstream ``β_match · Δ̂`` term is a no-op for
+        those rows.
     delta_int : Tensor of shape ``(n_players, n_snapshots, n_opps, N_ZONES)``
-        Float32. Pre-shrink Δ^int. Carried alongside Δ̂ for
-        diagnostics (lets us see how much shrinkage is doing on the
-        Δ̂ = κ · Δ^int factorization).
+        Float32. Unshrunk Δ^int, kept for diagnostics of the
+        ``Δ̂ = κ · Δ^int`` shrinkage.
     n_eff : Tensor of shape ``(n_players, n_snapshots, n_opps)``
-        Float32. Sum of recency weights for peer-vs-opponent shots
-        in the causal window. Used both for the shrinkage κ and for
-        ESS-bucket falsification (is the matchup signal concentrated
-        where evidence is strong?).
+        Float32. Sum of recency weights for peer-vs-opponent shots in
+        the causal window. Determines the shrinkage κ and supports
+        stratifying the matchup signal by evidence strength.
     config : MatchupFeaturesConfig
-        The config used to build the features. Carried for hash
+        The config used to build the features, kept for cache-hash
         round-trips and downstream consistency checks.
     """
 
@@ -285,6 +284,7 @@ class MatchupFeatures:
 
     @classmethod
     def load(cls, path: Path) -> MatchupFeatures:
+        """Load features written by :meth:`save`."""
         d = torch.load(path, weights_only=False)
         cfg_dict = d["config"]
         cfg_dict = {**cfg_dict, "anchor_dates": tuple(cfg_dict["anchor_dates"])}
@@ -302,9 +302,7 @@ def _prepare_shots(
     player_vocab: PlayerVocab,
     opp_vocab: OpponentVocab,
 ) -> tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.int64], NDArray[np.int64]]:
-    """Filter ``shots_df`` to in-vocab non-NA shots and return
-    ``(player_idx, opp_idx, date_ord, zone_idx)`` arrays sorted
-    ascending by date.
+    """Return ``(player_idx, opp_idx, date_ord, zone_idx)`` sorted by date.
 
     Only shots whose player AND opponent are both in the respective
     vocabs survive; rows with out-of-court coordinates (zone = -1) are
@@ -380,15 +378,12 @@ def _build_one_snapshot(
     delta_hat_out: NDArray[np.float32],
     n_eff_out: NDArray[np.float32],  # (n_players, n_snaps, n_opps)
 ) -> None:
-    """Fill the ``s_idx`` slice of the output tensors with Δ̂, Δ^int,
-    and N^eff for every (player, opponent) pair at this snapshot.
+    """Fill the ``s_idx`` slice of the outputs with Δ̂, Δ^int, and N^eff.
 
-    Players in the same group share their (group, opp, zone) Δ̂
-    row by construction; the per-player output tensor broadcasts
-    ``Δ̂_group[group(p), d, z]`` back across each member.
-
-    Empty-window snapshots leave the slice at zeros (initialized
-    upstream).
+    Statistics are computed at the (group, opponent, zone) level from
+    shots with ``anchor - window_days <= date < anchor`` and broadcast to
+    each group member as ``Δ̂_group[group(p), d, z]``. Snapshots with an
+    empty window leave the preallocated zeros in place.
     """
     i_hi = int(np.searchsorted(date_ord, anchor, side="left"))
     if i_hi == 0:
@@ -405,10 +400,8 @@ def _build_one_snapshot(
     log2_per_day = float(np.log(2.0)) / config.half_life_days
     w = np.exp(-((anchor - win_date).astype(np.float64)) * log2_per_day)
 
-    # Aggregate shot weights directly at the (group, opp, zone) level —
-    # no intermediate (n_players, n_opps, n_zones) tensor needed. For
-    # each in-window shot, the contributing group is groups_at_snap of
-    # its player.
+    # Aggregate shot weights directly at the (group, opp, zone) level,
+    # avoiding an intermediate (n_players, n_opps, n_zones) tensor.
     win_group = groups_at_snap[win_player]  # (n_win,) in [0, K)
     T_group_flat = np.zeros(K * n_opps * N_ZONES, dtype=np.float64)
     flat_idx = (win_group * n_opps + win_opp) * N_ZONES + win_zone
@@ -425,8 +418,8 @@ def _build_one_snapshot(
     T_z = T_group_z.sum(axis=0)  # (N_ZONES,)
     T_total = float(T_z.sum())
 
-    # Cell probabilities. Safe divide: any all-zero cell gets P = 0,
-    # and we then zero out Δ̂ for the matching N_eff = 0 cells.
+    # Cell probabilities. Safe divide: an all-zero cell gets P = 0, and
+    # Δ̂ is zeroed below for the matching N_eff = 0 cells.
     eps = 1e-12
     P_vs = T_group / np.maximum(T_group_d[:, :, None], eps)  # (K, n_opps, N_ZONES)
     P_base = T_group_z / np.maximum(T_group_total[:, None], eps)  # (K, N_ZONES)
@@ -471,8 +464,10 @@ def build_matchup_features(
     cache_dir: Path | None = None,
     rebuild: bool = False,
 ) -> MatchupFeatures:
-    """Build (or disk-load) per-(group, snapshot, opponent) matchup
-    Δ̂_{k,d,z}(t) features, broadcast back to per-player shape.
+    """Build (or load from cache) matchup features at per-player shape.
+
+    Δ̂_{k,d,z}(t) is computed per (group, snapshot, opponent) and
+    broadcast back to each group member.
 
     Parameters
     ----------
@@ -486,11 +481,14 @@ def build_matchup_features(
         :func:`assign_player_groups`. Indexed positionally into
         ``player_vocab.ids``; values are in ``[0, config.grouping_K)``.
     opp_vocab : OpponentVocab
+        Opponent vocabulary; defines the opponent axis.
     player_vocab : PlayerVocab
+        Player vocabulary; defines the player axis.
     anchor_dates : np.ndarray of shape ``(S,)``
         Snapshot anchor dates in epoch days. Must equal
         ``config.anchor_dates`` (used in the hash).
     config : MatchupFeaturesConfig
+        Build configuration.
     cache_dir : Path or None
         If given, the feature artifact is loaded from
         ``cache_dir/matchup_features_{config.config_hash}.pt`` when
@@ -502,6 +500,14 @@ def build_matchup_features(
     Returns
     -------
     MatchupFeatures
+
+    Raises
+    ------
+    ValueError
+        If ``anchor_dates`` is not 1-D or differs from
+        ``config.anchor_dates``, ``groups`` has the wrong shape or values
+        outside ``[0, config.grouping_K)``, or ``shots_df`` lacks a
+        required column.
     """
     if anchor_dates.ndim != 1:
         raise ValueError(f"anchor_dates must be 1D; got shape {anchor_dates.shape}")

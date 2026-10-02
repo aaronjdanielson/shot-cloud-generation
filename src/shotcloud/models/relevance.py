@@ -1,35 +1,42 @@
-"""Structured relevance score for the context-adaptive KDE.
+"""Relevance scores for context-adaptive KDE over a player's shot history.
 
-Computes per-historical-shot relevance scores ``f_φ(z_j, x_n)`` from the
-27-dim context vector. Paper App.~B calls these "interpretable
-similarity terms" — five named scalars, each acting on a specific
-slice of the context representation:
+A relevance score ``f_φ(z_j, x_n)`` assigns each historical shot ``j``
+(with context ``z_j``) a logit measuring its relevance to the target
+context ``x_n``; a softmax over the history turns the logits into kernel
+weights. Both arguments are the raw 27-dim context :math:`\\tilde x_n`
+of :class:`shotcloud.data.ContextEncoder`, so the named feature slices
+stay interpretable.
 
-============  =================================================  =====================
-parameter      acts on                                            interpretation
-============  =================================================  =====================
-``β_q``        ``period_onehot`` slice (4 dims) — dot product     same-quarter bonus
-``β_m``        ``time_in_period`` (1 dim) — negative absolute Δ    similar-time bonus
-``β_t``        ``season_recency`` (1 dim) — negative absolute Δ    nearby-date bonus
-``β_o``        ``opp_efficiency_onehot`` slice (4 dims) — dot product same-bucket bonus
-``λ_g``        per-shot scalar (NOT in x_n) — exponential decay   recency baseline
-============  =================================================  =====================
+:class:`RelevanceScore` is the structured form: five named scalars, each
+acting on a specific slice of the context vector.
 
-Notes:
+* ``β_q``: dot product of the ``period_onehot`` slices (4 dims), a
+  same-quarter bonus.
+* ``β_m``: negative absolute difference of ``time_in_period`` (1 dim), a
+  similar-time bonus.
+* ``β_t``: negative absolute difference of ``season_recency`` (1 dim), a
+  nearby-date bonus.
+* ``β_o``: dot product of the ``opp_efficiency_onehot`` slices (4 dims),
+  a same-opponent-bucket bonus.
+* ``λ_g``: exponential decay in a per-shot age ``games_ago`` that is not
+  part of the context vector, a recency baseline.
 
-* All five params are stored as **unconstrained reals**. Sign matters
-  (``λ_g`` should be ≥ 0 for the recency interpretation to hold), but
-  the optimizer decides — a positive ``λ_g`` for a player whose oldest
-  shots predict best is a fine empirical signal.
-* ``λ_g`` is the only term that doesn't have a symmetric ``f(z_j, x_n)``
-  shape — it's an absolute "how old is shot j?" prior, not a similarity
-  to ``x_n``. We pass it as a separate ``games_ago`` tensor at forward
-  time. When unavailable, callers pass zeros and ``λ_g`` drifts to 0
-  under weak gradient pressure.
-* Paper App.~B enumerates seven similarity terms (the five above plus
-  ``β_r`` starter-status and ``β_s`` minutes-played). The two extra
-  terms are not implemented; resolving the paper/code mismatch is
-  flagged in ``docs/audit_2026-05-15.md``.
+:class:`RelevanceMLP` is a small MLP with the same interface that can
+represent cross-feature interactions.
+
+Notes
+-----
+* All five scalars are unconstrained reals. ``λ_g ≥ 0`` gives the
+  recency interpretation (older shots down-weighted), but a negative
+  value, which up-weights older shots, is allowed.
+* ``λ_g`` is not a similarity between ``z_j`` and ``x_n`` but an
+  absolute prior on how old shot ``j`` is, so its input is passed
+  separately as ``games_ago``. When ``games_ago`` is omitted the recency
+  term is zero and ``λ_g`` receives no gradient.
+
+Both scorers are used by the deprecated grid-cell priors
+(:class:`~shotcloud.legacy_pivot.adaptive_prior.AdaptiveOffensivePrior`,
+:class:`~shotcloud.legacy_pivot.adaptive_defensive.AdaptiveDefensiveField`).
 """
 
 from __future__ import annotations
@@ -52,7 +59,7 @@ class RelevanceScore(nn.Module):
     ----------
     init_beta_q, init_beta_m, init_beta_t, init_beta_o : float, default 0.0
         Initial values for the four similarity-term scalars. ``0.0``
-        means uniform relevance at step 0 (every shot is equally
+        means uniform relevance at initialization (every shot is equally
         relevant), so the adaptive KDE starts equivalent to a fixed
         uniform-recency Gaussian-kernel density. Any deviation is
         data-driven.
@@ -62,18 +69,16 @@ class RelevanceScore(nn.Module):
         ``λ_g`` downweights older shots. Default 0.0 disables the
         decay until the optimizer engages it.
     beta_max : float or None, default None
-        Anti-overfit bound. When set, the four similarity-scalars
-        ``β_{q,m,t,o}`` are wrapped through ``β_max · tanh(θ / β_max)``
-        so each effective β is bounded in ``(-β_max, β_max)``. The
-        underlying ``nn.Parameter`` (``θ``) remains unconstrained — the
-        wrapping is applied at every forward pass. ``λ_g`` is left
-        unbounded; its semantics (recency decay) is non-symmetric and
-        unbounded magnitude there isn't an overfit risk in the same way.
-        ``None`` (default) preserves the unbounded behavior. Motivation:
-        without the bound, ``β_m`` can run to +3.67 and dominate the
-        relevance softmax. ``β_max = 2.0`` lets the model say "this
-        shot is 7× more relevant" (e^2 ≈ 7.4) but prevents single-
-        feature collapse.
+        Bound that guards against overfitting. When set, the four
+        similarity scalars ``β_{q,m,t,o}`` are passed through
+        ``β_max · tanh(θ / β_max)``, so each effective β lies in
+        ``(-β_max, β_max)``; the underlying ``nn.Parameter`` ``θ`` stays
+        unconstrained. ``λ_g`` is not bounded: as a recency decay it does
+        not carry the same overfitting risk. ``None`` (default) leaves
+        all scalars unbounded. Without a bound a single similarity term
+        can grow large and dominate the relevance softmax; for example,
+        ``β_max = 2.0`` caps each term's effect on a shot's relative
+        weight at a factor of ``e^2 ≈ 7.4``.
     """
 
     def __init__(
@@ -115,8 +120,7 @@ class RelevanceScore(nn.Module):
             self.beta_o = nn.Parameter(_inverse_bounded(init_beta_o, beta_max))
         self.lambda_g = nn.Parameter(torch.tensor(float(init_lambda_g)))
 
-        # Cache slice ranges as (start, stop) ints — Tensor.index_select
-        # is more autograd-friendly than slicing inside forward.
+        # Cache the bounds of the named context slices as plain ints.
         period = FEATURE_LAYOUT["period_onehot"]
         time = FEATURE_LAYOUT["time_in_period"]
         recency = FEATURE_LAYOUT["season_recency"]
@@ -134,18 +138,22 @@ class RelevanceScore(nn.Module):
 
     @property
     def effective_beta_q(self) -> Tensor:
+        """Effective (bounded, if ``beta_max`` is set) ``β_q``."""
         return self._bound(self.beta_q)
 
     @property
     def effective_beta_m(self) -> Tensor:
+        """Effective (bounded, if ``beta_max`` is set) ``β_m``."""
         return self._bound(self.beta_m)
 
     @property
     def effective_beta_t(self) -> Tensor:
+        """Effective (bounded, if ``beta_max`` is set) ``β_t``."""
         return self._bound(self.beta_t)
 
     @property
     def effective_beta_o(self) -> Tensor:
+        """Effective (bounded, if ``beta_max`` is set) ``β_o``."""
         return self._bound(self.beta_o)
 
     def forward(
@@ -162,7 +170,7 @@ class RelevanceScore(nn.Module):
         z_j : Tensor, shape ``(B, max_N, CONTEXT_DIM)``
             Per-historical-shot context, padded along the second axis.
         x_n : Tensor, shape ``(B, CONTEXT_DIM)``
-            Per-target-shot context.
+            Per-target-shot raw context :math:`\\tilde x_n`.
         games_ago : Tensor, shape ``(B, max_N)``, optional
             Per-historical-shot recency (in games or days; the unit is
             absorbed by ``λ_g``). When ``None``, the recency term is
@@ -176,7 +184,8 @@ class RelevanceScore(nn.Module):
 
         Returns
         -------
-        Tensor of shape ``(B, max_N)`` — per-shot pre-softmax logits.
+        Tensor of shape ``(B, max_N)``
+            Per-shot pre-softmax logits.
         """
         if z_j.dim() != 3 or x_n.dim() != 2:
             raise ValueError(
@@ -220,7 +229,7 @@ class RelevanceScore(nn.Module):
                 raise ValueError(
                     f"mask shape {tuple(mask.shape)} != logits shape {tuple(logits.shape)}"
                 )
-            # Set padded positions to a very negative number so softmax → 0.
+            # -inf on padded positions so the softmax gives them zero weight.
             logits = logits.masked_fill(mask < 0.5, float("-inf"))
 
         return logits
@@ -237,11 +246,10 @@ class RelevanceScore(nn.Module):
         return torch.softmax(logits, dim=-1)
 
     def params_as_floats(self) -> dict[str, float]:
-        """Detached float view of the five effective params, useful for logging.
+        """Detached float view of the five effective parameters, for logging.
 
-        With ``beta_max`` set, returns the *bounded* β values (the ones
-        actually entering the logits), not the raw underlying θ. This is
-        what's interpretable for the paper / per-epoch printout.
+        With ``beta_max`` set, the bounded β values that enter the logits
+        are returned, not the raw underlying θ.
         """
         with torch.no_grad():
             return {
@@ -264,18 +272,15 @@ class RelevanceScore(nn.Module):
 class RelevanceMLP(nn.Module):
     """MLP-based ``f_φ(z_j, x_n)`` returning per-history-shot logits.
 
-    Drop-in replacement for :class:`RelevanceScore`. Same forward and
-    :meth:`softmax` shape contract — callers (notably
-    :class:`AdaptiveOffensivePrior` and :class:`AdaptiveDefensiveField`)
-    don't need to branch on type.
+    Interchangeable with :class:`RelevanceScore`: the ``forward`` and
+    :meth:`softmax` signatures and shapes are the same, so callers need
+    not branch on type.
 
-    Architectural motivation. The structured 5-scalar form is a sum
-    of per-feature similarity terms; it cannot represent any cross-
-    feature interaction (quarter × starter, period × position, etc.).
-    Empirically that's a hard ceiling — the optimizer collapses onto
-    whichever single feature has the strongest marginal signal (see
-    the v1 G1-D diagnostic, 2026-05-15 working-log entry). The MLP
-    can represent arbitrary smooth functions of the joint
+    The structured five-scalar form is a sum of per-feature similarity
+    terms and cannot represent cross-feature interactions (quarter ×
+    starter, period × position, ...), which leaves the optimizer to
+    concentrate on whichever single feature has the strongest marginal
+    signal. The MLP can represent smooth functions of the joint
     ``(z_j, x_n, games_ago)`` input.
 
     Parameters
@@ -285,9 +290,8 @@ class RelevanceMLP(nn.Module):
         :data:`shotcloud.data.context.CONTEXT_DIM`. Both query and
         history use this dimension.
     hidden_dim : int, default 64
-        Hidden width of the single-hidden-layer MLP. ~3.6K params
-        total at the default config; trivial relative to dataset
-        size (1.86M shots).
+        Hidden width of the single-hidden-layer MLP (about 3.6K
+        parameters at the defaults).
     """
 
     def __init__(self, context_dim: int = 27, hidden_dim: int = 64) -> None:
@@ -303,12 +307,11 @@ class RelevanceMLP(nn.Module):
         in_dim = 2 * context_dim + 1
         self.fc1 = nn.Linear(in_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, 1)
-        # Zero-init the output layer so step-0 logits are exactly zero
-        # for every (z_j, x_n) pair → softmax is uniform → π matches
-        # what RelevanceScore() produces at its all-zeros default. This
-        # preserves the AdaptiveOffensivePrior warm-up contract: at
-        # init, the relevance term is a uniform average over historical
-        # shots, and q_self reduces to a fixed-kernel KDE.
+        # Zero-init the output layer so the initial logits are exactly zero
+        # for every (z_j, x_n) pair and the softmax is uniform, matching
+        # RelevanceScore at its all-zero default: at initialization the
+        # self-KDE is a uniform average over historical shots, i.e. a
+        # fixed-kernel KDE.
         nn.init.zeros_(self.fc2.weight)
         nn.init.zeros_(self.fc2.bias)
 
@@ -324,9 +327,9 @@ class RelevanceMLP(nn.Module):
         Parameters
         ----------
         z_j : Tensor, shape ``(B, max_N, context_dim)``
+            Per-historical-shot context, padded along the second axis.
         x_n : Tensor, shape ``(B, context_dim)``
-            Raw context :math:`\\tilde x_n` — same convention as
-            :class:`RelevanceScore` post the 2026-05-15 fix.
+            Raw context :math:`\\tilde x_n`, as for :class:`RelevanceScore`.
         games_ago : Tensor, shape ``(B, max_N)``, optional
             Per-shot recency feature. When ``None``, substituted with
             zeros so the MLP sees a consistent input dimension.
@@ -337,7 +340,8 @@ class RelevanceMLP(nn.Module):
 
         Returns
         -------
-        Tensor of shape ``(B, max_N)`` of pre-softmax logits.
+        Tensor of shape ``(B, max_N)``
+            Per-shot pre-softmax logits.
         """
         if z_j.dim() != 3 or x_n.dim() != 2:
             raise ValueError(
@@ -386,10 +390,8 @@ class RelevanceMLP(nn.Module):
     def params_as_floats(self) -> dict[str, float]:
         """Summary statistics over MLP parameters, for per-epoch logging.
 
-        Returns mean and L2 norm of each layer's weights so the
-        trainer's progress line and the diagnostic script can report
-        meaningful numbers in place of the structured form's named
-        scalars.
+        Returns the L2 norm of each layer's weight and bias, reported in
+        place of the structured form's named scalars.
         """
         with torch.no_grad():
             return {

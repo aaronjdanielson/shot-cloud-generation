@@ -1,4 +1,8 @@
-"""Adaptive defensive field — opponent-conditioned spatial reweighting (paper §3.4).
+"""Adaptive defensive field — opponent-conditioned spatial reweighting on the grid.
+
+Deprecated; retained to reproduce the grid-cell decoder ablations. Superseded
+by the zone-level opponent reweighting in
+:mod:`shotcloud.models.zone_defense_reweighting`.
 
 This module is the per-opponent analog of
 :class:`shotcloud.legacy_pivot.adaptive_prior.AdaptiveOffensivePrior`. For
@@ -14,7 +18,7 @@ the opponent-conditioned reweighting field
 where :math:`\\mathcal D_d^{<t}` is the causal pool of shots taken
 *against* opponent :math:`d` strictly before snapshot anchor :math:`t`,
 and :math:`\\omega_{\\delta,j}(x_n)` are relevance weights produced by a
-structured :class:`~shotcloud.models.RelevanceScore`. The field is a
+structured :class:`~shotcloud.models.relevance.RelevanceScore`. The field is a
 simplex over cells (the weights sum to 1 by construction); the Gibbs
 decoder consumes :math:`\\log a_\\delta(c)` as a log-additive term
 in its energy
@@ -43,11 +47,10 @@ Three structural differences from :class:`AdaptiveOffensivePrior`:
    ``player_id`` argument is the grouping key, semantically
    "opponent" in this use.
 
-Causal date masking follows the same Proposition-1 contract as the
-offensive prior: each forward call masks history slots whose date
-is :math:`\\geq` the per-row anchor date pulled from the
-SnapshotStore. Rows with no causal history fall back to uniform
-feasibility (``log a_δ(c) = -log C``).
+Causal date masking follows the same contract as the offensive prior:
+each forward call masks history slots whose date is :math:`\\geq` the
+per-row anchor date pulled from the SnapshotStore. Rows with no causal
+history fall back to uniform feasibility (``log a_δ(c) = -log C``).
 """
 
 from __future__ import annotations
@@ -68,7 +71,7 @@ if TYPE_CHECKING:
 
 
 class AdaptiveDefensiveField(nn.Module):
-    """Per-opponent context-adaptive spatial reweighting field (paper §3.4).
+    """Per-opponent context-adaptive spatial reweighting field.
 
     Parameters
     ----------
@@ -79,7 +82,7 @@ class AdaptiveDefensiveField(nn.Module):
         mask. The kernel matrix ``M`` from this fit is reused as a
         non-trainable buffer.
     snapshot_store : SnapshotStore
-        Causal feature registry (paper §2.5). The constructor reads
+        Causal feature registry. The constructor reads
         anchor dates into a ``(T,)`` int64 buffer; the forward maps
         a per-row ``snapshot_idx`` into that buffer to supply the
         causal cutoff.
@@ -307,9 +310,8 @@ class AdaptiveDefensiveField(nn.Module):
         # function, so the row contributes zero to the energy.
         uniform = torch.full_like(field, 1.0 / self.n_cells)
         a_delta = torch.where(has_history.unsqueeze(-1), field, uniform)
-        # Additive smoothing instead of clamp_min, parallel to the
-        # offensive prior's Decision-1 fix (2026-05-16). Keeps gradient
-        # flowing for under-supported cells. Renormalize so the field
+        # Additive smoothing instead of clamp_min, as in the offensive
+        # prior, keeps gradient flowing for under-supported cells. Renormalize so the field
         # remains a proper probability — the constant offset slides
         # through the Gibbs partition function untouched. The
         # ``clamp_min(0)`` removes tiny negative SVD-reconstruction

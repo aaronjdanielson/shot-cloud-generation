@@ -1,33 +1,25 @@
 """Causal per-player historical shot-time distribution.
 
-For each shot in a dataset, build a 48-bin normalized histogram of
-the *player's* shot-times across all of their **strictly prior**
-games. The featurizer is causal at game granularity: a shot taken
-in game G on date D consumes only shots from strictly-earlier-date
-games (no same-game leak, no same-day leak).
+For each shot, builds a 48-bin normalized histogram of the times (one
+bin per game minute) at which the player shot in **strictly prior**
+games. The featurizer is causal at game granularity: a shot on date
+``D`` uses only shots from dates strictly before ``D``, so neither the
+shot's own game nor any same-day shot contributes.
 
-This addresses the limitation documented in paper §5.2 (Phase 3.2
-timing audit): the standard 27-dim pregame ``x_n`` lacks a
-per-player historical on-court-by-minute distribution feature. The
-trained timing head, given only ``x_n``'s starter/minutes/role
-slots, beats the minutes-conditioned baseline by only $0.056$ nats
-per shot. With this 48-dim per-player historical feature appended
-to ``x_n``, the timing head sees the direct signal — what game-minute
-ranges this player typically takes shots in — and can produce a
-per-shot timing distribution far sharper than what starter/minutes
-quartile baselines provide.
+The 27-dimensional context vector ``x_n`` carries starter status,
+minutes, and role, but not *when* in a game the player tends to shoot.
+Appended to ``x_n``, this feature gives the timing head that signal
+directly.
 
-The featurizer's signature matches
+The signature follows
 :func:`shotcloud.data.within_game_history.compute_within_game_features`
-and :func:`shotcloud.data.prior_outcomes.compute_prior_outcome_features`
-for caller-side consistency: takes a shots DataFrame, returns a
-``(n_shots, TIMING_HISTORY_DIM)`` numpy array aligned to the input
-row order.
+and :func:`shotcloud.data.prior_outcomes.compute_prior_outcome_features`:
+a shots DataFrame in, a ``(n_shots, TIMING_HISTORY_DIM)`` array in input
+row order out.
 
-Cold-start players (no prior games) get the all-zero feature plus the
-Laplace +1 smoothing in the histogram. Players with very few prior
-shots get a near-uniform smoothed distribution — the timing head
-will see "no information" and fall back on the pregame slots.
+With the default Laplace smoothing, players with no prior games get the
+uniform distribution and players with few prior shots a near-uniform
+one, which carries little information beyond the other context slots.
 """
 
 from __future__ import annotations
@@ -40,8 +32,8 @@ from numpy.typing import NDArray
 
 from shotcloud.training.gibbs_dataset import N_TIMING_BINS, _compute_tau_bin
 
-#: Number of historical-timing feature slots; identical to the
-#: timing-head's bin count (paper §5.2).
+#: Number of historical-timing feature slots; equal to the timing
+#: head's bin count.
 TIMING_HISTORY_DIM: Final[int] = N_TIMING_BINS  # 48
 
 
@@ -50,7 +42,7 @@ def compute_player_timing_history_features(
     *,
     smoothing: float = 1.0,
 ) -> NDArray[np.float32]:
-    """Per-shot causal historical shot-time distribution.
+    """Compute the per-shot causal historical shot-time distribution.
 
     Parameters
     ----------
@@ -61,15 +53,21 @@ def compute_player_timing_history_features(
         :func:`shotcloud.data.loaders.load_shots`).
     smoothing : float, default 1.0
         Laplace smoothing constant added to each bin's count before
-        normalization. Cold-start players get a uniform $1/48$
-        distribution.
+        normalization. With a positive value, players without prior
+        games get the uniform $1/48$ distribution; with 0, they get an
+        all-zero vector.
 
     Returns
     -------
     NDArray of shape ``(n_shots, TIMING_HISTORY_DIM)`` float32
-        Per-shot feature vector aligned to ``shots_df.index`` order.
-        Row $i$ is the player's normalized histogram of tau_bin over
-        their shots from strictly-earlier-date games.
+        Per-shot feature vectors in the input row order. Row $i$ is
+        the player's normalized histogram of ``tau_bin`` over their
+        shots from strictly earlier dates.
+
+    Raises
+    ------
+    KeyError
+        If a required column is missing.
     """
     required = ("player_id", "date", "period", "time_remaining_sec")
     for col in required:
@@ -103,9 +101,9 @@ def compute_player_timing_history_features(
     for _, g in work_sorted.groupby("player_id", sort=False):
         # Per-game-date histograms for this player.
         dates = g["date"].to_numpy()
-        # Treat ties at the day-level — shots on the same day are
-        # treated as the same game for the strict-prior cutoff so
-        # within-game shots cannot leak into each other's histories.
+        # Shots on the same day count as the same game for the
+        # strict-prior cutoff, so within-game shots never enter each
+        # other's histories.
         dates_day = dates.astype("datetime64[D]")
         taus = g["_tau_bin"].to_numpy(dtype=np.int64)
         rows = g["_row"].to_numpy(dtype=np.int64)

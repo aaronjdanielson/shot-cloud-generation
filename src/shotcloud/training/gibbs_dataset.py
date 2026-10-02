@@ -1,31 +1,41 @@
-"""Dataset for joint Gibbs training of the marked point-process model.
+"""Per-shot dataset for joint training of the marked point-process model.
 
-:class:`GibbsShotDataset` materializes the per-shot tensors that the
-joint trainer consumes:
+:class:`GibbsShotDataset` materializes, for every in-court shot, the
+tensors consumed by :func:`~shotcloud.training.train_gibbs`:
 
-* ``player_idx`` into :class:`~shotcloud.training.PlayerVocab`,
-* ``opp_idx`` into :class:`~shotcloud.training.OpponentVocab`,
-* ``snapshot_idx`` from
-  :meth:`SnapshotStore.get_snapshot_index(date)` — required by
-  :class:`~shotcloud.models.AdaptiveOffensivePrior` and
-  :class:`~shotcloud.models.AdaptiveDefensiveField` for their causal
-  date masks,
-* ``cell_idx`` — the observed court cell,
-* ``tau_bin`` — minute bin in ``[0, 48)`` (regulation; OT folded into
-  the final bin) consumed by
-  :class:`~shotcloud.models.TimingSoftmaxHead`,
-* ``x_n_raw`` of shape ``(CONTEXT_DIM,)`` — the canonical context
-  vector that :class:`~shotcloud.models.ContextMLP` will transform
-  into ``x_n`` inside the trainer,
-* ``game_id`` index into the dataset's per-game table.
+* ``player_idx`` -- index into :class:`~shotcloud.training.PlayerVocab`;
+* ``opp_idx`` -- index into :class:`~shotcloud.training.OpponentVocab`
+  (zero when no opponent vocabulary is given);
+* ``snapshot_idx`` -- index of the latest
+  :class:`~shotcloud.data.snapshots.SnapshotStore` anchor on or before
+  the shot's date, which selects the causal snapshot data used by the
+  support backend and the defensive features;
+* ``cell_idx`` -- the observed court cell (used by the grid-cell losses);
+* ``tau_bin`` -- game-minute bin in ``[0, 48)`` with overtime folded into
+  the final bin, the target of
+  :class:`~shotcloud.models.TimingSoftmaxHead`;
+* ``x_n_raw`` -- the raw pregame context vector of length ``CONTEXT_DIM``,
+  mapped to ``x_n`` by :class:`~shotcloud.models.ContextMLP` inside the
+  trainer;
+* ``game_idx`` -- index into the per-game table;
+* ``shot_xy`` -- the exact shot coordinates in feet;
+* ``h_within_game`` -- causal summary of the player's earlier shots in
+  the same game;
+* ``prior_outcome`` -- causal summary of the outcomes of those earlier
+  shots (optionally extended by a prior-shot KDE feature);
+* ``prior_seq``, ``prior_lengths`` -- the padded sequence of earlier
+  same-game shots and its length, for an optional within-game recurrent
+  encoder.
 
-A parallel :attr:`per_game` table maps ``game_id`` to
-``(x_n_raw_game, K_obs)`` for the negative-binomial count loss. The
-count loss is computed once per game, not once per shot.
+A parallel :attr:`GibbsShotDataset.per_game` table holds the pregame
+context and observed shot count ``K_obs`` of every player-game, so the
+negative-binomial count loss is evaluated once per game rather than once
+per shot.
 
-The dataset does not own any KDEs or models; it only routes
-indices and features. The trainer composes the spatial / count /
-timing modules and consumes these tensors.
+The dataset owns no models; it only computes indices and features. All
+features use information available before the shot: snapshot data from
+earlier games, and within-game features from earlier shots of the same
+game.
 """
 
 from __future__ import annotations
@@ -59,21 +69,18 @@ N_TIMING_BINS: int = 48
 def _compute_tau_bin(
     period: NDArray[np.int64], time_remaining_sec: NDArray[np.float64]
 ) -> NDArray[np.int64]:
-    """Map shot timing → tau_bin in [0, 48).
+    """Map shot timing to a game-minute bin in ``[0, 48)``.
 
-    The loader's ``time_remaining_sec`` column is, despite its name,
-    the **total seconds elapsed in the game** (built from
-    ``MINUTES_REMAINING`` + ``SECONDS_REMAINING`` + ``PERIOD``; see
+    The loader's ``time_remaining_sec`` column holds, despite its name,
+    the total seconds elapsed in the game (derived from ``PERIOD``,
+    ``MINUTES_REMAINING`` and ``SECONDS_REMAINING``; see
     :func:`shotcloud.data.loaders.load_shots`). The bin index is
-    therefore ``floor(time_remaining_sec / 60)``, clipped to
-    ``[0, 47]`` so overtime shots (game minute > 47) fold into the
-    final bin.
+    ``floor(time_remaining_sec / 60)`` clipped to ``[0, 47]``, so
+    overtime shots fold into the final bin.
 
-    The ``period`` argument is unused (it's implicit in the elapsed
-    seconds) but kept in the signature for caller-side legibility
-    and forward compatibility if the schema is ever renamed.
+    ``period`` is unused, since it is implied by the elapsed seconds.
     """
-    del period  # see docstring
+    del period  # implied by the elapsed seconds
     bin_idx = np.floor(time_remaining_sec / 60.0).astype(np.int64)
     clipped: NDArray[np.int64] = np.clip(bin_idx, 0, N_TIMING_BINS - 1).astype(np.int64)
     return clipped
@@ -83,8 +90,8 @@ def _compute_tau_bin(
 class PerGameTable:
     """Per-game targets and context for the count factor.
 
-    Aligned across ``game_id``: row ``i`` corresponds to the game with
-    integer id ``i`` (assigned by :class:`GibbsShotDataset`).
+    Row ``i`` is the player-game with ``game_idx == i`` as assigned by
+    :class:`GibbsShotDataset`.
     """
 
     x_n_raw: Tensor  # (n_games, CONTEXT_DIM)
@@ -94,7 +101,7 @@ class PerGameTable:
 #: Per-shot batch tuple emitted by :class:`GibbsShotDataset.__getitem__`:
 #: ``(player_idx, opp_idx, snapshot_idx, cell_idx, tau_bin, x_n_raw,
 #: game_idx, shot_xy, h_within_game, prior_outcome, prior_seq,
-#: prior_lengths)`` — 12 per-shot tensors.
+#: prior_lengths)``.
 _BatchTuple = tuple[
     Tensor,
     Tensor,
@@ -112,32 +119,63 @@ _BatchTuple = tuple[
 
 
 class GibbsShotDataset(Dataset[_BatchTuple]):
-    """Per-shot training examples for joint Gibbs training.
+    """Per-shot training examples for :func:`~shotcloud.training.train_gibbs`.
+
+    Shots are dropped when the player (or, with ``opp_vocab``, the
+    opponent) is not in the vocabulary, when the coordinates fall off the
+    grid, or when the shot's date precedes the first snapshot anchor (no
+    causal snapshot exists for it). Each item is the tuple of per-shot
+    tensors described in the module docstring.
 
     Parameters
     ----------
     shots_df : DataFrame
         Canonical-schema shot rows with at least ``x``, ``y``,
-        ``player_id``, ``date``, ``opponent``, ``period``,
-        ``time_remaining_sec``, ``game_id``.
+        ``player_id``, ``date``, ``period``, ``time_remaining_sec`` and
+        ``game_id``, plus ``opponent`` when ``opp_vocab`` is given and the
+        columns ``context_encoder`` requires. An optional ``made`` column
+        enables the prior-outcome features; without it they are zero.
     snapshot_store : SnapshotStore
-        Frozen causal store. Provides
-        :meth:`get_snapshot_index(date)` for every shot.
+        Causal snapshot store whose ``anchor_dates`` define
+        ``snapshot_idx``.
     grid : CourtGrid
-        Discretization shared with the snapshot bundles.
+        Court discretization used for ``cell_idx`` and the on-court filter.
     player_vocab : PlayerVocab
-        Players covered by the offensive prior; shots whose player
-        is not in the vocab are dropped.
+        Players covered by the model.
     opp_vocab : OpponentVocab or None
-        Required when the trainer will consume the defensive field;
-        when ``None`` the dataset emits sentinel zeros for
-        ``opp_idx``. The downstream :class:`ConditionalGibbsDecoder`
-        is offense-only-safe in this mode if its defensive field is
-        configured to return uniform feasibility.
+        Required by opponent-conditioned components. When ``None``,
+        ``opp_idx`` is all zeros.
     context_encoder : ContextEncoder
-        Transforms the shots frame to the canonical 27-D context
-        vector. Required (no sentinel mode).
+        Fitted encoder mapping the shot rows to ``(n, CONTEXT_DIM)``
+        context vectors.
     dtype : torch.dtype, default ``torch.float32``
+        Floating dtype of the feature tensors.
+    with_spatial_hawkes_residual : bool, default False
+        Append the causal prior-shot KDE feature
+        (:func:`~shotcloud.data.prior_shot_kde.compute_prior_shot_kde_features`)
+        to ``prior_outcome``, widening it from ``PRIOR_OUTCOME_DIM`` to
+        ``PRIOR_OUTCOME_DIM + PRIOR_SHOT_KDE_DIM``.
+    spatial_hawkes_sigma_ft : float, default 4.0
+        Kernel bandwidth in feet of the prior-shot KDE feature.
+
+    Attributes
+    ----------
+    per_game : PerGameTable
+        Pregame context and observed shot count per player-game.
+    outcome_feature_dim : int
+        Width of ``prior_outcome``, for sizing the residual encoder's
+        outcome branch.
+    per_shot_meta : DataFrame
+        ``player_id``, ``date`` and (when present) ``starter`` of the
+        retained shots, in dataset row order.
+
+    Raises
+    ------
+    KeyError
+        If a required column is missing.
+    ValueError
+        If no shots survive filtering or a feature builder returns an
+        unexpected shape.
     """
 
     def __init__(
@@ -173,18 +211,15 @@ class GibbsShotDataset(Dataset[_BatchTuple]):
         valid = cells >= 0
         df = df.loc[valid].reset_index(drop=True)
         cells = cells[valid].astype(np.int64)
-        # Exact continuous shot coords parallel to the cell index. Kept
-        # as float32 — the continuous-coordinate spatial loss uses these
-        # directly (not the cell-center snap) so geometric distance to
-        # the predicted distribution is preserved.
+        # Exact shot coordinates, parallel to the cell index. The
+        # continuous spatial losses evaluate these directly rather than
+        # the cell centers, so sub-cell geometry is preserved.
         shot_xy_np = np.stack([x_coord[valid], y_coord[valid]], axis=1, dtype=np.float32)
         if len(df) == 0:
             raise ValueError("no in-court shots remained after filtering")
 
-        # Compute per-shot snapshot_idx in one searchsorted call. Shots
-        # whose date precedes the first anchor (searchsorted returns 0,
-        # decremented to -1) have no valid bundle; drop them to keep
-        # the causal contract intact.
+        # Latest anchor on or before each shot's date. Shots before the
+        # first anchor (index -1) have no causal snapshot and are dropped.
         dates = np.asarray(df["date"], dtype="datetime64[D]")
         anchor_dates = snapshot_store.anchor_dates
         snap_idx_np = np.searchsorted(anchor_dates, dates, side="right").astype(np.int64) - 1
@@ -215,10 +250,9 @@ class GibbsShotDataset(Dataset[_BatchTuple]):
                 f"({len(df)}, {CONTEXT_DIM})"
             )
 
-        # Within-game causal shot-history features h_{n,r}. The
-        # featurizer is causal by construction; built on the
-        # post-filter DataFrame so the row order is aligned with
-        # cells / ctx / shot_xy.
+        # Within-game shot-history features h_{n,r}, built from earlier
+        # shots of the same game on the filtered frame so rows align
+        # with cells / ctx / shot_xy.
         h_within_game_np = compute_within_game_features(df)
         if h_within_game_np.shape != (len(df), WITHIN_GAME_DIM):
             raise ValueError(
@@ -226,21 +260,17 @@ class GibbsShotDataset(Dataset[_BatchTuple]):
                 f"expected ({len(df)}, {WITHIN_GAME_DIM})"
             )
 
-        # Causal prior-outcome summary o_{n,r} (Phase 2 of the
-        # 2026-06-07 audit). Computed when the input carries a
-        # ``made`` column; zero-filled otherwise so the residual
-        # encoder can be wired with ``outcome_dim > 0`` without
-        # forcing every caller to supply outcomes.
+        # Causal prior-outcome summary o_{n,r}. Zero-filled when there is
+        # no ``made`` column, so a residual encoder with
+        # ``outcome_dim > 0`` can be used without outcome data.
         if "made" in df.columns:
             prior_outcome_np = compute_prior_outcome_features(df)
         else:
             prior_outcome_np = np.zeros((len(df), PRIOR_OUTCOME_DIM), dtype=np.float32)
 
-        # Phase 1 B1 (2026-06-09): when the spatial-Hawkes flag is
-        # set, append the 8-dim causal prior-shot KDE feature to
-        # ``o_{n,r}``. The residual encoder's ``outcome_dim`` then
-        # bumps from 9 to 17; the zero-init projection invariant
-        # carries through unchanged.
+        # Optionally append the causal prior-shot KDE feature to o_{n,r};
+        # the residual encoder's ``outcome_dim`` must then be
+        # PRIOR_OUTCOME_DIM + PRIOR_SHOT_KDE_DIM.
         if with_spatial_hawkes_residual:
             from shotcloud.data.prior_shot_kde import (
                 PRIOR_SHOT_KDE_DIM,
@@ -266,11 +296,9 @@ class GibbsShotDataset(Dataset[_BatchTuple]):
                 f"{prior_outcome_np.shape}; expected ({len(df)}, {expected_outcome_dim})"
             )
 
-        # G1 within-game shot sequence (paper §10). Computed lazily here
-        # so the per-shot prior-sequence tensor + per-shot length are
-        # available to the trainer whether or not the G1 GRU is wired;
-        # the per-row memory is bounded by MAX_PRIOR_SHOTS and the
-        # tensors are zero-shaped when the dataset is empty.
+        # Padded sequence of earlier same-game shots for the optional
+        # within-game recurrent encoder. Always built, so the batch tuple
+        # has a fixed layout; per-row memory is bounded by MAX_PRIOR_SHOTS.
         prior_seq_np, prior_lengths_np = compute_within_game_sequence(df)
         expected_seq_shape = (len(df), MAX_PRIOR_SHOTS, WITHIN_GAME_SEQ_DIM)
         if prior_seq_np.shape != expected_seq_shape:
@@ -284,32 +312,24 @@ class GibbsShotDataset(Dataset[_BatchTuple]):
                 f"expected ({len(df)},)"
             )
 
-        # Per-game integer index. Each game is associated with one
-        # (player_id, game_id) pair — a player taking shots in different
-        # games has a different count target per game. pd.factorize
-        # over the combined string key assigns 0..n_games-1 in order
-        # of first appearance, identical to the previous dict-build loop.
+        # Per-game integer index over (player_id, game_id) pairs, so each
+        # player-game has its own count target. pd.factorize assigns
+        # 0..n_games-1 in order of first appearance.
         #
-        # CRITICAL: the separator must not be a null byte. In pandas 3.x,
-        # ``pd.factorize`` on a numpy object array containing null bytes
-        # uses a C-string hash that truncates at the null, collapsing
-        # every game of a given player into a single ``game_idx`` —
-        # verified 2026-06-08 on pandas 3.0.2 / numpy 2.4.4. Using ``|``
-        # as the separator is safe because neither ``player_id`` nor
-        # ``game_id`` ever contains it. See
-        # ``tests/test_training_gibbs_dataset_factorize.py`` for the
-        # regression check.
+        # The key separator must not be a null byte: pandas 3.x factorizes
+        # object arrays with a C-string hash that truncates at the null,
+        # which would merge all games of a player into one index. ``|``
+        # never occurs in player or game IDs.
         game_keys = (df["player_id"].astype(str) + "|" + df["game_id"].astype(str)).to_numpy()
         game_id_np, _ = pd.factorize(game_keys, sort=False)
         game_id_np = game_id_np.astype(np.int64)
         n_games = int(game_id_np.max()) + 1
         k_obs_np = np.bincount(game_id_np, minlength=n_games).astype(np.int64)
 
-        # Per-game x_n: take the context of the game's first shot —
-        # all shots within a player-game share the same x_n by
-        # construction (pregame state is per-player-game). Stable
-        # argsort by game_idx; the first occurrence of each game is
-        # marked by a change in the sorted key.
+        # Per-game pregame context: the context of the game's first shot.
+        # The count head consumes only this pregame representative (the
+        # count loss is per game). The first occurrence of each game is
+        # where the stably sorted key changes.
         order = np.argsort(game_id_np, kind="stable")
         sorted_games = game_id_np[order]
         first_in_sorted = np.empty(n_games, dtype=np.int64)
@@ -332,10 +352,8 @@ class GibbsShotDataset(Dataset[_BatchTuple]):
         self.shot_xy: Tensor = torch.from_numpy(shot_xy_np).to(dtype=dtype)
         self.h_within_game: Tensor = torch.from_numpy(h_within_game_np).to(dtype=dtype)
         self.prior_outcome: Tensor = torch.from_numpy(prior_outcome_np).to(dtype=dtype)
-        # Exposes the realized outcome-feature dim so callers building a
-        # model can size the residual encoder's outcome branch directly.
-        # PRIOR_OUTCOME_DIM (=9) when no spatial-Hawkes flag is set;
-        # PRIOR_OUTCOME_DIM + PRIOR_SHOT_KDE_DIM (=17) when on.
+        # PRIOR_OUTCOME_DIM, plus PRIOR_SHOT_KDE_DIM with the spatial-Hawkes
+        # feature.
         self.outcome_feature_dim: int = int(prior_outcome_np.shape[-1])
         self.with_spatial_hawkes_residual: bool = bool(with_spatial_hawkes_residual)
         self.spatial_hawkes_sigma_ft: float = float(spatial_hawkes_sigma_ft)
@@ -345,11 +363,9 @@ class GibbsShotDataset(Dataset[_BatchTuple]):
             x_n_raw=torch.from_numpy(x_n_raw_game).to(dtype=dtype),
             k_obs=torch.from_numpy(k_obs_np),
         )
-        # Post-filter per-shot metadata. The dataset's filtering chain
-        # (vocab membership, in-court coordinates, snapshot validity) is
-        # opaque to external callers; this small DataFrame lets the
-        # presence/timing pipeline align on (player_id, date, starter)
-        # exactly to the dataset's row order without replicating filters.
+        # Per-shot metadata in dataset row order, so callers can align
+        # external tables on (player_id, date, starter) without
+        # replicating the filters above.
         meta_cols = ["player_id", "date"]
         if "starter" in df.columns:
             meta_cols.append("starter")
@@ -357,14 +373,17 @@ class GibbsShotDataset(Dataset[_BatchTuple]):
 
     @property
     def n_shots(self) -> int:
+        """Number of shots in the dataset."""
         return int(self.cell_idx.shape[0])
 
     @property
     def n_games(self) -> int:
+        """Number of player-games in the per-game table."""
         return int(self.per_game.k_obs.shape[0])
 
     @property
     def has_opponents(self) -> bool:
+        """Whether an opponent vocabulary was given (``opp_idx`` is meaningful)."""
         return self.opp_vocab is not None
 
     def __len__(self) -> int:
@@ -387,18 +406,29 @@ class GibbsShotDataset(Dataset[_BatchTuple]):
         )
 
     def subset(self, n_shots: int, *, seed: int = 0) -> GibbsShotDataset:
-        """Return a deterministic-random sub-dataset of ``n_shots`` rows.
+        """Return a random sub-dataset of ``n_shots`` rows, seeded by ``seed``.
 
-        For the fast validation ladder: train a small subset to test
-        learning signal before committing compute to a full epoch.
+        Useful for quick training runs on a fraction of the data. The
+        per-game table is rebuilt from the sampled rows, so ``k_obs``
+        counts only the sampled shots of each game.
 
-        The per-game table is **re-derived** for the sampled rows
-        because the count loss is amortized over per-game shot counts,
-        and the original ``per_game.k_obs`` would over-count for any
-        partially-sampled game.
+        Parameters
+        ----------
+        n_shots : int
+            Number of shots to keep; must be positive. Values at or above
+            :attr:`n_shots` return ``self`` unchanged.
+        seed : int, default 0
+            Seed of the sampling generator.
 
-        ``n_shots >= self.n_shots`` returns ``self`` unchanged (cheap
-        no-op).
+        Returns
+        -------
+        GibbsShotDataset
+            The subset, sharing vocabularies and snapshot store with
+            ``self``.
+
+        Notes
+        -----
+        The subset does not carry :attr:`per_shot_meta`.
         """
         if n_shots <= 0:
             raise ValueError(f"n_shots must be > 0; got {n_shots}")
@@ -409,8 +439,7 @@ class GibbsShotDataset(Dataset[_BatchTuple]):
         keep = np.sort(rng.choice(self.n_shots, size=n_shots, replace=False)).astype(np.int64)
         keep_t = torch.from_numpy(keep)
 
-        # Build a shallow copy by bypassing __init__ — the source
-        # tensors are already validated.
+        # Bypass __init__: the source tensors are already validated.
         out = object.__new__(type(self))
         out.player_vocab = self.player_vocab
         out.opp_vocab = self.opp_vocab
@@ -430,17 +459,13 @@ class GibbsShotDataset(Dataset[_BatchTuple]):
         out.prior_seq = self.prior_seq[keep_t]
         out.prior_lengths = self.prior_lengths[keep_t]
 
-        # Re-derive game_idx + per_game table over the sampled rows.
-        # ``torch.unique(return_inverse=True)`` collapses original
-        # game ids to contiguous [0..n_kept_games) and gives the
-        # remapped per-shot idx in one shot.
+        # Remap the kept games to contiguous indices [0, n_kept_games).
         orig_game = self.game_idx[keep_t]
         kept_game_ids, remapped_game = torch.unique(orig_game, return_inverse=True)
         out.game_idx = remapped_game.to(torch.int64)
         n_kept_games = int(kept_game_ids.shape[0])
 
-        # Per-game x_n_raw: first shot of each game in the sampled
-        # rows. argsort by game id + take first occurrence per group.
+        # Per-game context: first sampled shot of each game.
         order = torch.argsort(out.game_idx, stable=True)
         sorted_games = out.game_idx[order]
         first_in_sorted = torch.cat(

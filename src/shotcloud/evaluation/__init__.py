@@ -1,10 +1,20 @@
-"""Evaluation suite: Wasserstein-only after the 2026-05-15 pivot cleanup.
+"""Evaluation metrics and diagnostics for forecast shot clouds.
 
-Pre-pivot evaluation harness (``ablation``, ``diagnostics``,
-``metrics``, ``retrieval``) moved to :mod:`shotcloud.legacy_pivot`
-on 2026-05-15. The current production paper-train-evaluate path
-uses only :func:`sliced_wasserstein_grid` from this package (via
-``pretrain_snapshots`` and ``archetype_stability``).
+The package provides:
+
+* distances between finite shot clouds --
+  :func:`~shotcloud.evaluation.wasserstein.sliced_wasserstein` and
+  :func:`~shotcloud.evaluation.energy_distance.energy_distance`;
+* proper scoring rules on the predictive density surface
+  (:mod:`shotcloud.evaluation.density_surfaces`);
+* calibration summaries for the count and timing factors
+  (:func:`compute_count_calibration`, :func:`compute_timing_calibration`);
+* the own/pooled partition of a collaborative support set
+  (:func:`support_source_masks`) and the own-history buckets used to
+  stratify results (:mod:`shotcloud.evaluation.history_buckets`).
+
+The grid-cell evaluation harness is retained in
+:mod:`shotcloud.legacy_pivot`.
 """
 
 from shotcloud.evaluation.count_calibration import compute_count_calibration

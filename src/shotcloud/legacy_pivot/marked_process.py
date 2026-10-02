@@ -1,7 +1,10 @@
 """End-to-end marked point process: timing × spatial decoder × base measure.
 
-Implements the player-game generative model from
-[core_model_description.md §6](../../core_model_description.md):
+Deprecated; retained as a minimal sampler for the grid-cell decoder.
+Superseded by the count, timing, and spatial factors trained jointly by
+:mod:`shotcloud.training.train_gibbs`.
+
+Implements the player-game generative model
 
 .. math::
 
@@ -10,15 +13,12 @@ Implements the player-game generative model from
         \\prod_{i=1}^{K_n}
         p_\\theta(c_{n,i} \\mid x_n, h_{n,i}, \\tau_{n,i}).
 
-**v1 scope.** The context encoder is omitted: ``u`` is hardcoded to
-zeros, which means the spatial decoder reproduces the base measure
-``q_0`` exactly (since :class:`~shotcloud.models.LowRankTiltDecoder`
-satisfies the zero-init invariant). This proves the marked-point-process
-scaffolding works end-to-end; the role-aware encoder will be added in a
-follow-up sprint.
-
-The optional outcome term ``p_ψ(o | c, ...)`` is also deferred per
-[plan.md §10 decision 7](../../docs/plan.md#10-decisions-locked-2026-04-24).
+Notes
+-----
+No context encoder is attached: the tilt context ``u`` is fixed at
+zero, so the tilt term ``u^T v_c`` vanishes and the spatial decoder
+reproduces the base measure ``q_0`` exactly. The optional outcome term
+``p_ψ(o | c, ...)`` is not modeled.
 """
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ class ShotCloudProcess:
         Samples ``(K, τ_{1:K})`` and evaluates ``log p(K, τ | x)``.
     spatial_decoder : LowRankTiltDecoder
         Computes ``log p_θ(c | x, h, τ)`` from ``log q_0`` and a context
-        vector ``u``. v1 always feeds ``u = 0``.
+        vector ``u``. The process always feeds ``u = 0``.
     base_measure : KDEProduct
         Provides ``log q_0(c | player_id)``.
 

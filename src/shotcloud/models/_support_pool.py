@@ -1,12 +1,9 @@
-"""Global shot-support pool + per-player index for collaborative KDE.
+"""Global shot-support pool and per-player index for the collaborative KDE.
 
-The v1.0 CollaborativeKDE stored four padded ``(n_players, max_R, *)``
-buffers — one of ``(2,)`` coords, ``(CONTEXT_DIM,)`` context,
-``(,)`` int64 date, and a ``(,)`` float32 occupancy mask. Every batch
-gather read a different slice of those buffers, and a shot appearing
-in two players' histories was duplicated in storage. This module
-replaces that layout with a single flat **global pool** plus a per-player
-**int64 index** into the pool:
+Per-shot data used by
+:class:`~shotcloud.models.collaborative_kde.CollaborativeKDE` is stored
+as a single flat **global pool** plus a per-player **int64 index** into
+it:
 
 * :class:`GlobalSupportPool` holds ``(coords, context, dates)`` for
   every shot exactly once.
@@ -14,26 +11,12 @@ replaces that layout with a single flat **global pool** plus a per-player
   table whose entries point into the pool, with ``-1`` marking empty
   slots.
 
-Why bother? Three reasons:
-
-1. **Deduplicated shot-attention compute.** The bilinear shot-attention
-   form computes ``h_θ(z_j)`` on each shot context once per batch.
-   With a global pool we can take ``torch.unique`` over the batch's
-   shot ids, run the MLP on the unique-only context tensor, and
-   gather back via ``inverse``. The v1.0 padded layout reuses
-   ``shot_idx == 0`` for "this slot is empty" and provides no way to
-   distinguish duplicates.
-2. **Incremental updates.** Future causal pre-fitting can append new
-   shots to the pool and grow the per-player index without rebuilding
-   the entire ``(n_players, max_R, D)`` array — important when the
-   snapshot calendar walks forward across seasons.
-3. **Cheaper gather.** The gather of ``coords`` and ``dates`` for a
-   batch is one ``index_select`` per buffer instead of three padded
-   slices.
-
-The v1.0 occupancy mask is now derived on the fly as
-``index >= 0``; padded indices are ``clamp_min(0)``-ed before the
-gather and the pulled values are masked out downstream.
+Global shot ids let the bilinear shot attention run ``h_θ(z_j)`` once
+per unique shot in a batch (``torch.unique`` over the gathered ids, then
+gather back via the inverse), and a batch gather of coordinates or dates
+is a single ``index_select``. The occupancy mask is ``index >= 0``;
+padded indices are ``clamp_min(0)``-ed before the gather and the pulled
+values are masked out downstream.
 """
 
 from __future__ import annotations
@@ -89,10 +72,12 @@ class GlobalSupportPool:
 
     @property
     def n_shots(self) -> int:
+        """Number of shots in the pool."""
         return int(self.coords.shape[0])
 
     @property
     def context_dim(self) -> int:
+        """Width of the per-shot context vectors."""
         return int(self.context.shape[1])
 
 
@@ -102,10 +87,15 @@ class PerPlayerSupportIndex:
 
     Padded with ``-1`` so every player row has the same width
     ``max_R`` regardless of how many shots they actually have. The
-    pad sentinel is exposed as :pyattr:`PAD_INDEX` for downstream code.
+    pad sentinel is exposed as :attr:`PAD_INDEX`.
+
+    Attributes
+    ----------
+    index : Tensor of shape ``(n_players, max_R)``, int64
+        Pool ids of each player's shots; ``-1`` marks padding.
     """
 
-    index: Tensor  # (n_players, max_R) int64, -1 = pad
+    index: Tensor
 
     PAD_INDEX: int = _PAD_INDEX
 
@@ -117,10 +107,12 @@ class PerPlayerSupportIndex:
 
     @property
     def n_players(self) -> int:
+        """Number of player rows."""
         return int(self.index.shape[0])
 
     @property
     def max_R(self) -> int:  # noqa: N802 — `R` is the model's per-player history cap
+        """Row width: the longest per-player history."""
         return int(self.index.shape[1])
 
     def real_mask(self) -> Tensor:
@@ -137,13 +129,20 @@ def build_support_pool_from_adaptive_kde(
     Pool order: shots concatenated in ``vocab.ids`` order, each player's
     block in the order ``AdaptiveKDE`` stored them. The per-player index
     points into this concatenated layout. ``vocab`` is the source of
-    truth for player ordering — the per-player-index row ``vocab.to_idx(pid)``
+    truth for player ordering: the per-player-index row ``vocab.to_idx(pid)``
     holds ``pid``'s shot ids (or all ``-1`` if the player has no
     history in ``adaptive_kde``).
 
     Returned tensors live on CPU; the consumer (typically
-    :class:`CollaborativeKDE`) registers them as module buffers and
-    PyTorch handles the device transfer.
+    :class:`~shotcloud.models.collaborative_kde.CollaborativeKDE`)
+    registers them as module buffers, which move with the module.
+
+    Raises
+    ------
+    ValueError
+        If ``adaptive_kde`` is unfitted, lacks per-shot coordinates,
+        context, or dates, or has no history for any vocabulary player,
+        or if ``vocab`` is empty.
     """
     if not adaptive_kde.is_fitted:
         raise ValueError("adaptive_kde must be fitted")

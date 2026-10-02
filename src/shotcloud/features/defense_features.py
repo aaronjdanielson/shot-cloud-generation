@@ -1,18 +1,19 @@
-"""Per-(opponent, snapshot) defensive feature pipeline (PR-D0.5).
+"""Per-(opponent, snapshot) defensive feature pipeline.
 
-Builds the team / zone / reliability blocks of the defensive query
-context :math:`c_{d,n,r}` from
-:mod:`docs/defense_integration_proposal.md` §4. The output tensor
-mirrors the indexing of
-:class:`shotcloud.models.defensive_retrieval_cache.DefensiveRetrievalCache`
-so PR-D1's defensive scorer can gather features by
-``(opp_idx, snapshot_idx)`` alongside the cache's allowed-shot
-indices.
+Builds team, zone, and reliability summaries of the shots each opponent
+has allowed, indexed by ``(opp_idx, snapshot_idx)`` like
+:class:`~shotcloud.models.defensive_retrieval_cache.DefensiveRetrievalCache`.
+The league-centered zone block feeds the zone-level opponent
+reweighting term ``D`` in
+:class:`~shotcloud.models.zone_defense_reweighting.ZoneReweightingDefense`;
+the full vector is the query context of
+:class:`~shotcloud.models.continuous_adaptive_defensive.ContinuousAdaptiveDefensiveField`.
 
-This is a **pure data layer** — the features are causal aggregates
-of allowed-shot data, computed with recency-weighted attention.
-The features themselves are not learnable; PR-D1's relevance head
-will consume them as a fixed query context.
+This is a **pure data layer**: the features are fixed, recency-weighted
+aggregates of allowed shots and carry no learnable parameters.
+
+Causality: the features at a snapshot anchor use only shots dated
+strictly before the anchor, within a ``window_days`` look-back.
 
 Feature layout (length :data:`DEFENSE_FEATURE_DIM` ``= 24``):
 
@@ -38,14 +39,12 @@ Block D — reliability (4):
       exponential recency weights
 
 Cold-start opponents (no causal allowed shots before the snapshot
-anchor) get **all-zero** feature blocks; the reliability block is
-the disambiguator — ``log1p_allowed_count = 0`` flags the row as
-no-data and PR-D1 can route around it.
+anchor) get **all-zero** feature blocks; ``log1p_allowed_count = 0``
+distinguishes them from legitimately zero rates. Because the centered
+zone block is zero for these rows, any term linear in it is a no-op.
 
-Lineup features (``v_d^lineup(n,r)``) are intentionally *not* in this
-PR — they're per-shot, not per-(opp, snapshot), and the lineup-join
-data path needs separate plumbing. They'll arrive in PR-D0.6 or
-PR-D1.5.
+Lineup features are not included: they vary per shot rather than per
+``(opponent, snapshot)``.
 """
 
 from __future__ import annotations
@@ -65,12 +64,12 @@ from shotcloud.data.zones import N_ZONES, zone_from_xy_vectorized
 from shotcloud.training.dataset import OpponentVocab
 
 #: Default recency window (in days) for causal allowed-shot
-#: aggregation. Same window the defensive retrieval cache uses in v1.
+#: aggregation; equal to the defensive retrieval cache's default window.
 DEFAULT_DEFENSE_FEATURE_WINDOW_DAYS: int = 365
 
-#: Default exponential recency half-life (in days). The downstream
-#: attention scorer's half-life lives separately in PR-D1; this is
-#: the half-life used only for the feature aggregates.
+#: Default exponential recency half-life (in days) for the feature
+#: aggregates. Independent of any recency scale used by downstream
+#: scorers.
 DEFAULT_DEFENSE_FEATURE_HALF_LIFE_DAYS: float = 90.0
 
 # ---------------------------------------------------------------------------
@@ -84,10 +83,9 @@ _TEAM_SCALAR_NAMES: Final[tuple[str, ...]] = (
     "allowed_2pa_rate",
 )
 
-#: Zone labels matching :data:`shotcloud.data.zones.ZONE_NAMES`. We
-#: alias the labels here for stable feature names; the index order is
-#: the same as ``ZONE_NAMES`` (0=rim, 1=paint, 2=mid, 3=LC3, 4=RC3,
-#: 5=LW3, 6=RW3, 7=ATB3).
+#: Short zone labels for stable feature names, in the index order of
+#: :data:`shotcloud.data.zones.ZONE_NAMES` (0=rim, 1=paint, 2=mid,
+#: 3=LC3, 4=RC3, 5=LW3, 6=RW3, 7=ATB3).
 _ZONE_LABELS_FOR_FEATURES: Final[tuple[str, ...]] = (
     "rim",
     "paint",
@@ -112,10 +110,9 @@ _RELIABILITY_NAMES: Final[tuple[str, ...]] = (
     "effective_sample_size",
 )
 
-#: Canonical feature-name tuple. Length must equal
-#: :data:`DEFENSE_FEATURE_DIM`; changing order breaks downstream
-#: consumers, so this is a stable identifier (mirrors the bucket-
-#: label convention in :mod:`shotcloud.evaluation.history_buckets`).
+#: Canonical feature-name tuple, of length :data:`DEFENSE_FEATURE_DIM`.
+#: The order is a stable interface: downstream consumers index the
+#: feature tensor by position.
 DEFENSE_FEATURE_NAMES: Final[tuple[str, ...]] = (
     *_TEAM_SCALAR_NAMES,
     *_ZONE_NAMES_RAW,
@@ -146,10 +143,22 @@ _THREE_POINT_ZONE_IDX: Final[tuple[int, ...]] = (3, 4, 5, 6, 7)
 class DefenseFeaturesConfig:
     """Configuration for the defensive feature build.
 
-    The half-life lives here (not on the retrieval cache config)
-    because it affects feature *values*, not which shots are
-    retrieved. Mirrors the budget-vs-mass split that motivated PR-D0's
-    decision to remove half-life from the cache hash.
+    The recency half-life belongs to this config rather than the
+    defensive retrieval cache's because it changes feature *values*,
+    not which shots are retrieved.
+
+    Parameters
+    ----------
+    shots_fingerprint : str
+        Fingerprint of the shot table the features are built from.
+    anchor_dates : tuple of int
+        Snapshot anchor dates in epoch days.
+    window_days : int, default 365
+        Causal look-back window in days.
+    half_life_days : float, default 90.0
+        Exponential recency half-life in days.
+    seed : int, default 0
+        Included in the config hash.
     """
 
     shots_fingerprint: str
@@ -192,8 +201,8 @@ class DefenseFeatures:
         Length :data:`DEFENSE_FEATURE_DIM`; matches the canonical
         layout above.
     config : DefenseFeaturesConfig
-        The config used to build the features. Carried for
-        config-hash round-trips and downstream consistency checks.
+        The config used to build the features, kept for cache-hash
+        round-trips and downstream consistency checks.
     """
 
     features: Tensor
@@ -214,6 +223,7 @@ class DefenseFeatures:
 
     @classmethod
     def load(cls, path: Path) -> DefenseFeatures:
+        """Load features written by :meth:`save`."""
         d = torch.load(path, weights_only=False)
         cfg_dict = d["config"]
         cfg_dict = {**cfg_dict, "anchor_dates": tuple(cfg_dict["anchor_dates"])}
@@ -228,12 +238,10 @@ class DefenseFeatures:
 def _prepare_shots(
     shots_df: pd.DataFrame, opp_vocab: OpponentVocab
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Filter ``shots_df`` to in-vocab non-NA allowed shots and return
-    ``(opp_idx, date_ord, distance, zone_idx)`` arrays sorted ascending
-    by date.
+    """Return ``(opp_idx, date_ord, distance, zone_idx)`` sorted by date.
 
-    The build only needs four per-shot columns and they're all
-    derivable from canonical ``load_shots()`` output:
+    Keeps shots whose opponent is present and in the vocabulary. All four
+    per-shot arrays derive from canonical ``load_shots()`` output:
 
     * ``opp_idx``     — defending team's vocab index
     * ``date_ord``    — epoch-day date (int64)
@@ -263,8 +271,8 @@ def _prepare_shots(
     y = shots_df["y"].to_numpy(dtype=np.float64)
     distance = np.sqrt(x * x + y * y)
     zone_idx = zone_from_xy_vectorized(x, y)
-    # Drop out-of-court shots (zone == -1) from the aggregation —
-    # they're noise for defensive feasibility.
+    # Out-of-court shots (zone == -1) carry no zone information and are
+    # excluded from the aggregates.
     in_court = zone_idx >= 0
     if not in_court.all():
         opp_idx = opp_idx[in_court]
@@ -299,9 +307,7 @@ def _league_zone_baseline(
     total_w = float(totals.sum())
     if total_w <= 0.0:
         return np.zeros(N_ZONES, dtype=np.float64)
-    # cast(): NumPy 2.x stubs leak Any through arithmetic chains;
-    # explicit cast preserves the declared return type. (Same pattern
-    # documented in CLAUDE.md "Known sharp edges".)
+    # cast(): NumPy 2.x stubs leak Any through arithmetic chains.
     from typing import cast
 
     return cast(np.ndarray, totals / total_w)
@@ -319,12 +325,11 @@ def _build_one_snapshot(
     config: DefenseFeaturesConfig,
     out: np.ndarray,  # (n_opps, n_snaps, DEFENSE_FEATURE_DIM)
 ) -> None:
-    """Fill ``out[:, s_idx, :]`` with each opp's feature vector at
-    snapshot ``anchor``.
+    """Fill ``out[:, s_idx, :]`` with each opponent's features at ``anchor``.
 
-    The function mutates ``out`` rather than returning; this keeps
-    memory pressure flat (we allocate one big tensor once and write
-    into it).
+    Writes into the preallocated ``out`` array in place so the full
+    tensor is allocated only once. Only shots with ``date < anchor`` are
+    used.
     """
     # Causal upper bound: date < anchor.
     i_hi = int(np.searchsorted(date_ord, anchor, side="left"))
@@ -419,6 +424,8 @@ def build_defense_features(
     anchor_dates : np.ndarray of shape ``(S,)``
         Snapshot anchor dates in epoch days.
     config : DefenseFeaturesConfig
+        Build configuration; ``config.anchor_dates`` must equal
+        ``anchor_dates``.
     cache_dir : Path or None
         If given, the feature tensor is loaded from
         ``cache_dir/defense_features_{config.config_hash}.pt`` when
@@ -430,6 +437,13 @@ def build_defense_features(
     Returns
     -------
     DefenseFeatures
+
+    Raises
+    ------
+    ValueError
+        If ``anchor_dates`` is not 1-D or differs from
+        ``config.anchor_dates``, or ``shots_df`` lacks an ``opponent``
+        column.
     """
     if anchor_dates.ndim != 1:
         raise ValueError(f"anchor_dates must be 1D; got shape {anchor_dates.shape}")

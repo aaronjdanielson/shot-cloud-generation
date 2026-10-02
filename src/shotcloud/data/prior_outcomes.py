@@ -1,24 +1,14 @@
 """Causal prior-outcome summary ``o_{n,r}`` for the residual tilt.
 
-The within-game-history module ``h_{n,r}``
+The within-game history ``h_{n,r}``
 (:mod:`shotcloud.data.within_game_history`) summarizes *where* the
 player has shot earlier in the current game. This module's
-counterpart vector summarizes *what happened* on those earlier shots
-— makes, misses, zone-by-outcome breakdowns, recent make rate, recent
-distance — so the residual decoder can condition on outcome dynamics
-rather than only location dynamics.
-
-Paper §5.7 reported that a one-layer causal GRU over prior shot
-locations did not improve density-surface or finite-cloud metrics
-beyond the existing ``h_{n,r}`` summary. The 2026-06-07 Phase 1
-findings established the count factor's pretrain-and-freeze protocol;
-the natural next conditioning is on prior outcomes rather than only
-prior locations. Following the user's plan, this module starts
-**non-recurrently**: a small fixed-dimensional vector that the
-residual encoder consumes alongside ``x_n``, ``h_{n,r}``, the causal
-usage state, and the count-supervised latent score. A GRU over the
-outcome summaries is reserved for future work and only justified by
-positive evidence from this simpler baseline.
+counterpart summarizes *what happened* on those earlier shots (makes,
+misses, outcome by zone, recent make rate, recent distance), so the
+residual tilt can condition on outcome dynamics as well as location
+dynamics. The summary is a fixed-dimensional, non-recurrent vector
+consumed by the outcome branch of
+:class:`~shotcloud.models.context_residual.ContextResidualEncoder`.
 
 ============= ================= =============================================
 slot          name              description
@@ -35,23 +25,18 @@ slot          name              description
                                 ``_DIST_NORM`` (35 ft, half-court typical max)
 ============= ================= =============================================
 
-All eight count slots are ``log1p``'d so they live on a similar scale
-to the residual encoder's other inputs (``h_{n,r}`` uses log1p for
-its first slot for the same reason). The two recency slots are
-normalized: ``recent_make_rate`` already lives in [0, 1];
-``recent_dist_mean`` is divided by 35 ft so it lives in roughly
+The seven count slots are ``log1p``-transformed so they share a scale
+with the residual encoder's other inputs (``h_{n,r}`` applies log1p to
+its count slot for the same reason). ``recent_make_rate`` lies in
+[0, 1]; ``recent_dist_mean`` is divided by 35 ft, so it lies in roughly
 [0, 1.3].
 
-**First-shot causal edge case.** For a shot that is the first shot
-of its (player, game), all features default to zero. The residual
-encoder's outcome branch is zero-initialized (matching the
-existing usage-branch pattern), so an all-zero ``o_{n,r}`` produces
-zero outcome-contribution at step 0 — preserving the AC-KDE's
-zero-init invariant.
-
-The featurizer is causal by construction: for shot ``i`` in a
-``(player, game)`` group, only shots strictly before ``i`` in the
-group's chronological order contribute.
+**Causality.** For shot ``i`` in a ``(player, game)`` group, only
+shots strictly before ``i`` in the group's chronological order
+contribute; the outcome of shot ``i`` itself never enters its own
+features. The first shot of a player-game gets an all-zero vector.
+The encoder's outcome branch is zero-initialized, so enabling it
+leaves the model unchanged at initialization.
 """
 
 from __future__ import annotations
@@ -64,10 +49,8 @@ from numpy.typing import NDArray
 
 from shotcloud.data.zones import zone_from_xy_vectorized
 
-#: Number of prior-outcome summary feature slots. Keep this
-#: synchronized with the constructor + tests for
-#: :class:`shotcloud.models.context_residual.ContextResidualEncoder`'s
-#: ``outcome_dim`` parameter.
+#: Number of prior-outcome summary slots; pass as ``outcome_dim`` to
+#: :class:`shotcloud.models.context_residual.ContextResidualEncoder`.
 PRIOR_OUTCOME_DIM: Final[int] = 9
 
 #: Distance normalization (feet) for the ``recent_dist_mean`` slot.
@@ -78,12 +61,12 @@ _DIST_NORM: Final[float] = 35.0
 #: Recency window for ``recent_make_rate`` and ``recent_dist_mean``.
 _RECENT_K: Final[int] = 5
 
-#: Zone-set constants, mirroring
-#: :mod:`shotcloud.data.within_game_history`. Kept in sync with
-#: :data:`shotcloud.data.zones.ZONE_NAMES`.
+#: Zone sets, indexed as in :data:`shotcloud.data.zones.ZONE_NAMES` and
+#: matching :mod:`shotcloud.data.within_game_history`.
 _RIM_ZONES: Final[set[int]] = {0, 1}  # RA, Paint
 _THREE_PT_ZONES: Final[set[int]] = {3, 4, 5, 6, 7}  # Corner3/Wing3/TopKey3
 
+#: Slot names, in output column order.
 PRIOR_OUTCOME_FEATURE_NAMES: Final[tuple[str, ...]] = (
     "prior_fga_log1p",
     "prior_makes_log1p",
@@ -100,7 +83,11 @@ PRIOR_OUTCOME_FEATURE_NAMES: Final[tuple[str, ...]] = (
 def compute_prior_outcome_features(
     shots_df: pd.DataFrame,
 ) -> NDArray[np.float32]:
-    """Per-shot causal prior-outcome summary in the input row order.
+    """Compute the per-shot causal prior-outcome summary.
+
+    Shots are ordered within each ``(player_id, game_id)`` group by
+    ``time_remaining_sec`` (elapsed game seconds), with ties broken by
+    input row order.
 
     Parameters
     ----------
@@ -111,8 +98,15 @@ def compute_prior_outcome_features(
     Returns
     -------
     NDArray of shape ``(n_shots, PRIOR_OUTCOME_DIM)`` float32
-        Per-shot feature vector aligned to ``shots_df.index`` order.
-        First shots in a player-game group get an all-zero vector.
+        Per-shot feature vectors in the input row order. First shots in
+        a player-game group get an all-zero vector.
+
+    Raises
+    ------
+    KeyError
+        If a required column is missing.
+    ValueError
+        If ``made`` takes a value other than 0 or 1.
     """
     required = ("x", "y", "made", "player_id", "game_id", "time_remaining_sec")
     for col in required:
@@ -171,10 +165,8 @@ def compute_prior_outcome_features(
         three_g = is_three[a:b]
         dist_g = distance[a:b]
 
-        # Cumulative sums (prefix sums) over the group's chronological
-        # order. ``cs[k]`` = sum of the first ``k`` values. The number
-        # of prior shots for position ``k`` (0-indexed) is ``k`` and
-        # the prefix sum we want is ``cs[k]``.
+        # Exclusive prefix sums over the group's chronological order:
+        # ``cs[k]`` is the sum over the ``k`` shots before position ``k``.
         cs_fga = np.arange(size, dtype=np.float64)  # 0, 1, ..., size-1
         cs_makes = np.concatenate([[0.0], np.cumsum(made_g)])[:-1]
         cs_misses = cs_fga - cs_makes
@@ -183,10 +175,8 @@ def compute_prior_outcome_features(
         cs_rim_att = np.concatenate([[0.0], np.cumsum(rim_g)])[:-1]
         cs_rim_makes = np.concatenate([[0.0], np.cumsum(rim_g * made_g)])[:-1]
 
-        # Position-local outputs (skip position 0 — leave all-zero).
-        # Use ``log1p`` for the count slots so the residual sees a
-        # well-scaled feature even when shot counts run into double
-        # digits in a high-volume game.
+        # Position 0 stays all-zero. ``log1p`` keeps the count slots
+        # well-scaled when shot counts reach double digits.
         out_grp_rows = row[a + 1 : b]  # original row indices for positions 1..size-1
         out[out_grp_rows, 0] = np.log1p(cs_fga[1:])
         out[out_grp_rows, 1] = np.log1p(cs_makes[1:])

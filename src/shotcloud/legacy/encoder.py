@@ -122,7 +122,7 @@ class PlayerPositionEncoder(nn.Module):
         avoid the dead-zero saddle when the decoder is also zero-init.
     zero_init_position : bool, default False
         Random by default. Setting ``True`` makes the encoder identical
-        to :class:`PlayerEmbeddingEncoder` at step 0.
+        to :class:`PlayerEmbeddingEncoder` at initialization.
     """
 
     # Class-level annotation: `register_buffer` types attributes as

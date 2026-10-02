@@ -1,8 +1,12 @@
-"""Training: dataset, trainer, history.
+"""Datasets and trainers for the marked point-process model.
 
-Pre-pivot artifacts (``train_decoder``, ``TrainHistory``,
-``DecoderCheckpoint``, ``ShotCellDataset``, the regularizer helpers)
-moved to :mod:`shotcloud.legacy_pivot` on 2026-05-15.
+Provides the per-player-game dataset (:class:`GibbsShotDataset`), the
+player and opponent vocabularies, the joint trainer :func:`train_gibbs`,
+and the single-factor trainers used to pretrain the count, timing, and
+presence heads, each with its training-history record.
+
+The per-shot dataset and trainer for the deprecated grid-cell decoder live
+in :mod:`shotcloud.legacy_pivot`.
 """
 
 from shotcloud.training.dataset import OpponentVocab, PlayerVocab

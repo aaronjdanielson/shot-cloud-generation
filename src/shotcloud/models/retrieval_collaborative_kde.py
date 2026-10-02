@@ -1,29 +1,31 @@
-"""Retrieval-based support backend for the continuous-mixture path (PR3.2).
+r"""Retrieval-based support backend for the AC-KDE spatial factor.
 
-Drop-in successor to :class:`shotcloud.models.CollaborativeKDE` for the
-``forward_continuous`` contract. Differences from the L×R backend:
+:class:`RetrievalCollaborativeKDE` supplies the causal support set of
+:class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial`
+in the mainline configuration (``--support-backend retrieval``). It
+implements the same ``forward_continuous`` contract as
+:class:`~shotcloud.models.collaborative_kde.CollaborativeKDE`, but builds
+the support from a precomputed
+:class:`~shotcloud.models.retrieval_cache.RetrievalCache` instead of a
+fixed ``L × R`` analogue grid:
 
-* **Support construction**: own + pooled candidates come from a
-  precomputed :class:`shotcloud.models.RetrievalCache` (PR3.1) rather
-  than a fixed L×R analogue×shot grid. The diagnostic
-  (2026-05-22) showed the 50-shot own cap was the binding constraint;
-  retrieval lifts it to (default) 1000.
-* **Per-slot shooter identity**: every candidate has its own shooter id
-  (``support_shooter``), not just an L-bucket identity.
-* **Per-shot context** ``z_j``: rebuilt from
-  ``ContextEncoder.transform(shots_df)`` at construction (kept as a
-  non-persistent buffer; not part of the cache schema).
+* **Own support**: up to ``own_support_max`` of the target player's
+  shots dated before the snapshot anchor, most recent first.
+* **Pooled support**: up to ``pooled_support_max`` shots by other players
+  within a recency window before the anchor, ranked by trait similarity
+  to the target and recency.
 
-What's identical to the L×R backend:
+Each support slot carries its own shooter identity and stored shot
+context :math:`z_j`, and is scored individually,
 
-* Scoring (per-shot): ``A_Θ + B_Θ - λ_age·Δt``. The same
-  ``RelevanceScore``-style MLP, the same bilinear / concat shot
-  attention, the same ``b_same`` / ``γ_sim`` / ``λ_age`` /
-  σ-head parameters, named the same way so checkpoints round-trip.
-* Residual ``R_Θ`` and the pooling gate ``λ`` remain in
-  :class:`shotcloud.models.ContinuousMixtureSpatial`; the retrieval
-  backend produces the same :class:`CollaborativeContinuousOutputs`
-  the wrapper already consumes.
+.. math::
+
+    \ell_j = A_\Theta(p, p_j, x_n) + B_\Theta(x_n, z_j)
+             - \lambda_{\mathrm{age}}\,\Delta t_j,
+
+with the same player-level relevance MLP, shot attention, and bandwidth
+head as :class:`~shotcloud.models.collaborative_kde.CollaborativeKDE`.
+Parameters are named identically in both backends.
 """
 
 from __future__ import annotations
@@ -52,16 +54,69 @@ from shotcloud.training.dataset import PlayerVocab
 
 
 class RetrievalCollaborativeKDE(nn.Module):
-    """Continuous-mixture collaborative offensive prior with retrieval support.
+    r"""Collaborative adaptive KDE support backend with retrieved own/pooled support.
 
-    Constructor arguments parallel :class:`CollaborativeKDE` for the
-    learnable submodules so the same training hyperparameters drive
-    either backend. The non-learnable data the model needs at forward
-    time — the cache indices, the global shot table, the per-shot
-    context tensor, the trait tensor, and the anchor-date buffer — are
-    all registered as **non-persistent** buffers so ``modules.pt`` only
-    captures the trained parameters; the data layer is rebuilt from
-    ``shots_df + retrieval_cache`` at eval reconstruction.
+    For a target player :math:`p` at snapshot :math:`t_n`, the support set
+    is the concatenation of the cached own block (``own_support_max``
+    slots) and pooled block (``pooled_support_max`` slots), so
+    ``M = own_support_max + pooled_support_max``. Each valid slot
+    :math:`j` with shooter :math:`p_j` receives the logit
+
+    .. math::
+
+        \ell_j = \phi_\theta([u_p, u_{p_j}, u_p - u_{p_j}, u_p \odot u_{p_j}, x_n])
+                 + b_{\mathrm{same}}\,[p_j = p]
+                 + \gamma \cos(u_p, u_{p_j})
+                 + \lambda_M \log(1 + M_{p_j}) + \lambda_S \log(1 + S_{p_j})
+                 + g_\theta(x_n, z_j) - \lambda_{\mathrm{age}}\,\Delta t_j,
+
+    where the similarity term is present only with
+    ``alpha_prior="similarity"`` and :math:`\Delta t_j` is the shot's age
+    in days at the snapshot anchor. The bandwidth :math:`\sigma_p` uses the
+    same evidence-dependent formula as
+    :class:`~shotcloud.models.collaborative_kde.CollaborativeKDE`.
+
+    The cache indices, global shot table, per-shot context, traits, and
+    anchor dates are registered as non-persistent buffers, so a saved
+    state dict holds only learned parameters; the data buffers are
+    rebuilt from ``shots_df`` and ``retrieval_cache`` when the model is
+    reconstructed.
+
+    Parameters
+    ----------
+    retrieval_cache : RetrievalCache
+        Precomputed own and pooled support indices per (player, snapshot)
+        and the global shot table they index.
+    shots_df : pd.DataFrame
+        The full shot table the cache was built from (no train/validation
+        split; causality is enforced by the cache's anchor-date cut). Used
+        to rebuild the per-shot context :math:`z_j`.
+    context_encoder : ContextEncoder
+        Fitted encoder that maps ``shots_df`` rows to context vectors.
+    traits_table : PlayerTraitsTable
+        Causal per-(player, snapshot) trait vectors.
+    vocab : PlayerVocab
+        Player vocabulary shared with ``retrieval_cache`` and
+        ``traits_table``.
+    phi_hidden_dim, shot_hidden_dim, shot_proj_dim : int
+        Hidden and projection widths of the attention MLPs.
+    alpha_prior, alpha_prior_scale_init, same_player_bias_init
+        Player-level score options.
+    shot_attention_form, h_z_init
+        Shot-attention form and initialization.
+    sigma_min, sigma_max, sigma_init : float
+        Bandwidth bounds and initial bandwidth, in feet.
+
+    All hyperparameters above have the same meaning and defaults as in
+    :class:`~shotcloud.models.collaborative_kde.CollaborativeKDE`.
+
+    Raises
+    ------
+    ValueError
+        If the trait table does not match the vocabulary or
+        :data:`~shotcloud.data.player_traits.TRAIT_DIM`, the bandwidth
+        bounds are inconsistent, or ``shots_df`` does not reproduce the
+        cache's global shot table.
     """
 
     sigma_min: Tensor
@@ -111,7 +166,7 @@ class RetrievalCollaborativeKDE(nn.Module):
                 f"traits_table.n_players={traits_table.n_players} != len(vocab)={n_players}"
             )
 
-        # ---- σ bounds (must be set BEFORE init formulas below) ----
+        # ---- σ bounds (needed by the a_0 initialization below) ----
         if not (sigma_min <= sigma_init <= sigma_max):
             raise ValueError(
                 f"sigma_min={sigma_min} <= sigma_init={sigma_init} <= "
@@ -130,7 +185,7 @@ class RetrievalCollaborativeKDE(nn.Module):
         )
         self.sigma_init = float(sigma_init)
 
-        # ---- Cache buffers (non-persistent; rebuilt from disk at eval). ----
+        # ---- Cache buffers (non-persistent; rebuilt from the cache). ----
         self.register_buffer("global_xy", retrieval_cache.global_xy.float(), persistent=False)
         self.register_buffer(
             "global_dates", retrieval_cache.global_dates.to(torch.int64), persistent=False
@@ -184,8 +239,8 @@ class RetrievalCollaborativeKDE(nn.Module):
         self._M = self._own_max + self._pool_max
 
         # ===========================================================
-        # Trained submodules — name-for-name match with CollaborativeKDE
-        # so checkpoints round-trip across backends when reusable.
+        # Trained submodules — named as in CollaborativeKDE so parameter
+        # names are shared across backends.
         # ===========================================================
 
         # A_Θ: relevance MLP on [u_self, u_other, u_self - u_other,
@@ -272,10 +327,12 @@ class RetrievalCollaborativeKDE(nn.Module):
     def _build_global_context(
         shots_df: pd.DataFrame, context_encoder: ContextEncoder, vocab: PlayerVocab
     ) -> Tensor:
-        """Filter ``shots_df`` to shooters in the vocab, sort ascending
-        by date (matching the cache's global ordering), then transform
-        with the context encoder. Returns ``(N_global, CONTEXT_DIM)``
-        float32."""
+        """Return the ``(N_global, CONTEXT_DIM)`` float32 per-shot context table.
+
+        Filters ``shots_df`` to shooters in the vocabulary and sorts it
+        stably by date, matching the cache's global ordering, before
+        applying the context encoder.
+        """
         id_to_idx = {pid: i for i, pid in enumerate(vocab.ids)}
         pid_str = shots_df["player_id"].astype(str).to_numpy()
         keep = np.array([p in id_to_idx for p in pid_str], dtype=bool)
@@ -288,19 +345,21 @@ class RetrievalCollaborativeKDE(nn.Module):
 
     @property
     def own_support_max(self) -> int:
+        """Number of own-support slots per row."""
         return self._own_max
 
     @property
     def pooled_support_max(self) -> int:
+        """Number of pooled-support slots per row."""
         return self._pool_max
 
     @property
-    def M(self) -> int:  # noqa: N802 — model-spec notation
+    def M(self) -> int:  # noqa: N802 — matches the model notation
+        """Total support slots per row, ``own_support_max + pooled_support_max``."""
         return self._M
 
     def _compute_sigma(self, player_idx: Tensor, snapshot_idx: Tensor) -> Tensor:
-        """Per-target bandwidth σ_p(t_n); identical formula to
-        :meth:`CollaborativeKDE._compute_sigma`."""
+        """Per-target bandwidth σ_p(t_n), as in ``CollaborativeKDE._compute_sigma``."""
         u_self = self.traits[player_idx, snapshot_idx]
         log1p_M = u_self[..., _SLOT_LOG1P_M]
         log1p_S = u_self[..., _SLOT_LOG1P_S]
@@ -325,13 +384,30 @@ class RetrievalCollaborativeKDE(nn.Module):
         x_n_raw: Tensor,
         x_n: Tensor,
     ) -> CollaborativeContinuousOutputs:
-        """Cell-free forward: gather retrieved candidates, score each,
-        return the same :class:`CollaborativeContinuousOutputs` the
-        spatial wrapper consumes."""
-        del x_n_raw  # accepted for API parity
+        """Gather the retrieved support set and score each support shot.
+
+        Parameters
+        ----------
+        player_idx : Tensor of shape ``(B,)`` int64
+            Vocabulary index of the target player.
+        snapshot_idx : Tensor of shape ``(B,)`` int64
+            Causal snapshot index of the shot's game.
+        x_n_raw : Tensor of shape ``(B, CONTEXT_DIM)``
+            Raw context; accepted for interface compatibility and unused.
+        x_n : Tensor of shape ``(B, CONTEXT_DIM)``
+            Learned context vector.
+
+        Returns
+        -------
+        CollaborativeContinuousOutputs
+            Support set of width ``M`` with the own block first. The
+            ``analogue_idx``, ``alpha_scores``, and ``beta_scores``
+            diagnostics are empty tensors for this backend.
+        """
+        del x_n_raw  # accepted for interface compatibility; unused
         b = player_idx.shape[0]
 
-        # ---- 1. Gather per-cell retrieved indices + masks. ----
+        # ---- 1. Gather per-(player, snapshot) retrieved indices + masks. ----
         own_idx_b = self.own_idx[player_idx, snapshot_idx]  # (B, own_max)
         own_mask_b = self.own_mask_cache[player_idx, snapshot_idx]  # (B, own_max)
         pool_idx_b = self.pooled_idx[player_idx, snapshot_idx]  # (B, pool_max)
@@ -380,11 +456,9 @@ class RetrievalCollaborativeKDE(nn.Module):
         else:
             alpha_scores_per_shot = phi_scores
 
-        # Evidence-volume prior on the shooter (matches the L×R
-        # ``_compute_alpha_scores`` term ``λ_M log1p_M + λ_S log1p_S``
-        # but applied per support slot in the retrieval layout — since
-        # there's no per-shooter A_l score, this contribution attaches
-        # to every shot from that shooter).
+        # Evidence-volume prior on the shooter: the L×R term
+        # ``λ_M log1p_M + λ_S log1p_S``, applied per support slot since
+        # the retrieval layout has no per-analogue score A_l.
         log1p_M_other = shooter_trait[..., _SLOT_LOG1P_M]  # (B, M)
         log1p_S_other = shooter_trait[..., _SLOT_LOG1P_S]
         alpha_scores_per_shot = (
@@ -411,9 +485,8 @@ class RetrievalCollaborativeKDE(nn.Module):
 
         # ---- 7. Return ----
         # analogue_idx / alpha_scores / beta_scores are L×R-specific
-        # diagnostics; populate as empty-L tensors for the retrieval
-        # backend so the dataclass contract holds without forcing
-        # downstream consumers to None-check.
+        # diagnostics; they are empty (L = 0) tensors here so consumers
+        # need no None checks.
         empty_l = torch.empty(b, 0, dtype=torch.int64, device=support_xy.device)
         empty_l_float = torch.empty(b, 0, dtype=torch.float32, device=support_xy.device)
         empty_l_r = torch.empty(b, 0, 0, dtype=torch.float32, device=support_xy.device)

@@ -1,12 +1,10 @@
-"""Context-adaptive anisotropic KDE kernel (paper §3.2 extension).
+"""Context-adaptive anisotropic Gaussian kernel on the court grid.
 
-Promotes the per-shot smoothing scale from a fixed global bandwidth
-(``h = 1.5 ft``, isotropic) to a *learned per-shot per-context*
-anisotropic Gaussian whose widths along the rim-radial and tangential
-axes are conditioned on both the current player-game context
-:math:`x_n` and the historical shot's own context :math:`z_j`.
-
-Mathematically, the self-density becomes
+:class:`AnisotropicKernelEvaluator` replaces the fixed isotropic
+bandwidth of a grid KDE with a learned, per-shot anisotropic Gaussian
+whose widths along the rim-radial and tangential axes depend on both the
+current player-game context :math:`x_n` and the historical shot's own
+context :math:`z_j`. The relevance-weighted own-player density becomes
 
 .. math::
 
@@ -43,31 +41,33 @@ are bounded scalars
         + \\mathrm{MLP}_x(x)
         + (W x)^\\top (V z_j).
 
-The four-term decomposition (bias, marginal-z, marginal-x, low-rank
-bilinear interaction) gives the right bias-variance tradeoff: the
-model can learn "rim shots are tighter than arc shots" (via
-``MLP_z``), "tonight the player has broader role" (via ``MLP_x``),
-and "this corner-three matters more under tonight's starter
-context" (via the bilinear) — without an unconstrained black-box
-similarity network.
+The four terms are a bias, a shot-context marginal, a game-context
+marginal, and a low-rank bilinear interaction. The marginals capture
+effects such as rim shots being tighter than arc shots (``MLP_z``) or a
+broader role in tonight's game (``MLP_x``); the rank-limited bilinear
+term adds context-by-shot interactions without becoming an
+unconstrained similarity network.
 
-Three ablation forms are exposed via ``kernel_form`` (corresponding
-to the ``--kernel-form`` CLI flag):
+``kernel_form`` selects one of three nested parameterizations:
 
-* ``z_only``: only ``a_0 + MLP_z(z_j)`` — variable bandwidth, no
-  context (classical Abramson-style).
-* ``additive``: ``a_0 + MLP_z(z_j) + MLP_x(x)`` — independent
-  context and shot dependence, no interaction.
-* ``factored``: full ``a_0 + MLP_z + MLP_x + bilinear`` — the
-  paper-worthy model.
+* ``z_only``: ``a_0 + MLP_z(z_j)`` -- variable bandwidth driven by the
+  historical shot only (Abramson-style), no game context.
+* ``additive``: ``a_0 + MLP_z(z_j) + MLP_x(x)`` -- independent shot and
+  context effects, no interaction.
+* ``factored``: all four terms.
+
+The evaluator is consumed by the grid-cell offensive prior
+:class:`~shotcloud.legacy_pivot.adaptive_prior.AdaptiveOffensivePrior`.
+The continuous spatial mixture uses the per-zone kernels in
+:mod:`shotcloud.models.anisotropic_kernel` instead.
 
 Initialization. ``a_0`` is set so that
-``sigmoid(a_0) = (1.5 - σ_min) / (σ_max - σ_min)`` for both
-:math:`\\sigma_\\parallel` and :math:`\\sigma_\\perp`. At step 0, with
-the output layer of ``MLP_z``, ``MLP_x``, and the bilinear
-zero-init, every kernel is isotropic Gaussian with bandwidth 1.5 ft
-— matching the current fixed-bandwidth default exactly. Anisotropy
-emerges only as the optimizer pushes off step 0.
+``sigmoid(a_0) = (init_sigma - σ_min) / (σ_max - σ_min)`` for both
+:math:`\\sigma_\\parallel` and :math:`\\sigma_\\perp`, and the output
+layers of ``MLP_z`` and ``MLP_x`` and the bilinear factors are
+zero-initialized. Every kernel therefore starts as an isotropic Gaussian
+of bandwidth ``init_sigma`` (default 1.5 ft, the fixed-bandwidth KDE
+default), and anisotropy is introduced only by training.
 
 Computation. The kernel is evaluated on the **full court grid** per
 batch (no precomputed stencil) using vectorized projections onto
@@ -95,9 +95,9 @@ log-kernel is
 
 and the per-shot kernel is normalized over the grid by softmax,
 yielding :math:`K_{jc} = \\mathrm{softmax}_c(\\log \\tilde K_{jc})`
-which sums to 1 over cells per shot. Memory is controlled by
-chunking along ``max_N`` (history length) so the peak intermediate
-``(B, chunk, n_cells)`` tensor stays under ~1 GB.
+which sums to 1 over cells per shot. Peak memory is controlled by
+evaluating the history axis in chunks of ``max_n_chunk`` shots, which
+bounds the ``(B, chunk, n_cells)`` intermediate.
 """
 
 from __future__ import annotations
@@ -129,7 +129,7 @@ class AnisotropicKernelEvaluator(nn.Module):
         Dimension of the per-shot context vector (must match
         :data:`shotcloud.data.context.CONTEXT_DIM`).
     kernel_form : {"z_only", "additive", "factored"}, default "factored"
-        Which σ parameterization is active. See module docstring.
+        Which σ parameterization is active; see the module docstring.
     sigma_min, sigma_max : float, default 0.75, 4.0
         Bounds on the per-shot widths (in feet). The sigmoid output
         is mapped to ``[σ_min, σ_max]``.
@@ -137,19 +137,25 @@ class AnisotropicKernelEvaluator(nn.Module):
         Hidden width of the two marginal MLPs ``MLP_z`` and ``MLP_x``.
     rank : int, default 4
         Rank of the bilinear interaction term ``(W x)^T (V z)``.
-        Only used when ``kernel_form == 'factored'``. Capped explicitly
-        to prevent the interaction from becoming an unconstrained
-        similarity network.
+        Only used when ``kernel_form == 'factored'``. Kept small so the
+        interaction cannot become an unconstrained similarity network.
     init_sigma : float, default 1.5
-        Target value for both ``σ_∥`` and ``σ_⊥`` at step 0. ``a_0``
+        Value of both ``σ_∥`` and ``σ_⊥`` at initialization. ``a_0``
         is initialized so that ``sigmoid(a_0) = (init_sigma − σ_min) /
-        (σ_max − σ_min)``. With output layers zero-init, this means
+        (σ_max − σ_min)``. With the output layers zero-initialized,
         every kernel starts as an isotropic Gaussian of bandwidth
-        ``init_sigma``, matching the current fixed-bandwidth default.
+        ``init_sigma``.
     max_n_chunk : int, default 64
-        Maximum ``max_N`` slice processed at a time, controlling
-        peak intermediate memory at forward time. Set lower if MPS
-        OOMs; higher to maximize throughput.
+        Number of history shots evaluated per chunk in :meth:`forward`.
+        Lower values reduce peak memory; higher values increase
+        throughput.
+
+    Raises
+    ------
+    ValueError
+        If ``kernel_form`` is unknown, the σ bounds are not
+        ``0 < sigma_min < sigma_max``, ``init_sigma`` lies outside them,
+        or a size argument is non-positive.
     """
 
     cell_centers: Tensor
@@ -210,16 +216,15 @@ class AnisotropicKernelEvaluator(nn.Module):
         self.register_buffer("cell_centers", torch.from_numpy(cell_xy), persistent=False)
         self._n_cells = int(cell_xy.shape[0])
 
-        # a_0: 2 biases (one each for σ_∥, σ_⊥), initialized so that
-        # at step 0 the kernel is isotropic Gaussian with bandwidth
-        # init_sigma. Both biases get the same value.
+        # a_0: 2 biases (one each for σ_∥, σ_⊥), both set so that the
+        # kernel is an isotropic Gaussian of bandwidth init_sigma at
+        # initialization.
         a0_init = _logit((self.init_sigma - self.sigma_min) / self.sigma_range)
         self.a_0 = nn.Parameter(torch.full((2,), a0_init, dtype=torch.float32))
 
-        # MLP_z and MLP_x: 27 → hidden → 2 (one head for σ_∥, one for σ_⊥).
-        # Output layers are zero-init so step-0 g_• equals a_0.
-        # ``mlp_z[-1]`` returns nn.Module statically; we keep a typed
-        # reference to the output Linear for init + diagnostics.
+        # MLP_z and MLP_x: context_dim → hidden → 2 (one output each for
+        # σ_∥ and σ_⊥). Output layers are zero-initialized so g_• equals
+        # a_0 at initialization.
         mlp_z_out = nn.Linear(hidden_dim, 2)
         nn.init.zeros_(mlp_z_out.weight)
         nn.init.zeros_(mlp_z_out.bias)
@@ -245,9 +250,9 @@ class AnisotropicKernelEvaluator(nn.Module):
         if kernel_form == "factored":
             # Rank-r bilinear: for each of (∥, ⊥), parameters
             # (W: r × D, V: r × D). Interaction term is
-            # (W x)^T (V z_j) summed across the rank-r dim. Zero-init
-            # both so the bilinear contribution is exactly zero at
-            # step 0.
+            # (W x)^T (V z_j) summed across the rank-r dim. Both are
+            # zero-initialized so the bilinear contribution vanishes at
+            # initialization.
             self.bilinear_W = nn.Parameter(torch.zeros(2, self.rank, context_dim))
             self.bilinear_V = nn.Parameter(torch.zeros(2, self.rank, context_dim))
         else:
@@ -256,6 +261,7 @@ class AnisotropicKernelEvaluator(nn.Module):
 
     @property
     def n_cells(self) -> int:
+        """Number of grid cells the kernel is evaluated on."""
         return self._n_cells
 
     def _compute_g(self, x_n: Tensor, z_j: Tensor) -> Tensor:
@@ -355,8 +361,7 @@ class AnisotropicKernelEvaluator(nn.Module):
             Per-historical-shot ``(x, y)`` coordinates in court feet.
         u_j : Tensor, shape ``(B, max_N, 2)``
             Per-historical-shot rim-radial unit vector
-            ``(s_j - r_rim) / ||s_j - r_rim||``. Fixed per shot at
-            fit time; threaded through here as a buffer-gather.
+            ``(s_j - r_rim) / ||s_j - r_rim||``, fixed per shot.
         mask : Tensor, shape ``(B, max_N)``, optional
             ``1`` for real shots, ``0`` for padding. When supplied,
             padded rows of the output are set to zero so they
@@ -366,9 +371,15 @@ class AnisotropicKernelEvaluator(nn.Module):
         -------
         Tensor of shape ``(B, max_N, n_cells)``
             Per-shot per-cell kernel weights. Each row sums to 1
-            over cells (it's the softmax-normalized Gaussian on the
-            grid in the rim-radial / tangential frame). Padded rows
-            are zero when ``mask`` is supplied.
+            over cells (the softmax-normalized Gaussian on the grid in
+            the rim-radial / tangential frame). Padded rows are zero
+            when ``mask`` is supplied.
+
+        Raises
+        ------
+        ValueError
+            If any input shape is inconsistent with the others or with
+            ``context_dim``.
         """
         if z_j.dim() != 3 or x_n.dim() != 2:
             raise ValueError(
@@ -416,10 +427,11 @@ class AnisotropicKernelEvaluator(nn.Module):
         return kernel
 
     def sigma_stats(self, x_n: Tensor, z_j: Tensor) -> dict[str, float]:
-        """Diagnostic helper: mean/std of σ_∥ and σ_⊥ across the batch.
+        """Summary statistics of σ_∥ and σ_⊥ over a batch.
 
-        Useful for the q_self diagnostic: ``σ_∥ ≠ σ_⊥`` on average
-        confirms the model is actually using anisotropy.
+        Returns the mean and standard deviation of each width and the
+        mean absolute difference ``|σ_∥ - σ_⊥|``, which is zero for an
+        isotropic kernel.
         """
         with torch.no_grad():
             sigma_par, sigma_perp = self._compute_sigmas(x_n, z_j)

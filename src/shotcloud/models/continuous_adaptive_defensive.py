@@ -1,14 +1,25 @@
-"""Cell-free defensive feasibility field (PR-D1a, pure module).
+"""Cell-free defensive feasibility field.
 
-Implements the multiplicative defensive reweighting term
+:class:`ContinuousAdaptiveDefensiveField` computes an opponent-specific
+additive term for the support logits of
+:class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial`
+from a kernel density over the shots opponent :math:`d` allowed strictly
+before the snapshot anchor of the current game. It is an alternative to the zone-level
+reweighting of
+:class:`~shotcloud.models.zone_defense_reweighting.ZoneReweightingDefense`,
+evaluated as an ablation.
+
+For every offensive support shot :math:`s_m` the field is
 
 .. math::
 
     D_\\Delta(s_m \\mid d, x_n, h_{n,r})
-    = \\beta_D \\,\\log \\sum_{j \\in \\mathcal D_d^{<t_n}}
-        \\alpha_{\\delta,j}(c_{d,n,r}) \\, K_h(s_m - s_j^{\\mathrm{allow}}),
+    = \\beta_D \\Bigl[\\log \\sum_{j \\in \\mathcal D_d^{<t_n}}
+        \\alpha_{\\delta,j}(c_{d,n,r}) \\, K_h(s_m - s_j^{\\mathrm{allow}})
+        \\; - \\; \\text{row mean over } m\\Bigr],
 
-where the attention is bilinear with a per-shot recency decay:
+where :math:`K_h` is an isotropic Gaussian kernel and the attention is
+bilinear with a per-shot recency decay:
 
 .. math::
 
@@ -25,50 +36,38 @@ The defensive query context is
 
     c_{d,n,r} = [x_n,\\, h_{n,r},\\, e_d,\\, v_d(t_n)],
 
-with :math:`v_d(t_n)` the PR-D0.5 defense-feature vector
-(team / zone / reliability blocks; see
+with :math:`v_d(t_n)` the causal defense-feature vector of opponent
+:math:`d` at the snapshot (team, zone and reliability blocks; see
 :mod:`shotcloud.features.defense_features`) and :math:`e_d` a small
-learnable opponent-id embedding. The per-allowed-shot key context
-:math:`z_j^{\\mathrm{def}}` is **location-derived** in this PR (the
-allowed-shot coordinate, distance to rim, and 8-zone one-hot); the
-opponent-level reliability / scheme signal is carried entirely by
-the *query* side via the feature artifact.
+learnable opponent-id embedding. The key context
+:math:`z_j^{\\mathrm{def}}` of each allowed shot is location-derived
+(coordinate, distance to the rim, zone one-hot); opponent-level
+reliability and scheme information enters only through the query.
 
-Scope contract (PR-D1a, "pure module"):
+Design notes:
 
-* Inputs are pre-gathered tensors. The module does **not** consume
-  the retrieval cache or the feature artifact directly — PR-D1b's
-  adapter does that gather step.
-* Output is the additive support-logit term :math:`D_\\Delta(s_m)`
-  for every offensive support shot, shape ``(B, M_off)``. Downstream
-  the :class:`ContinuousMixtureSpatial` wrapper adds this to the
-  collaborative + residual support logits before the gated subset
-  softmax (PR-D2a).
-* :math:`\\beta_D` is the warm-init scaling scalar (default
-  ``1e-3``). Hard zero is retained only as a unit-test setting for
-  the exact-no-op invariant; near-zero warm init keeps gradient
-  flow live into ``q_Δ`` / ``k_Δ`` / ``λ_{δ,age}`` from step 0.
-* Chunked KDE evaluation along the ``M_off`` query axis is
-  mandatory. The naive ``(B, M_off, M_def)`` distance tensor is
-  too large for MPS training at ``B=256, M_off≈1500, M_def≈1000``;
-  the chunked path processes ``query_chunk_size`` query points at
-  a time and never materializes the full ``M_off × M_def`` tensor.
+* Inputs are pre-gathered tensors; :func:`gather_defense_inputs` builds
+  them from a
+  :class:`~shotcloud.models.defensive_retrieval_cache.DefensiveRetrievalCache`
+  and a :class:`~shotcloud.features.defense_features.DefenseFeatures`
+  artifact.
+* The output is the additive support-logit term :math:`D_\\Delta(s_m)`
+  for every offensive support shot, shape ``(B, M_off)``, which the
+  spatial decoder adds to the collaborative and residual support logits
+  before the support softmax.
+* :math:`\\beta_D` is initialized near zero (default ``1e-3``) so the
+  field starts as an approximate no-op while gradient still reaches
+  ``q_Δ``, ``k_Δ`` and ``λ_{δ,age}``; ``β_D = 0`` gives an exact no-op.
+* The kernel sum is evaluated in chunks along the ``M_off`` axis, so the
+  full ``(B, M_off, M_def)`` distance tensor, which is prohibitively
+  large at typical sizes (e.g. ``B=256, M_off≈1500, M_def≈1000``), is
+  never materialized.
 
-Cold-start opponents (``def_mask.any(dim=-1) == False`` for some
-rows) contribute :math:`D_\\Delta = 0` exactly — they pass through
-the support softmax without affecting the offensive weighting. The
-implementation handles them via a safe-mode dummy on the masked
-softmax then a final ``torch.where`` zeroing, so no NaN ever
-propagates.
-
-What's intentionally out of scope (per PR-D1a build approval):
-
-* No lineup features ``v_d^lineup(n,r)`` — deferred to PR-D0.6 /
-  PR-D1.5.
-* No real-data adapter / gather — PR-D1b owns that.
-* No wrapper integration with :class:`ContinuousMixtureSpatial` —
-  PR-D2a.
-* No trainer flags / manifest / eval reconstruction — PR-D3.
+Cold-start opponents (no causal allowed shots, ``def_mask`` empty for
+the row) contribute :math:`D_\\Delta = 0` exactly, so they pass through
+the support softmax without affecting the offensive weighting. A dummy
+slot in the masked softmax followed by a final ``torch.where`` keeps
+these rows free of NaN.
 """
 
 from __future__ import annotations
@@ -85,12 +84,11 @@ if TYPE_CHECKING:
     from shotcloud.features.defense_features import DefenseFeatures
     from shotcloud.models.defensive_retrieval_cache import DefensiveRetrievalCache
 
-#: Default isotropic kernel bandwidth in feet. Shared with the
-#: offensive KDE per PR-D0.5 decision; the c → d ablation can sweep
-#: a separate bandwidth later if needed.
+#: Default isotropic kernel bandwidth in feet, equal to the offensive
+#: kernel bandwidth.
 DEFAULT_DEFENSE_BANDWIDTH_FT: Final[float] = 1.5
 
-#: Default β_D warm init. See module docstring for rationale.
+#: Default near-zero initial value of β_D (see the module docstring).
 DEFAULT_DEFENSE_BETA_INIT: Final[float] = 1e-3
 
 #: Default attention chunk size along the M_off axis.
@@ -106,17 +104,16 @@ def _location_key_context(def_xy: Tensor) -> Tensor:
 
     Returns a ``(B, M_def, _KEY_INPUT_DIM)`` tensor containing
     ``(x, y, distance_to_rim, zone_onehot)`` for each allowed shot.
-    The zone one-hot is computed on a NumPy detour because the zone
-    classifier is a NumPy routine in :mod:`shotcloud.data.zones`;
-    this function is called in the no-grad sense (the result feeds
-    into ``k_Δ`` which is the learnable part).
+    The zone one-hot goes through NumPy because the zone classifier
+    in :mod:`shotcloud.data.zones` is a NumPy routine, so no gradient
+    flows through it; the learnable part is ``k_Δ``, which consumes the
+    result.
     """
     b, m, _ = def_xy.shape
     flat = def_xy.detach().reshape(b * m, 2).cpu().numpy()
     zone_flat = zone_from_xy_vectorized(flat[:, 0], flat[:, 1])
-    # Out-of-court (zone == -1) gets an all-zero one-hot. This shouldn't
-    # happen in practice because the retrieval cache filters by zone
-    # upstream, but it's defensive.
+    # Out-of-court shots (zone == -1) get an all-zero one-hot. The
+    # retrieval cache filters these upstream; this is a safeguard.
     valid = zone_flat >= 0
     zone_onehot = torch.zeros(b * m, N_ZONES, dtype=def_xy.dtype, device=def_xy.device)
     if valid.any():
@@ -132,7 +129,10 @@ def _location_key_context(def_xy: Tensor) -> Tensor:
 
 
 class ContinuousAdaptiveDefensiveField(nn.Module):
-    """Pure cell-free defensive feasibility module (PR-D1a).
+    """Cell-free, attention-weighted defensive feasibility field.
+
+    See the module docstring for the definition of
+    :math:`D_\\Delta(s_m)`.
 
     Parameters
     ----------
@@ -159,21 +159,18 @@ class ContinuousAdaptiveDefensiveField(nn.Module):
         Output dim of both ``q_Δ`` and ``k_Δ`` (the bilinear dot-
         product dim).
     bandwidth : float, default :data:`DEFAULT_DEFENSE_BANDWIDTH_FT`
-        Isotropic Gaussian kernel bandwidth in feet. Shared with the
-        offensive KDE in v1.
+        Isotropic Gaussian kernel bandwidth in feet.
     beta_init : float, default :data:`DEFAULT_DEFENSE_BETA_INIT`
-        Warm-init for the scaling scalar ``β_D``.
+        Initial value of the learnable scaling scalar ``β_D``.
     lambda_age_init : float, default 0.0
         Initial value for the per-shot recency-decay coefficient
-        ``λ_{δ,age}`` inside the attention. Zero is the simplest
-        starting point because the cache layer already applied a
-        recency window; the attention's own decay then learns over
-        training.
+        ``λ_{δ,age}`` inside the attention. Zero is a natural starting
+        point because the retrieval cache already applies a recency
+        window; the additional decay is learned.
     query_chunk_size : int, default :data:`DEFAULT_DEFENSE_QUERY_CHUNK_SIZE`
         Number of query points (offensive support shots) processed
-        per chunk. The forward never materializes the full
-        ``(B, M_off, M_def)`` distance tensor; chunk along ``M_off``
-        and concatenate.
+        per chunk, bounding peak memory at
+        ``(B, query_chunk_size, M_def)``.
     """
 
     # Type-hint registered tensor buffers.
@@ -252,6 +249,7 @@ class ContinuousAdaptiveDefensiveField(nn.Module):
 
     @property
     def query_chunk_size(self) -> int:
+        """Number of offensive support shots evaluated per chunk."""
         return self._query_chunk_size
 
     def _build_query(
@@ -326,12 +324,30 @@ class ContinuousAdaptiveDefensiveField(nn.Module):
         h_n: Tensor | None,  # (B, within_game_dim) or None
         opp_idx: Tensor,  # (B,) int64
     ) -> Tensor:
-        """Compute :math:`D_\\Delta(s_m)` for every offensive support
-        shot in every batch row.
+        """Compute :math:`D_\\Delta(s_m)` for every offensive support shot.
 
-        Returns shape ``(B, M_off)``. The output is :math:`\\beta_D`-
-        scaled, so step-0 magnitudes are intentionally small (default
-        ``β_D = 1e-3``).
+        Parameters
+        ----------
+        query_xy : Tensor of shape ``(B, M_off, 2)``
+            Offensive support-shot coordinates in feet.
+        def_xy, def_mask, def_age_days, def_features : Tensor
+            Allowed-shot coordinates ``(B, M_def, 2)``, validity mask
+            ``(B, M_def)``, ages in days ``(B, M_def)``, and defense
+            features ``(B, defense_feature_dim)``, as returned by
+            :func:`gather_defense_inputs`.
+        x_n : Tensor of shape ``(B, context_dim)``
+            Offensive context vector.
+        h_n : Tensor of shape ``(B, within_game_dim)`` or None
+            Within-game history; required when ``within_game_dim > 0``.
+        opp_idx : Tensor of shape ``(B,)``, int64
+            Opponent vocabulary index.
+
+        Returns
+        -------
+        Tensor of shape ``(B, M_off)``
+            Row-mean-centered, ``β_D``-scaled field; zero on rows with no
+            allowed shots. With the default ``β_D`` initialization the
+            output is small at the start of training.
         """
         _b, m_off, _ = query_xy.shape
         # Per-row query projection (one MLP forward per row).
@@ -358,16 +374,14 @@ class ContinuousAdaptiveDefensiveField(nn.Module):
             out_chunks.append(log_a_chunk)
         log_a = torch.cat(out_chunks, dim=-1)  # (B, M_off)
 
-        # Per-row mean-center. The unscaled log-KDE field
+        # Per-row mean-centering. The unscaled log-KDE field
         #   log Σ_j α_j K_h(s − s_j)
-        # carries a large negative offset that depends on how far the
-        # nearest support shot is from the query — at NBA scale with
-        # h=1.5 ft, |log_a| can reach hundreds. That offset is a
-        # *per-row constant* and cancels exactly under the downstream
-        # support softmax in :class:`ContinuousMixtureSpatial`, so
-        # subtracting it has zero effect on the spatial likelihood
-        # while bringing the warm-init magnitude of ``D_Δ`` into the
-        # `β_D`-controlled regime the test_4 invariant assumes.
+        # carries a large negative offset (|log_a| can reach hundreds at
+        # h = 1.5 ft when allowed shots are far from the query). A
+        # per-row constant cancels exactly under the downstream support
+        # softmax, so subtracting the row mean leaves the spatial
+        # likelihood unchanged while keeping the magnitude of D_Δ
+        # controlled by β_D.
         log_a = log_a - log_a.mean(dim=-1, keepdim=True)
 
         # β_D scaling.
@@ -395,13 +409,12 @@ class ContinuousAdaptiveDefensiveField(nn.Module):
         )
 
 
-# Silence the unused-import warning while still re-exporting for
-# downstream consumers that may want to introspect the math constant.
+# Reference ``math`` so the otherwise-unused import is not flagged.
 _ = math
 
 
 # ---------------------------------------------------------------------------
-# PR-D1b: real-data gather adapter
+# Real-data gather adapter
 # ---------------------------------------------------------------------------
 
 
@@ -412,19 +425,20 @@ def gather_defense_inputs(
     cache: DefensiveRetrievalCache,
     features: DefenseFeatures,
 ) -> dict[str, Tensor]:
-    """Assemble per-row defensive inputs from the cache + features
-    artifact, ready to feed :meth:`ContinuousAdaptiveDefensiveField.forward`.
+    """Gather per-row defensive inputs from the retrieval cache and features.
+
+    The result feeds :meth:`ContinuousAdaptiveDefensiveField.forward`.
 
     Parameters
     ----------
     opp_idx, snapshot_idx : Tensor of shape ``(B,)`` int64
         Per-row opponent vocab index and snapshot index.
     cache : DefensiveRetrievalCache
-        PR-D0 allowed-shot retrieval cache. Provides
+        Per-(opponent, snapshot) causal allowed-shot cache. Provides
         ``def_idx / def_mask / global_xy / global_dates`` and the
-        anchor-date tuple from its config.
+        anchor dates in its config.
     features : DefenseFeatures
-        PR-D0.5 per-(opp, snap) feature tensor.
+        Per-(opponent, snapshot) causal defense-feature tensor.
 
     Returns
     -------
@@ -458,9 +472,8 @@ def gather_defense_inputs(
     device = opp_idx.device
     cache_device = cache.def_idx.device
     if cache_device != device:
-        # Ensure tensors are on the same device as the request. The
-        # cache is typically built on CPU; we move the per-row gathers
-        # over to whatever device the model lives on.
+        # The cache is typically built on CPU: gather there, then move
+        # the per-row results to the request's device.
         opp_idx_dev = opp_idx.to(cache_device)
         snap_idx_dev = snapshot_idx.to(cache_device)
     else:

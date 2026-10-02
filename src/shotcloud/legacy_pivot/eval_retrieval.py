@@ -1,5 +1,8 @@
 """Player retrieval accuracy: top-k retrieval of the correct player.
 
+Deprecated; retained for the classical-baseline ablation runner in
+:mod:`shotcloud.legacy_pivot.eval_ablation`.
+
 For each player ``i``, we compute the distance from real cloud ``i`` to
 *every* generated cloud, then check whether the correct player ``i`` is
 in the top-k closest. A model that has collapsed to a league-average

@@ -1,28 +1,27 @@
 """NBA player game-log join.
 
-Per-``(player_id, game_id)`` stats: starter status and minutes
-played, plus recency-weighted ``recent_3pa_frac``, ``recent_usage``,
-``recent_fga`` for the context vector ``x_n``.
+Per-``(player_id, game_id)`` statistics: starter status and minutes
+played, plus the recency-weighted ``recent_3pa_frac``,
+``recent_usage``, and ``recent_fga`` features of the context vector
+``x_n``.
 
-**Upstream data.** The CSV consumed here is fetched by shot_flow's
-``scripts/fetch_game_logs.R`` (R + ``nbastatR``); we treat it as a
-third-party artifact and join it onto our shots frame. The file lives
-at ``/Users/aarondanielson/Dropbox/shot_flow/data/player_game_logs.csv``
-and covers seasons 2014-15 through 2024-25 (~280k rows). Refreshing it
-is shot_flow's responsibility, not ours.
+**Upstream data.** The game-log CSV is produced by shot_flow's
+``scripts/fetch_game_logs.R`` (R + ``nbastatR``) and covers seasons
+2014-15 through 2024-25; it is treated as an external input (for
+example ``path/to/player_game_logs.csv``) and joined onto the shot
+table.
 
-**Starter inference.** The R fetcher does not surface the
-``START_POSITION`` column from NBA Stats, so :func:`load_game_logs`
-derives a heuristic starter from minutes played:
-``minutes >= STARTER_MINUTES_THRESHOLD`` (default 20) ≡ starter.
-NBA convention: starters typically log 28-32 min, bench players 8-15;
-the 20-min threshold sits cleanly in the gap. This heuristic carries
-**no information beyond ``minutes_norm``** (it's a discretization),
-so it's only adequate as a fallback. Pass ``starters_path`` to
-:func:`load_game_logs` to override the heuristic with real
-``START_POSITION``-derived values fetched per game by
-:doc:`scripts/fetch_starters`. Rows present in the starters file get
-the real value; rows absent (e.g. fetch is mid-run) keep the heuristic.
+**Starter inference.** The game-log CSV does not carry the NBA Stats
+``START_POSITION`` column, so :func:`load_game_logs` derives a
+heuristic starter flag from minutes played:
+``minutes >= STARTER_MINUTES_THRESHOLD`` (default 20). Starters
+typically log 28-32 minutes and bench players 8-15, so the threshold
+falls in the gap. The heuristic is a discretization of minutes and
+carries no information beyond ``minutes_norm``, so it serves only as a
+fallback. Pass ``starters_path`` to :func:`load_game_logs` to use
+``START_POSITION``-derived values fetched by
+``scripts/fetch_starters.py``; pairs present in the starters file get
+the fetched value and the rest keep the heuristic.
 """
 
 from __future__ import annotations
@@ -33,8 +32,8 @@ from typing import Final
 import numpy as np
 import pandas as pd
 
-#: Minutes-played threshold above which a player is classified as a
-#: starter. See module docstring for the rationale.
+#: Minutes-played threshold at or above which the heuristic classifies a
+#: player as a starter. See the module docstring for the rationale.
 STARTER_MINUTES_THRESHOLD: Final[int] = 20
 
 #: Columns the canonical game-log frame is required to expose.
@@ -47,9 +46,9 @@ CANONICAL_COLUMNS: Final[tuple[str, ...]] = (
 
 #: Default half-life (in days) for the exponential-recency weighting
 #: used to compute ``recent_3pa_frac``, ``recent_usage``, ``recent_fga``.
-#: 30 days roughly covers the last ~15 games of an NBA player's
-#: schedule (~2 games/week) and balances responsiveness with
-#: variance. Adjust at :func:`load_game_logs` call time if needed.
+#: At roughly 3-4 games per week, 30 days spans about the last 15
+#: games, trading responsiveness against variance. Override via
+#: :func:`load_game_logs`.
 DEFAULT_RECENCY_HALFLIFE_DAYS: Final[float] = 30.0
 
 #: Hollinger-style usage proxy weight on free-throw attempts.
@@ -74,11 +73,9 @@ def load_game_logs(
         NBA Stats ``BoxScoreTraditionalV3``. When provided, the
         ``starter`` column is **overridden** with the real
         ``START_POSITION``-derived value for any (player_id, game_id)
-        present in this file; any pair not in the file falls back to
-        the minutes-derived heuristic. The file may be partial (e.g.
-        if the fetch is mid-run); rows we don't have real data for
-        keep the heuristic. When ``None`` (default), starter is
-        purely minutes-derived.
+        present in this file; any pair not in the file (the file may be
+        partial) keeps the minutes-derived heuristic. When ``None``
+        (default), starter is purely minutes-derived.
     recency_halflife_days : float, default 30
         Half-life of the exponential decay used to compute
         ``recent_3pa_frac``, ``recent_usage``, and ``recent_fga``.
@@ -339,7 +336,9 @@ def join_game_logs(
     Returns
     -------
     DataFrame with the original shots columns plus ``minutes`` and
-    ``starter`` (both int64 when imputed).
+    ``starter`` (both int64 when imputed) and any of
+    ``recent_3pa_frac``, ``recent_usage``, ``recent_fga`` present in
+    ``game_logs`` (NaN filled with 0 when imputed).
 
     Notes
     -----

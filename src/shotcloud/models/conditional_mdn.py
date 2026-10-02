@@ -1,11 +1,10 @@
-"""Conditional Mixture Density Network — generic neural baseline.
+"""Conditional mixture density network (MDN) baseline.
 
-A strong generic-neural conditional-density baseline for
-shot-location modelling, matching the paper's three-level baseline
-ladder: classical reference KDE → conditional MDN → structured
-AC-KDE. The MDN consumes the same causal pregame context
-:math:`x_n \\in \\mathbb R^{27}` that the AC-KDE consumes and
-produces
+A generic neural conditional-density baseline for shot location. It
+sits between the classical reference KDE and the structured AC-KDE in
+the paper's baselines. The MDN consumes the same causal pregame context
+vector (the raw :math:`\\tilde x_n \\in \\mathbb R^{27}`) that the
+AC-KDE consumes and produces
 
 .. math::
 
@@ -25,10 +24,9 @@ trunk):
   :math:`\\varepsilon = 0.1` ft.
 
 This is a deliberately plain MDN: shared trunk, diagonal covariance,
-no court-aware reparameterisation. The paper's intent is to test
-whether *generic context conditioning* matches *structured causal
-support borrowing*, not to engineer a court-specialised neural
-density estimator.
+no court-aware reparameterisation. It measures how far *generic
+context conditioning* gets relative to *structured causal support
+borrowing*; it is not a court-specialised neural density estimator.
 
 Sampling uses ancestral mixture-component draws followed by a
 Gaussian draw with per-component diagonal scales, with rejection
@@ -68,9 +66,15 @@ class ConditionalMDN(nn.Module):
         single components collapsing to a delta during NLL training.
     n_hidden_layers : int, default 2
         Number of GELU-activated linear layers in the trunk.
+    init_sigma_ft : float, default 8.0
+        Initial per-component standard deviation in feet; must exceed
+        ``eps_sigma``.
+    court_bounds : tuple of float, default (-25.0, 25.0, -5.0, 47.0)
+        ``(x_lo, x_hi, y_lo, y_hi)`` rectangle over which the initial
+        component means are scattered.
 
     Inputs are the raw 27-dim context :math:`\\tilde x_n` (no
-    :class:`ContextMLP` in front); the MDN's own trunk learns the
+    :class:`~shotcloud.models.ContextMLP` in front); the MDN's own trunk learns the
     representation it needs. This deliberately separates the
     baseline's representation learning from AC-KDE's
     :math:`f_{\\mathrm{ctx}}` — the comparison is generic neural
@@ -136,8 +140,8 @@ class ConditionalMDN(nn.Module):
             self.head_mu.weight.zero_()
             self.head_log_sigma.weight.zero_()
 
-            # Stratified random init for mu: scatter the K components
-            # roughly uniformly across the half-court rectangle.
+            # Seeded uniform random init for mu: scatter the K components
+            # across the half-court rectangle.
             gen = torch.Generator().manual_seed(0)
             mu_init_x = torch.rand(self.n_components, generator=gen) * (x_hi - x_lo) + x_lo
             mu_init_y = torch.rand(self.n_components, generator=gen) * (y_hi - y_lo) + y_lo
@@ -167,10 +171,8 @@ class ConditionalMDN(nn.Module):
         # gives σ in [exp(-3), exp(4)] ≈ [0.05, 55] ft before the
         # eps_sigma floor — broad enough to be a uniform-over-court
         # baseline and tight enough to be a near-delta at the rim.
-        # Together these guarantees rule out any path to NaN/inf in
-        # the diff/sigma and log_norm chains regardless of which way
-        # the head weights drift, which was the empirical failure
-        # mode at epoch 2 on real shots (2026-06-08).
+        # Together these bounds rule out NaN/inf in the diff/sigma and
+        # log_norm computations regardless of how the head weights drift.
         mu = self.head_mu(h).view(-1, self.n_components, 2).clamp(min=-50.0, max=50.0)
         log_sigma = self.head_log_sigma(h).view(-1, self.n_components, 2).clamp(min=-3.0, max=4.0)
         sigma = torch.exp(log_sigma) + self.eps_sigma
@@ -248,8 +250,11 @@ class ConditionalMDN(nn.Module):
         :data:`shotcloud.simulation.sampler.DEFAULT_COURT_XLIM` /
         ``YLIM`` rectangle (matching AC-KDE's evaluator). After
         ``max_attempts`` rounds of rejection, any remaining
-        out-of-court draws are clipped to the rectangle so the
-        return is guaranteed inside the court.
+        out-of-court draws are redrawn once more and clipped to the
+        rectangle, so every returned point lies inside the court.
+
+        ``generator`` seeds the Gaussian draws only; the mixture
+        component indices are drawn from the global RNG.
         """
         if n_samples <= 0:
             raise ValueError(f"n_samples must be positive; got {n_samples}")

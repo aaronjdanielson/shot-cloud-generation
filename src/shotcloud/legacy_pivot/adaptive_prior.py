@@ -1,13 +1,17 @@
 """Adaptive offensive prior: ESS-gated self-KDE ⊕ archetype prior.
 
-Composition of the offensive prior (paper §3.2–§3.3):
+Deprecated; retained to reproduce the grid-cell decoder ablations. Superseded
+by the gated own/pooled support mixture of
+:class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial`.
 
-* Self component (Gibbs §3.2) — relevance-weighted self-KDE
+Composition of the offensive prior:
+
+* Self component — relevance-weighted self-KDE
   :math:`\\hat q_\\phi(c \\mid p, x_n) =
   \\sum_j \\pi_{\\phi,j}(x_n; \\mathcal H_p^{(t_i)}) M[c, k_j]`,
   with :math:`\\mathcal H_p^{(t_i)}` the player's history filtered to
   shots strictly before the snapshot anchor :math:`t_i`.
-* Archetype component (Gibbs §3.3) — adaptive archetype prior
+* Archetype component — adaptive archetype prior
   :math:`\\hat q_g(c \\mid x_n; t_i)
   = \\sum_k \\rho_{\\xi,k}(x_n) A_k^{(t_i)}(c)`,
   composed via :class:`ArchetypeDictionary` and
@@ -22,16 +26,15 @@ The two components are blended by ESS shrinkage:
     \\tilde q(c \\mid p, x_n; t_i) &=
         \\omega_p(x_n) \\hat q_\\phi(c) + (1 - \\omega_p(x_n)) \\hat q_g(c)
 
-The causal date mask (paper §2.5, Proposition 1) is enforced on the
-fly: each forward call masks history slots whose date is :math:`\\geq`
-the per-row anchor date pulled from
+The causal date mask is enforced on the fly: each forward call masks
+history slots whose date is :math:`\\geq` the per-row anchor date pulled from
 ``snapshot_store.bundles[snapshot_idx].anchor_date``. This guarantees
 :math:`\\mathcal H_p^{(t_i)}` is :math:`\\mathcal F_{<t_i}`-measurable
 without rebuilding per-player history per anchor.
 
-The defensive feasibility field ``a_δ`` (§3.4) and residual tilt
-``r_θ`` (§3.5) are applied downstream by other modules and composed
-under the Gibbs softmax in :class:`ConditionalGibbsDecoder` (§3.7).
+The defensive feasibility field ``a_δ`` and residual tilt ``r_θ`` are
+applied downstream by other modules and composed under the Gibbs softmax
+in :class:`~shotcloud.legacy_pivot.gibbs_decoder.ConditionalGibbsDecoder`.
 
 Implementation. The ragged per-player history is gathered on demand
 into padded ``(B, max_N)`` tensors per minibatch. The padding mask is
@@ -79,7 +82,7 @@ class AdaptiveOffensivePrior(nn.Module):
         **with** the ``date`` argument so per-shot dates are available
         for the causal mask.
     snapshot_store : SnapshotStore
-        Causal feature registry (paper §2.5). The constructor reads
+        Causal feature registry. The constructor reads
         anchor dates into a ``(T,)`` int64 buffer; the forward maps a
         per-row ``snapshot_idx`` into that buffer to supply the
         causal cutoff.
@@ -378,8 +381,7 @@ class AdaptiveOffensivePrior(nn.Module):
         # (= 1/eps), but we override ω = 0 explicitly via ``has_history``
         # so the layer reduces to the pure archetype prior. ``N_eff``
         # is detached so the relevance head can only learn through
-        # ``q_self``, not by inflating ``ω`` via a diffuse π (see
-        # 2026-05-16 working-log entry, Decision 2).
+        # ``q_self``, not by inflating ``ω`` via a diffuse π.
         pi_sq_sum = pi.pow(2).sum(dim=-1).clamp_min(self.eps)
         n_eff = 1.0 / pi_sq_sum.detach()
         omega = n_eff / (n_eff + self.kappa)
@@ -392,7 +394,7 @@ class AdaptiveOffensivePrior(nn.Module):
         # Additive smoothing instead of clamp_min: keeps gradient flowing
         # for cells where the model assigns very low density (clamp_min
         # would zero those gradients). Renormalize so q_off remains a
-        # proper probability over cells (see 2026-05-16 entry, Decision 1).
+        # proper probability over cells.
         # The clamp_min(0) absorbs tiny negative SVD-reconstruction
         # artifacts when low_rank is used; it's a no-op for the dense
         # path where q_phi and q_g are non-negative by construction.

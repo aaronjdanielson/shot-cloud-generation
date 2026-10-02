@@ -1,10 +1,9 @@
 """NBA shot-zone taxonomy and grid masks.
 
-Eight-zone categorization used for evaluation (zone KL, zone retrieval) and
-for visualization. Adapted from
-[shot_flow/src/shot_flow/data/zones.py](/Users/aarondanielson/Dropbox/shot_flow/src/shot_flow/data/zones.py)
-and rewired to consume :class:`~shotcloud.grids.CourtGrid` instead of the
-hardcoded 64×46 grid.
+Eight-zone categorization used for evaluation (zone KL, zone retrieval),
+zone-level features, and visualization. The zone definitions follow the
+companion shot_flow project; grid masks can be built for any
+:class:`~shotcloud.grids.CourtGrid`.
 
 Zone indices
 ------------
@@ -31,7 +30,9 @@ from numpy.typing import NDArray
 
 from shotcloud.grids import CourtGrid
 
+#: Number of on-court zones.
 N_ZONES: Final[int] = 8
+#: Short zone names, indexed by zone id.
 ZONE_NAMES: Final[tuple[str, ...]] = (
     "RA",
     "Paint",
@@ -64,7 +65,10 @@ _ABOVE_BREAK_AREA: Final[dict[str, int]] = {
 def zone_from_strings(shot_zone_basic: str, shot_zone_area: str) -> int:
     """Map NBA zone-label strings to a zone index in ``[0, 7]`` or ``-1``.
 
-    NBA Stats API columns are ``SHOT_ZONE_BASIC`` and ``SHOT_ZONE_AREA``.
+    The inputs are the NBA Stats ``SHOT_ZONE_BASIC`` and
+    ``SHOT_ZONE_AREA`` labels. Above-the-break threes with an
+    unrecognized area map to the top-of-key zone (7); other
+    unrecognized labels map to ``-1``.
     """
     if shot_zone_basic == "Above the Break 3":
         return _ABOVE_BREAK_AREA.get(shot_zone_area, 7)
@@ -78,9 +82,8 @@ def zone_from_xy(x: float, y: float) -> int:
     (e.g., backcourt heaves with ``y > 47``, behind the baseline with
     ``y < -5``, or beyond the sidelines with ``|x| > 25``).
 
-    Note: shot_flow's original ``zone_from_xy`` had unreachable ``return -1``
-    code; this version adds explicit out-of-bounds checks at the top so
-    backcourt shots are correctly flagged.
+    The out-of-bounds check runs before any zone test, so backcourt
+    shots are always labeled ``-1``.
     """
     # Out of the offensive half-court — backcourt or out-of-bounds.
     if y > 47.0 or y < -5.0 or abs(x) > 25.0:

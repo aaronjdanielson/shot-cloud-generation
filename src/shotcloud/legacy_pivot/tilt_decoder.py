@@ -1,7 +1,9 @@
 """Low-rank exponential-tilt decoder for the spatial mark model.
 
-Implements the spatial decoder from the role-aware marked point process
-([core_model_description.md §2](../../core_model_description.md)):
+Deprecated; retained to reproduce the grid-cell decoder ablations. Superseded
+by :class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial`.
+
+The decoder adds a low-rank tilt to a log base measure on the court grid:
 
 .. math::
 
@@ -19,13 +21,11 @@ encoder) and ``v_c ∈ ℝ^r`` is a learned spatial basis vector for cell
 **Critical invariant.** At zero-init (``V = 0``), the tilt term is
 identically zero and the logits collapse to ``log q_0``. Because ``q_0``
 is a probability that sums to 1, ``softmax(log q_0) = q_0`` exactly. The
-decoder therefore reproduces the KDE-product base measure at step 0,
+decoder therefore reproduces the base measure at initialization,
 which lets the model start training from a strong, statistically
 principled prior — the neural correction only learns the contextual
-deformation on top.
-
-This invariant is enforced by ``zero_init=True`` (the default) and
-verified by a test in ``tests/test_tilt_decoder.py``.
+deformation on top. ``zero_init=True`` (the default) selects this
+initialization.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ class LowRankTiltDecoder(nn.Module):
         smoother / smaller corrections, more stable training.
     zero_init : bool, default True
         If ``True``, ``V`` is initialized to zeros. The decoder then
-        reproduces the base measure exactly at step 0 — the load-bearing
+        reproduces the base measure exactly at initialization — the load-bearing
         invariant for stable training. If ``False``, ``V`` is randomly
         initialized with std ``1 / sqrt(rank)`` (Glorot-style).
 

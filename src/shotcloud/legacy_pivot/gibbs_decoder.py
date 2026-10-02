@@ -1,7 +1,11 @@
-"""Conditional Gibbs spatial decoder (paper §3.7).
+"""Conditional Gibbs spatial decoder over court cells.
+
+Deprecated; retained to reproduce the grid-cell decoder ablations. Superseded
+by :class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial`,
+which evaluates a continuous kernel mixture instead of a softmax over cells.
 
 Composes the three log-energy terms produced by the upstream
-modules into the headline spatial distribution
+modules into the spatial distribution
 
 .. math::
 
@@ -38,7 +42,7 @@ Forward contract
 ``(B, n_cells)`` log-probabilities. ``return_components=True``
 additionally returns a :class:`GibbsDecoderOutputs` dataclass with
 the per-component intermediates that are useful for ablations,
-diagnostics, and the structural-regularization losses (paper §6.2).
+diagnostics, and structural-regularization losses.
 
 Zero-init invariant
 -------------------
@@ -53,7 +57,7 @@ zero for every cell. The Gibbs decoder then collapses to
 
 which is itself a normalized geometric mean of the offensive prior
 and the defensive feasibility field. No information from the
-neural residual contaminates the geometry at step 0; training
+neural residual contaminates the geometry at initialization; training
 gradually opens it up via :math:`V`.
 
 Defensive uniform fallback
@@ -83,8 +87,8 @@ from shotcloud.legacy_pivot.tilt_decoder import LowRankTiltDecoder
 from shotcloud.models.collaborative_kde import CollaborativeKDE
 from shotcloud.models.context_residual import ContextResidualEncoder
 
-# Either offensive-prior backbone: legacy ω-gated mixture or the new
-# collaborative KDE. They have different forward signatures; the
+# Either offensive-prior backbone: the ω-gated self/archetype mixture or
+# the collaborative KDE. They have different forward signatures; the
 # decoder dispatches on the type at runtime.
 OffensivePriorBackbone = AdaptiveOffensivePrior | CollaborativeKDE
 
@@ -95,7 +99,7 @@ class GibbsDecoderOutputs:
 
     All tensors are batched along axis 0 and live on the same device
     as the inputs. Useful for downstream losses (entropy/ESS
-    regularizers on the relevance softmaxes), G1/G2 ablations
+    regularizers on the relevance softmaxes), component ablations
     (zero out one component, recompose), and visualization.
 
     Attributes
@@ -136,7 +140,7 @@ class GibbsDecoderOutputs:
     #: Rich per-prior intermediates. ``CollaborativeOutputs`` for the
     #: collaborative-KDE path (carries ``alpha``, ``beta``, ``sigma``,
     #: etc. — used by trainer-side entropy diagnostics); ``None`` for
-    #: the legacy ``AdaptiveOffensivePrior`` path. Typed as ``object``
+    #: the ``AdaptiveOffensivePrior`` path. Typed as ``object``
     #: so this module doesn't acquire a downward import; downstream
     #: consumers use ``isinstance(prior_components, CollaborativeOutputs)``.
     prior_components: object | None = None
@@ -145,24 +149,24 @@ class GibbsDecoderOutputs:
 class ConditionalGibbsDecoder(nn.Module):
     """Composes ``q_off``, ``a_δ``, ``r_θ`` into the Gibbs spatial distribution.
 
-    The paper's central spatial-decoder object (§3.7). Combines a
-    required offensive prior with an *optional* defensive field and
+    Combines a required offensive prior with an *optional* defensive field and
     an *optional* low-rank residual tilt, producing the conditional
     log-probability ``log_softmax(log q_off + [log a_δ] + [r_θ])``
     where each bracketed term is included only when its module is
-    supplied. The four ablation regimes covered by a single
-    constructor:
+    supplied. A single constructor covers four ablation regimes:
 
-    * **G1-D** (offense-only mixture): only ``offensive_prior``.
-    * **G2-A** (offense + defense): add ``defensive_field``.
-    * **G2-B** (offense + residual): add ``residual_encoder`` and
-      ``tilt_decoder`` (both required when either is present).
-    * **G2-C** (full Gibbs): all four.
+    * offense only: ``offensive_prior`` alone;
+    * offense + defense: add ``defensive_field``;
+    * offense + residual: add ``residual_encoder`` and
+      ``tilt_decoder`` (both required when either is present);
+    * full Gibbs decoder: all four.
 
     Parameters
     ----------
-    offensive_prior : AdaptiveOffensivePrior
-        Produces ``log q_off``, ``π_off``, ``ω`` for each row.
+    offensive_prior : AdaptiveOffensivePrior or CollaborativeKDE
+        Produces ``log q_off`` for each row. :class:`AdaptiveOffensivePrior`
+        also produces ``π_off`` and ``ω``; for :class:`CollaborativeKDE`
+        those outputs are zero-filled placeholders.
     defensive_field : AdaptiveDefensiveField, optional
         Produces ``log a_δ``, ``π_def``, ``has_history`` for each row.
         Omitted when training an offense-only configuration; the
@@ -285,12 +289,11 @@ class ConditionalGibbsDecoder(nn.Module):
         Tensor of shape ``(B, n_cells)``
             Log-probabilities :math:`\\log p(c)` for each row.
         """
-        # Offensive prior dispatch. The legacy AdaptiveOffensivePrior
-        # returns (log_q, π, ω); the new CollaborativeKDE returns log_q
-        # alone (with optional rich components). Both produce the same
-        # (B, n_cells) log_q for the energy sum; we synthesize placeholder
-        # π / ω for the legacy GibbsDecoderOutputs fields so downstream
-        # consumers keep working unchanged.
+        # Offensive prior dispatch. AdaptiveOffensivePrior returns
+        # (log_q, π, ω); CollaborativeKDE returns log_q alone (with
+        # optional rich components). Both produce the same (B, n_cells)
+        # log_q for the energy sum; placeholder π / ω fill the
+        # GibbsDecoderOutputs fields for the collaborative path.
         prior_components: object | None = None
         if isinstance(self.offensive_prior, CollaborativeKDE):
             # When components are requested downstream (e.g. for
@@ -310,8 +313,8 @@ class ConditionalGibbsDecoder(nn.Module):
             else:
                 log_q_off = self.offensive_prior(player_idx, snapshot_idx, x_n_raw, x_n)
             assert isinstance(log_q_off, Tensor)
-            # Collaborative architecture has no π, ω — use zero-size
-            # placeholders so GibbsDecoderOutputs stays a fixed shape.
+            # Collaborative architecture has no π, ω — use zero-filled
+            # placeholders so GibbsDecoderOutputs keeps the same fields.
             pi_off = torch.zeros(
                 log_q_off.shape[0], 1, dtype=log_q_off.dtype, device=log_q_off.device
             )
@@ -344,8 +347,7 @@ class ConditionalGibbsDecoder(nn.Module):
         # gradually via the V gradient.
         if self.residual_encoder is not None and self.tilt_decoder is not None:
             # When the encoder consumes within-game history, h_n must
-            # be provided. Otherwise (within_game_dim=0 legacy mode)
-            # h_n is ignored.
+            # be provided. Otherwise (within_game_dim=0) h_n is ignored.
             if self.residual_encoder.within_game_dim > 0:
                 if h_n is None:
                     raise ValueError(

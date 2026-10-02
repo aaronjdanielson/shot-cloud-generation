@@ -1,20 +1,17 @@
-"""Closed-form per-player role profiles for the archetype mixture.
+"""Closed-form per-player role profiles.
 
-The role profile is a deterministic, low-dimensional summary of a
-player's shot-geometry over a (causal) shot pool. It is the
-canonical, interpretable input to:
-
-* the archetype mixture network ``rho_xi(p, x_n)`` (paper §3.3),
-* the defensive relevance score's player-similarity term
-  ``role_sim(p', p_n)`` (paper §3.4),
-* per-player diagnostics surfaced alongside the snapshot trajectory
-  (paper §3.3a, "Why archetypes evolve").
+The role profile ``r_p`` is a deterministic, low-dimensional,
+interpretable summary of a player's shot geometry over a shot pool.
+Profiles are stored per snapshot in the :class:`~shotcloud.data.SnapshotStore`
+and enter the ``role_profile`` slice of the context vector ``x_n`` and
+the role slots of the player trait vector
+(:mod:`shotcloud.data.player_traits`).
 
 This module is **stateless and learning-free**: every coordinate of
 the profile is a closed-form aggregate of the input shots, so the
-function output depends only on the rows passed in. Causality is the
-caller's responsibility — pass the strict-past sub-frame
-``shots[shots.date < t_i]``; the function makes no time decisions.
+output depends only on the rows passed in. Causality is the caller's
+responsibility: pass the strict-past sub-frame
+``shots[shots.date < t_i]``; the functions make no time decisions.
 
 Profile composition (8-dim, ROLE_PROFILE_DIM)::
 
@@ -29,11 +26,12 @@ Profile composition (8-dim, ROLE_PROFILE_DIM)::
         shot_entropy,     # Shannon entropy on coarse 8x8 grid / log(64)
     )
 
-The first five rates partition shots and sum to 1 (unless backcourt
-shots are present, which the loader already filters). The last three
-are continuous unit-scale features: mean distance and its spread
-characterize the player's offensive radius; the entropy distinguishes
-spot-up specialists (concentrated) from movement shooters (spread).
+The first five rates partition the player's shots in the eight zones
+and sum to 1; shots outside the zones (backcourt) are excluded from
+their denominator. The last three are continuous unit-scale features:
+mean distance and its spread characterize the player's offensive
+radius, and the entropy distinguishes concentrated shot profiles
+(spot-up specialists) from spread ones (movement shooters).
 
 See also :func:`shotcloud.data.snapshots.build_snapshot_store_from_shots`,
 which accepts this builder via its ``role_profile_fn`` hook.
@@ -68,9 +66,9 @@ ROLE_FEATURE_NAMES: Final[tuple[str, ...]] = (
 #: in roughly [0, 1].
 DIST_SCALE: Final[float] = 30.0
 
-#: Scale factor for ``std_dist`` (feet). Half of ``DIST_SCALE`` since
-#: per-player std is bounded above by the half-court diagonal divided
-#: by 2 in practice.
+#: Scale factor for ``std_dist`` (feet). Distances lie in roughly
+#: ``[0, DIST_SCALE]``, so their standard deviation is at most about half
+#: of ``DIST_SCALE``.
 DIST_SCALE_STD: Final[float] = 15.0
 
 #: Coarse-grid resolution for the shot-entropy feature. 8x8 = 64 bins
@@ -79,8 +77,8 @@ DIST_SCALE_STD: Final[float] = 15.0
 #: ``log(64) ~ 4.16``; the normalized feature is in [0, 1].
 ENTROPY_BIN_COUNT: Final[int] = 8
 
-# Half-court extent for the entropy histogram. Matches the model's
-# default :class:`~shotcloud.grids.CourtGrid`.
+# Half-court extent for the entropy histogram; matches the default
+# :class:`~shotcloud.grids.CourtGrid`.
 _X_MIN: Final[float] = -25.0
 _X_MAX: Final[float] = 25.0
 _Y_MIN: Final[float] = -5.0
@@ -90,9 +88,8 @@ _Y_MAX: Final[float] = 47.0
 def _shot_entropy(x: NDArray[np.floating], y: NDArray[np.floating]) -> float:
     """Shannon entropy of (x, y) on a coarse 8x8 grid, normalized to [0, 1].
 
-    Returns 0 for fewer than 2 shots (no spread information) so the
-    feature is well-defined for sparse-history players. Empty input
-    returns 0 as well.
+    Returns 0 for fewer than 2 shots (no spread information), so the
+    feature is defined for sparse-history players.
     """
     n = x.shape[0]
     if n < 2:
@@ -123,12 +120,11 @@ def build_role_profiles(
     min_shots: int = 1,
     normalize: bool = True,
 ) -> dict[int, NDArray[np.float32]]:
-    """Compute closed-form role profiles for every player in `shots`.
+    """Compute closed-form role profiles for every player in ``shots``.
 
-    Each profile is a deterministic, learning-free 8-dim summary of
-    the player's shot geometry over the input shot pool. The function
-    is stateless: the output for player ``p`` depends only on the
-    rows of `shots` with ``player_id == p``.
+    Each profile is a deterministic 8-dim summary of the player's shot
+    geometry over the input shot pool; the output for player ``p``
+    depends only on the rows of ``shots`` with ``player_id == p``.
 
     Causality is the caller's responsibility: pass
     ``shots[shots.date < t_i]`` to obtain a profile valid at anchor
@@ -146,8 +142,8 @@ def build_role_profiles(
     min_shots : int, default 1
         Players with fewer than this many shots are omitted from the
         result. The default (1) admits any player with at least one
-        shot. Set to 50 to match the per-player KDE filter used in
-        the snapshot pretraining script.
+        shot; ``scripts/pretrain_snapshots.py`` passes its
+        ``--min-shots`` value.
     normalize : bool, default True
         When True, distance features are divided by their unit scale
         and entropy by ``log(ENTROPY_BIN_COUNT**2)``, putting all
@@ -158,13 +154,13 @@ def build_role_profiles(
     -------
     dict[int, NDArray[np.float32]]
         Mapping from player ID to an ``(8,)`` float32 array. Players
-        absent from `shots` (or below `min_shots`) are absent from
-        the dict.
+        absent from ``shots``, below ``min_shots``, or with no shots in
+        the eight zones are absent from the dict.
 
     Raises
     ------
     ValueError
-        If a required column is missing.
+        If a required column is missing or ``min_shots`` is negative.
     """
     for col in (player_col, x_col, y_col):
         if col not in shots.columns:
@@ -178,7 +174,7 @@ def build_role_profiles(
     x_all = shots[x_col].to_numpy(dtype=np.float64)
     y_all = shots[y_col].to_numpy(dtype=np.float64)
 
-    # Cell-zone for every shot in one vectorized pass (8-zone taxonomy).
+    # Zone index for every shot in one vectorized pass.
     zones = zone_from_xy_vectorized(x_all, y_all)
     distances = np.sqrt(x_all * x_all + y_all * y_all)
 
@@ -197,10 +193,9 @@ def build_role_profiles(
         x_p = x_all[mask]
         y_p = y_all[mask]
 
-        # Zone rates over the 8-zone taxonomy.
-        # Backcourt and other invalid zones get index -1; we treat
-        # them as out-of-distribution and exclude from the rate
-        # denominator implicitly by counting only valid zones.
+        # Zone rates over the 8-zone taxonomy. Backcourt and other
+        # unclassified shots (zone -1) are excluded from the denominator;
+        # the distance and entropy features still use every shot.
         valid = (z >= 0) & (z < N_ZONES)
         n_valid = int(valid.sum())
         if n_valid == 0:
@@ -257,11 +252,10 @@ def build_role_profiles_dataframe(
     """Convenience wrapper returning a player-indexed DataFrame.
 
     Same semantics as :func:`build_role_profiles`, but the output is
-    a DataFrame with one row per player and columns named by
-    :data:`ROLE_FEATURE_NAMES`. Useful for diagnostics and
-    interactive exploration; the dict form is what
+    a DataFrame indexed by player with columns named by
+    :data:`ROLE_FEATURE_NAMES`, for diagnostics and interactive use.
     :func:`shotcloud.data.snapshots.build_snapshot_store_from_shots`
-    consumes.
+    consumes the dict form.
     """
     profiles = build_role_profiles(
         shots,

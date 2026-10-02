@@ -25,10 +25,10 @@ The aggregated batch density is
     q_b(c) = \\sum_j w_{b,j}\\, K_x(c_x - s_{b,j,x})\\, K_y(c_y - s_{b,j,y}),
 
 computed via reshape + ``bmm`` so the intermediate ``(B, J, n_x, n_y)``
-tensor is **never materialized** — peak memory is
-``O(B*J*max(n_x, n_y))`` instead of ``O(B*J*n_x*n_y)``. This is the
-core win for the collaborative KDE forward, where ``B*J ≈ 144k`` and
-``n_x*n_y ≈ 3.5k`` would otherwise allocate ~500 MB per forward call.
+tensor is **never materialized**: peak memory is
+``O(B*J*(n_x + n_y))`` instead of ``O(B*J*n_x*n_y)``, which is what makes
+the grid forward of the collaborative KDE affordable at realistic batch
+and support sizes.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ def separable_gaussian_density(
         Per-batch, per-shot ``(x, y)`` coordinates in court feet.
     weights : Tensor of shape ``(B, J)``
         Per-shot scalar weights (typically :math:`\\alpha_{b,l}\\,\\beta_{b,l,r}`
-        after flattening the ``(L, R)`` axes into ``J = L\\cdot R``).
+        after flattening the ``(L, R)`` axes into :math:`J = L R`).
     sigma : Tensor of shape ``(B,)``
         Per-batch bandwidth in court feet.
     xcenters : Tensor of shape ``(n_x,)``
@@ -62,18 +62,18 @@ def separable_gaussian_density(
     ycenters : Tensor of shape ``(n_y,)``
         Cell-center y-coordinates (the row axis).
     eps : float
-        Floor for axis-wise normalization to avoid 0/0 when a shot lands
-        many σ away from every cell on one axis.
+        Unused. The axis-wise normalization is a softmax over log-kernel
+        values, which stays finite even when a shot lies many σ from
+        every cell center.
 
     Returns
     -------
     Tensor of shape ``(B, n_y * n_x)``
         Flat density per cell in **image-layout C-ravel** order
-        ``c = i_y \\cdot n_x + i_x``, matching
-        :class:`shotcloud.grids.court.CourtGrid`. No additional
-        normalization is applied — the returned tensor is the
-        weighted sum, so per-batch sums equal
-        ``sum_j weights[b, j]`` exactly (modulo float).
+        ``c = i_y * n_x + i_x``, matching
+        :class:`shotcloud.grids.court.CourtGrid`. No further
+        normalization is applied: each row sums to
+        ``weights[b].sum()`` up to floating-point error.
     """
     if coords.dim() != 3 or coords.shape[-1] != 2:
         raise ValueError(f"coords must be (B, J, 2); got {tuple(coords.shape)}")
@@ -118,6 +118,6 @@ def separable_gaussian_density(
     # Reorder (B, n_x, n_y) → (B, n_y, n_x) and flatten to C-ravel
     # ``c = i_y * n_x + i_x`` matching image layout.
     q_yx = q_xy.transpose(1, 2).contiguous()  # (B, n_y, n_x)
-    # Silence the unused-import note from `eps` in the public signature.
+    # ``eps`` is accepted for signature stability but not needed.
     _ = eps
     return q_yx.reshape(b, ny * nx)

@@ -1,7 +1,9 @@
-"""KDE diagnostics: descriptive statistics on classical KDEs (Phase 0.5)
-and per-player NLL slices on the trained model (Phase 1.5).
+"""KDE diagnostics: descriptive statistics and per-player NLL slices.
 
-Phase 0.5 helpers characterize the *prior geometry* before any learnable
+Deprecated; retained to reproduce the classical-KDE and temperature
+diagnostics on the court grid.
+
+The classical-KDE helpers characterize the *prior geometry* before any learnable
 parameter is introduced. They run on a fitted
 :class:`~shotcloud.kde.HierarchicalKDE` and produce per-player
 statistics that reveal:
@@ -13,16 +15,16 @@ statistics that reveal:
 * **Where the model has held-out NLL headroom** — per-player NLL on a
   held-out frame, grouped by shot count.
 
-Phase 1.5 helpers add per-player held-out NLL under the **trained
-model** ``softmax_c[τ · log q_p^hier(c) + u_p^⊤ V_c]`` so the gain over
+The trained-model helper adds per-player held-out NLL under the
+low-rank tilt decoder ``softmax_c[τ · log q_p^hier(c) + u_p^⊤ V_c]`` so the gain over
 the classical Hier-KDE baseline can be sliced by the same buckets.
 
-The outputs feed ``scripts/diagnose_kde.py`` (Phase 0.5) and
-``scripts/phase15_temperature_slice.py`` (Phase 1.5).
+The outputs feed ``scripts/legacy_pivot/diagnose_kde.py`` and
+``scripts/legacy/phase15_temperature_slice.py``.
 
-All Phase 0.5 metrics are pure-numpy and operate on density grids in
-image layout ``(ny, nx)`` or flat ``(n_cells,)``. The Phase 1.5
-trained-NLL helper takes torch ``encoder``/``decoder`` modules.
+The classical-KDE metrics are pure-numpy and operate on density grids in
+image layout ``(ny, nx)`` or flat ``(n_cells,)``. The trained-NLL helper
+takes torch ``encoder``/``decoder`` modules.
 """
 
 from __future__ import annotations
@@ -110,8 +112,8 @@ def held_out_nll(q: NDArray[np.floating], cells: NDArray[np.integer]) -> float:
 # Player-level bucketing
 # ---------------------------------------------------------------------------
 
-# Boundaries chosen to match research_plan.md §3 — these are the buckets
-# every Phase 0.5 / Phase 1.5 diagnostic uses. Keep in sync with the plan.
+# Shared by every diagnostic in this module so the classical and trained
+# slices are directly comparable.
 SHOT_COUNT_BUCKET_EDGES: tuple[float, ...] = (0.0, 50.0, 500.0, 2000.0)
 SHOT_COUNT_BUCKET_LABELS: tuple[str, ...] = ("<50", "50-500", "500-2000", ">=2000")
 
@@ -304,7 +306,7 @@ def summarize_by_bucket(per_player: pd.DataFrame) -> pd.DataFrame:
                 sub["nll_gain_hier_over_raw"].to_numpy(dtype=np.float64), weights
             ),
         }
-        # Phase-1.5 columns are present only if attached.
+        # Trained-model columns are present only if attached.
         if "nll_trained_held" in sub.columns:
             row["weighted_nll_trained_held"] = _weighted_mean(
                 sub["nll_trained_held"].to_numpy(dtype=np.float64), weights
@@ -319,7 +321,7 @@ def summarize_by_bucket(per_player: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Phase 1.5 — per-player trained NLL slice
+# Per-player trained NLL slice
 # ---------------------------------------------------------------------------
 
 
@@ -359,7 +361,7 @@ def per_player_trained_nll(
         Same vocab the trained model was built against.
     tau : float, default 1.0
         Temperature applied to ``log q_p^hier``. Pass the value learned
-        by :class:`~shotcloud.models.LearnableTemperature`.
+        by :class:`~shotcloud.legacy.temperature.LearnableTemperature`.
     device : optional, default ``"cpu"``
 
     Returns

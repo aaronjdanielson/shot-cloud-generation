@@ -187,137 +187,228 @@ class CausalZoneBias(nn.Module):
 
 @dataclass(frozen=True)
 class ContinuousMixtureOutputs:
-    """Per-batch intermediates of one cell-free spatial forward.
+    r"""Per-batch intermediates of one cell-free spatial forward pass.
 
-    Mirrors :class:`shotcloud.models.gibbs_decoder.GibbsDecoderOutputs`
-    in spirit: rich-enough for downstream diagnostics (α/β entropy,
-    support entropy, expected distance) without forcing the trainer
-    to redo the forward pass.
+    Shared by :class:`ContinuousMixtureSpatial` and the mode-based
+    alternatives
+    (:class:`~shotcloud.models.collaborative_mode_mixture.CollaborativeModeMixtureSpatial`,
+    :class:`~shotcloud.models.mode_routed_spatial.ModeRoutedContinuousMixtureSpatial`),
+    so diagnostics can be computed without repeating the forward pass.
+    ``n_components`` is the number of support shots ``M`` for the
+    continuous mixture and the number of court modes ``K`` for the
+    mode-mixture variant.
+
+    Attributes
+    ----------
+    log_lik : Tensor of shape (B,)
+        Log-density of the mixture at the observed shot coordinate.
+    log_weights : Tensor of shape (B, n_components)
+        Normalized log mixture weights; ``-inf`` on invalid components.
+        With a pooling gate these are the effective weights
+        :math:`\lambda\,\omega_{\mathrm{own}}` on own slots and
+        :math:`(1 - \lambda)\,\omega_{\mathrm{pooled}}` on pooled slots.
+    support_xy : Tensor of shape (B, n_components, 2)
+        Component centers (support shots or mode anchors), in court feet.
+    sigma : Tensor of shape (B,)
+        Per-row bandwidth. When a per-shot bandwidth is active this is
+        the mean over the row's support shots (a diagnostic); for the
+        mode-mixture variant it is the mean across modes.
+    support_mask : Tensor of shape (B, n_components), bool
+        Valid components. All ``True`` for the mode-mixture variant,
+        where cold start is handled per row rather than per mode.
+    residual_logits : Tensor of shape (B, M)
+        Residual-tilt contribution :math:`R_\theta(s_m)` to the support
+        logits; zero when no residual is wired.
+    collab : CollaborativeContinuousOutputs
+        Raw outputs of the support backend.
+    cold_start : Tensor of shape (B,), bool
+        Rows whose causal support set is empty after masking.
+    support_log_weights : Tensor of shape (B, M)
+        Log support attention :math:`\log \omega_m`. Equal to
+        ``log_weights`` for the continuous mixture; always indexed by
+        support shot, so support-level diagnostics apply to every
+        variant.
+    tail_responsibility : Tensor of shape (B,) or None
+        Posterior responsibility of the support-KDE tail component for
+        the observed shot,
+        :math:`\lambda_{\mathrm{tail}} f_{\mathrm{tail}} /
+        [(1 - \lambda_{\mathrm{tail}}) f_{\mathrm{mode}}
+        + \lambda_{\mathrm{tail}} f_{\mathrm{tail}}]`. Set only by the
+        mode-mixture variant with ``tail_weight > 0``.
+    gate_lambda : Tensor of shape (B,) or None
+        Own-support mixing weight :math:`\lambda` of the pooling gate,
+        so that :math:`f = \lambda f_{\mathrm{own}} + (1 - \lambda)
+        f_{\mathrm{pooled}}`. Set only when a pooling gate is wired.
+    defense_logits : Tensor of shape (B, M) or None
+        Opponent-reweighting contribution :math:`D(s_m)` to the support
+        logits; zero on defensive cold-start rows. Set only when a
+        defensive field is wired.
+    defense_cold_start : Tensor of shape (B,), bool, or None
+        Rows with no causal defensive evidence for the opponent at the
+        snapshot; their defensive contribution is identically zero.
+    sigma_per_shot : Tensor of shape (B, M) or None
+        Per-support-shot bandwidth from
+        :class:`~shotcloud.models.zone_source_bandwidth.ZoneSourceBandwidth`;
+        the tensor the log-likelihood actually uses when set.
+    matchup_logits : Tensor of shape (B, M) or None
+        Player-versus-opponent matchup contribution
+        :math:`\beta_{\mathrm{match}}\,\widehat\Delta_{p,d,z(s_m)}(t)` to the
+        support logits. Exactly zero on rows with no causal matchup
+        evidence. Set only when a matchup field is wired.
+    matchup_n_eff : Tensor of shape (B,) or None
+        Effective peer-versus-opponent sample size used to shrink
+        :math:`\widehat\Delta`. Set only when a matchup field is wired.
+    mode_log_pi : Tensor of shape (B, K) or None
+        Mode-router log-probabilities renormalized over the modes with
+        causal support (unavailable modes are ``-inf``). Set only by the
+        mode-routed decoder.
+    mode_available : Tensor of shape (B, K), bool, or None
+        Modes with at least one causal support shot.
+    mode_log_pi_raw : Tensor of shape (B, K) or None
+        Mode-router log-probabilities before availability
+        renormalization, so the mass assigned to empty modes,
+        :math:`1 - \sum_{k\ \mathrm{available}} \pi_k`, can be reported.
     """
 
-    log_lik: Tensor  # (B,) per-row log-likelihood at the observed shot
-    log_weights: Tensor  # (B, n_components) log mixture weights (normalized;
-    #                      -inf on invalid). ``n_components = M`` for the
-    #                      continuous-mixture variant (one component per
-    #                      support shot); ``n_components = K`` for the
-    #                      mode-mixture variant (one per court mode).
-    support_xy: Tensor  # (B, n_components, 2) — component coords (support
-    #                     shots or mode anchors).
-    sigma: Tensor  # (B,) — per-row bandwidth (mean across modes for
-    #              mode-mixture; per-row σ_p(t_m) for continuous-mixture).
-    support_mask: Tensor  # (B, n_components) bool — which components are
-    #                       valid this row. For mode-mixture all K modes
-    #                       are valid for every row (cold-start is per-row,
-    #                       not per-mode), so this is all-True there.
-    residual_logits: Tensor  # (B, M) R_θ contribution to support attention
-    #                          (zero when residual off; M = L*R always).
-    collab: CollaborativeContinuousOutputs  # raw support A + B and diagnostics.
-    cold_start: Tensor  # (B,) bool — rows whose causal support set was
-    #                     entirely empty after masking.
-    support_log_weights: Tensor  # (B, M) log of the support attention ω.
-    #                              Equal to ``log_weights`` for the
-    #                              continuous-mixture variant; distinct from
-    #                              the K-shaped mode weights for the
-    #                              mode-mixture variant. Always M-shaped, so
-    #                              α/β diagnostics that marginalize over
-    #                              the (L, R) factorization work in both
-    #                              variants uniformly.
+    log_lik: Tensor
+    log_weights: Tensor
+    support_xy: Tensor
+    sigma: Tensor
+    support_mask: Tensor
+    residual_logits: Tensor
+    collab: CollaborativeContinuousOutputs
+    cold_start: Tensor
+    support_log_weights: Tensor
     tail_responsibility: Tensor | None = None
-    #: (B,) — per-row γ_tail = λ_tail·f_tail / [(1-λ_tail)·f_mode +
-    #: λ_tail·f_tail], the posterior responsibility of the support-KDE
-    #: tail component for the observed shot. Only populated by the
-    #: mode-mixture wrapper when ``tail_weight > 0``; ``None`` otherwise.
-    #: Used as a per-epoch diagnostic — large ``mean(γ_tail)`` means
-    #: the tail is doing the explanatory work and the K-mode mixture
-    #: is failing to cover the support.
     gate_lambda: Tensor | None = None
-    #: (B,) — per-row own-history mixing weight λ from the
-    #: history-dependent pooling gate: density = λ·f_own +
-    #: (1-λ)·f_pooled. Only populated when the continuous-mixture
-    #: wrapper is run with a pooling gate; ``None`` otherwise.
     defense_logits: Tensor | None = None
-    #: (B, M) — additive support-logit contribution from the
-    #: defensive feasibility field :math:`D_\Delta(s_m)`. Populated
-    #: only when a defensive field is wired into the wrapper (PR-D2a).
-    #: ``None`` otherwise. Zero on cold-start defensive rows.
     defense_cold_start: Tensor | None = None
-    #: (B,) bool — per-row flag for "defensive cache had no causal
-    #: allowed shots against this opponent at this snapshot". The
-    #: defensive field's contribution for these rows is identically
-    #: zero (the field's own cold-start safety net). Populated only
-    #: when a defensive field is wired.
     sigma_per_shot: Tensor | None = None
-    #: (B, M) — per-support-shot bandwidth from the Tier-1a
-    #: ``ZoneSourceBandwidth`` field. ``None`` when the bandwidth field
-    #: isn't wired (the wrapper falls back to a per-row σ on
-    #: :attr:`sigma`). When populated, :attr:`sigma` carries the
-    #: per-row mean as a diagnostic; the per-shot tensor is what the
-    #: loglik actually consumed.
     matchup_logits: Tensor | None = None
-    #: (B, M) — additive support-logit contribution from the Tier-2a
-    #: D-matchup field :math:`\\beta_{\\mathrm{match}}\\widehat\\Delta_{p,d,z(s_m)}(t)`.
-    #: Populated only when a matchup field is wired; cold-start rows
-    #: (no causal peer-vs-opponent evidence) produce exactly zero
-    #: because the underlying Δ̂ is exactly zero.
     matchup_n_eff: Tensor | None = None
-    #: (B,) — per-row effective peer-vs-opponent sample size used to
-    #: shrink Δ̂. Carried for ESS-bucket falsification ("does D-matchup
-    #: only help where evidence is strong?"). Populated only when the
-    #: matchup field is wired.
     mode_log_pi: Tensor | None = None
-    #: (B, K) — per-row mode router log-probabilities, renormalized
-    #: over modes available for that row (modes with no causal support
-    #: are masked to ``-inf``). Populated only by the mode-routed
-    #: decoder; ``None`` for the single-softmax CMS path. Used both
-    #: for the within-batch log-density evaluation and for the
-    #: diagnostics ``H(π)``, ``mean max_k π_k``, ``mode usage``.
     mode_available: Tensor | None = None
-    #: (B, K) bool — per-row mask indicating which modes have at
-    #: least one causal support shot. Carried alongside
-    #: :attr:`mode_log_pi` so downstream diagnostics can compute the
-    #: empty-mode rate and the "renormalization mass lost" (the
-    #: pre-renormalization mass that landed on unavailable modes).
     mode_log_pi_raw: Tensor | None = None
-    #: (B, K) — per-row mode router log-probabilities BEFORE the
-    #: availability renormalization. Storing both lets the trainer
-    #: report ``mass lost`` = ``1 - Σ_{k available} exp(mode_log_pi_raw[k])``,
-    #: i.e. how much router probability landed on empty modes.
 
 
 class ContinuousMixtureSpatial(nn.Module):
-    """Cell-free continuous-mixture spatial decoder.
+    r"""Cell-free continuous-mixture spatial decoder (the AC-KDE spatial factor).
+
+    For each shot the decoder gathers causal support shots
+    :math:`s_m` from ``offensive_prior``, forms support logits
+
+    .. math::
+
+        \ell_m = \underbrace{A + B}_{\text{backend}}
+                + b^{\mathrm{zone}}_m + D(s_m) + M(s_m) + R_\theta(s_m),
+
+    and evaluates the kernel mixture
+    :math:`f(y) = \sum_m \mathrm{softmax}_m(\ell_m)\, K_m(y - s_m)` at the
+    observed coordinate :math:`y`. Each optional term is present only when
+    its module is wired: the causal zone bias :math:`b^{\mathrm{zone}}`,
+    the opponent reweighting :math:`D`, the matchup reweighting :math:`M`,
+    and the low-rank residual tilt :math:`R_\theta(s_m) = u^\top \psi(s_m)`.
+    With a ``pooling_gate`` the softmax is taken separately over own and
+    pooled support and the two densities are mixed by the gate weight
+    :math:`\lambda`.
+
+    The kernel :math:`K_m` is an isotropic Gaussian whose bandwidth is the
+    backend's per-row :math:`\sigma`, or a per-support-shot
+    :math:`\sigma_m` from ``bandwidth_field``; alternatively
+    ``anisotropic_kernel`` supplies the log-kernel directly.
 
     Parameters
     ----------
-    offensive_prior : CollaborativeKDE
-        Source of support shots, A_l (player) + B_{l,r} (shot)
-        scores, and σ.
+    offensive_prior : CollaborativeKDE or RetrievalCollaborativeKDE
+        Support backend. Supplies the support shots and mask, the own/pooled
+        partition, the support logits :math:`A + B`, the bandwidth, and the
+        causal trait buffer.
     residual_encoder : ContextResidualEncoder or None
-        When provided, must be paired with ``location_embedding``.
-        Produces ``u = u_θ(x_n, h_n) ∈ R^{rank}`` per shot.
+        Context encoder producing :math:`u \in \mathbb R^{\mathrm{rank}}`
+        for the residual tilt. Must be paired with ``location_embedding``.
     location_embedding : LocationEmbedding or None
-        Coordinate embedding ``ψ(s) ∈ R^{rank}`` matching the
-        residual encoder's ``rank``. The residual contribution is
-        ``R(s_m) = u^T ψ(s_m)``.
-    defensive_field : ContinuousAdaptiveDefensiveField or None
-        When provided, must be paired with both ``defensive_cache`` and
-        ``defensive_features``. Produces an additive support-logit
-        contribution :math:`D_\\Delta(s_m)` (PR-D1a) which the wrapper
-        adds to the support logits *before* the own/pooled subset
-        softmaxes — defense reshapes mass within each subset while
-        leaving the pooling gate :math:`\\lambda` untouched. Wiring all
-        three to ``None`` preserves the no-defense path bit-exactly.
+        Coordinate embedding :math:`\psi(s) \in \mathbb R^{\mathrm{rank}}`;
+        its ``rank`` must equal the residual encoder's.
+    defensive_field : ContinuousAdaptiveDefensiveField or ZoneReweightingDefense or None
+        Opponent reweighting :math:`D(s_m)`.
+        :class:`~shotcloud.models.zone_defense_reweighting.ZoneReweightingDefense`
+        (zone-level reweighting, the mainline choice) requires
+        ``defensive_features`` and no cache;
+        :class:`~shotcloud.models.continuous_adaptive_defensive.ContinuousAdaptiveDefensiveField`
+        (a kernel field over allowed shots, evaluated as an ablation)
+        requires both ``defensive_cache`` and ``defensive_features``.
     defensive_cache : DefensiveRetrievalCache or None
-        Per-(opponent, snapshot) allowed-shot retrieval cache (PR-D0).
-        Consumed via :func:`shotcloud.models.continuous_adaptive_defensive.gather_defense_inputs`
-        inside the wrapper.
+        Per-(opponent, snapshot) causal allowed-shot cache, consumed
+        through
+        :func:`~shotcloud.models.continuous_adaptive_defensive.gather_defense_inputs`.
     defensive_features : DefenseFeatures or None
-        Per-(opponent, snapshot) defensive feature tensor (PR-D0.5).
-    cold_start_log_lik_floor : float
-        Per-row log-likelihood assigned to batch rows whose
-        ``support_mask`` is all-``False`` (no valid causal support).
-        Defaults to a uniform-court-density floor so the batch loss
-        stays finite.
+        Per-(opponent, snapshot) causal defensive feature tensor.
+    matchup_field : MatchupReweightingDefense or None
+        Player-versus-opponent zone reweighting :math:`M(s_m)`. Must be
+        paired with ``matchup_features``; composes additively with
+        ``defensive_field``.
+    matchup_features : MatchupFeatures or None
+        Per-(player, snapshot, opponent) shrunken zone deltas and
+        effective sample sizes.
+    pooling_gate : PoolingGate or None
+        Gate producing the own-support weight :math:`\lambda`. When
+        ``None``, a single softmax runs over all support shots.
+    bandwidth_field : ZoneSourceBandwidth or None
+        Per-(source, zone) isotropic bandwidth :math:`\sigma_m`. Mutually
+        exclusive with ``anisotropic_kernel``.
+    anisotropic_kernel : RadialTangentZoneKernel or FullCovarianceZoneKernel or None
+        Per-zone anisotropic Gaussian kernel that replaces the isotropic
+        kernel. Mutually exclusive with ``bandwidth_field``.
+    count_head : nn.Module or None
+        Count head (e.g. :class:`~shotcloud.models.count_head.NegBinCountHead`)
+        whose predicted mean :math:`\hat K` is appended, detached, to the
+        residual encoder's usage input. Requires ``residual_encoder`` with
+        ``usage_dim`` equal to ``USAGE_KHAT_DIM`` (usage plus
+        :math:`\hat K`) or 1 (:math:`\hat K` only).
+    khat_log1p_mean, khat_log1p_std : float or None
+        Standardization statistics; when given, the residual receives
+        :math:`(\log(1 + \hat K) - \mu) / \sigma` instead of the raw
+        :math:`\hat K`. Both or neither; require ``count_head``.
+    within_game_gru : nn.Module or None
+        Within-game recurrent encoder over the player's earlier shots in
+        the same game, added to :math:`u` before the residual tilt
+        (evaluated as an ablation). Requires ``residual_encoder``.
+    cold_start_log_lik_floor : float, default ``_COLD_START_LOG_LIK_FLOOR``
+        Log-likelihood assigned to rows with no valid causal support.
+    stratified_epsilon : float, default 1.0
+        Cross-zone kernel attenuation in ``(0, 1]``. Values below 1 multiply
+        the kernel by ``stratified_epsilon`` whenever the evaluation point
+        and the support shot lie in different court zones; 1.0 disables it.
+    causal_zone_bias : CausalZoneBias or None
+        Optional zone-pair bias on the support logits.
+    court_bounds : tuple of float or None
+        ``(x_min, x_max, y_min, y_max)`` in court feet. When set, each
+        isotropic kernel is renormalized to integrate to one over this
+        rectangle, so the predictive density is a proper density on the
+        court. When ``None``, kernels are normalized on
+        :math:`\mathbb R^2`. Not applied to ``anisotropic_kernel``.
+
+    Raises
+    ------
+    ValueError
+        If paired arguments are wired inconsistently, the residual and
+        location-embedding ranks differ, ``bandwidth_field`` and
+        ``anisotropic_kernel`` are both set, the residual ``usage_dim``
+        does not match the ``count_head`` wiring, or ``stratified_epsilon``
+        or ``court_bounds`` is out of range.
+
+    Notes
+    -----
+    Causality contract: support shots, traits, defensive and matchup
+    features are snapshot-indexed and use only games strictly before the
+    shot's game; the within-game inputs use only earlier shots of the same
+    game. The observed coordinate ``shot_xy`` is used only to evaluate the
+    kernels (and, with ``stratified_epsilon < 1``, the zone of the
+    evaluation point inside the kernel); it never enters a support logit,
+    the gate, or the residual.
+
+    Rows with an empty support set receive ``cold_start_log_lik_floor``
+    instead of a mixture density.
     """
 
     def __init__(
@@ -356,10 +447,10 @@ class ContinuousMixtureSpatial(nn.Module):
                 f"residual_encoder.rank ({residual_encoder.rank}) must equal "
                 f"location_embedding.rank ({location_embedding.rank})"
             )
-        # Defense wiring rules (kind-aware after PR-D-lite-0):
-        # * ContinuousAdaptiveDefensiveField (D-field, KDE) requires the
+        # Defense wiring rules:
+        # * ContinuousAdaptiveDefensiveField (kernel field) requires the
         #   full triple ``field + cache + features``.
-        # * ZoneReweightingDefense (D-lite) requires ``field + features``
+        # * ZoneReweightingDefense (zone-level) requires ``field + features``
         #   only; the cache is unused and must be None.
         # * All three None → no defense.
         is_zone_lite = isinstance(defensive_field, ZoneReweightingDefense)
@@ -388,13 +479,10 @@ class ContinuousMixtureSpatial(nn.Module):
                     f"cache={defensive_cache is not None}, "
                     f"features={defensive_features is not None}"
                 )
-        # D-matchup wiring rules: ``matchup_field`` and ``matchup_features``
-        # must both be provided or both None. The matchup channel is
-        # composable with the cell-free defense (so the A/B/C
-        # ablations in docs/log.md can all run from the same
-        # constructor) — when both ``defensive_field`` and
-        # ``matchup_field`` are wired, their logit contributions are
-        # summed before the per-subset softmax.
+        # Matchup wiring rules: ``matchup_field`` and ``matchup_features``
+        # must both be provided or both None. The matchup channel
+        # composes with the defensive field: when both are wired, their
+        # logit contributions are summed before the per-subset softmax.
         if (matchup_field is None) != (matchup_features is None):
             raise ValueError(
                 "matchup_field and matchup_features must both be provided or both None; "
@@ -414,12 +502,11 @@ class ContinuousMixtureSpatial(nn.Module):
         self._defensive_features = defensive_features
         self.matchup_field = matchup_field
         self._matchup_features = matchup_features
-        # Kernel-shape wiring rules (Tier-1a / Tier-2):
-        # * ``bandwidth_field`` (Tier-1a): per-(source, zone) scalar σ
-        #   on the existing isotropic Gaussian kernel.
-        # * ``anisotropic_kernel`` (Tier-2 Option 1 or Option 3): replaces
-        #   the isotropic kernel entirely with a per-zone anisotropic
-        #   covariance.
+        # Kernel-shape wiring rules:
+        # * ``bandwidth_field``: per-(source, zone) scalar σ on the
+        #   isotropic Gaussian kernel.
+        # * ``anisotropic_kernel``: replaces the isotropic kernel entirely
+        #   with a per-zone anisotropic covariance.
         # The two cannot be wired together — both modify the same
         # kernel-shape axis but in different ways, so allowing both
         # would silently make ``bandwidth_field`` a no-op (the
@@ -432,22 +519,22 @@ class ContinuousMixtureSpatial(nn.Module):
             )
         self.bandwidth_field = bandwidth_field
         self.anisotropic_kernel = anisotropic_kernel
-        # Count-head wiring (count-location coupling, B2). When
-        # provided, the wrapper appends a detached predicted-count
-        # column ``K̂ = NegBinCountHead(x_n).μ`` to the causal usage
-        # vector before passing it to the residual encoder. The count
-        # head is owned by the trainer at top level (so it receives
-        # L_count gradient signal); ``self.count_head`` is the
-        # same nn.Module instance, registered here as a child to
-        # ensure ``cms.to(device)`` moves it correctly. The detach
-        # in the forward prevents L_spatial from bending the count
-        # head into a hidden variable.
+        # Count-head wiring. When provided, the wrapper appends a
+        # detached predicted-count column ``K̂ = NegBinCountHead(x_n).μ``
+        # to the causal usage vector before passing it to the residual
+        # encoder. The count head is owned by the trainer at top level
+        # (so it receives the count-loss gradient); ``self.count_head``
+        # is the same nn.Module instance, registered here as a child so
+        # ``.to(device)`` moves it. The detach in the forward keeps the
+        # spatial loss from turning the count head into a hidden
+        # variable.
         # Residual usage_dim must match the count_head wiring under
-        # one of three valid configurations:
-        #   * usage_dim == USAGE_DIM, count_head is None   — B1 (usage only).
-        #   * usage_dim == USAGE_KHAT_DIM, count_head wired — B2 mainline (usage + K̂).
-        #   * usage_dim == 1, count_head wired              — K̂-only diagnostic.
-        # Any other combination is a wiring bug.
+        # one of these configurations:
+        #   * usage_dim == 0, count_head is None              — no usage input.
+        #   * usage_dim == USAGE_DIM, count_head is None      — usage only.
+        #   * usage_dim == USAGE_KHAT_DIM, count_head wired   — usage + K̂ (mainline).
+        #   * usage_dim == 1, count_head wired                — K̂ only (diagnostic).
+        # Any other combination is a wiring error.
         if residual_encoder is not None:
             from shotcloud.features.usage_features import USAGE_DIM, USAGE_KHAT_DIM
 
@@ -473,15 +560,11 @@ class ContinuousMixtureSpatial(nn.Module):
                 "channel requires the residual-tilt encoder to be active too."
             )
         self.count_head = count_head
-        # K̂-standardization stats (calibrated-B2 path). When both are
-        # provided, the K̂ → residual cat replaces raw ``K̂`` with
-        # ``(log1p(K̂) − μ) / σ`` (still detached from the count head).
-        # This keeps the residual numerically stable when the count
-        # head moves onto the K-scale via ``init_mean``; without it,
-        # the residual would suddenly see K̂ swing from O(1) at the
-        # uncalibrated initialization to O(10) once calibrated, which
-        # would invalidate the residual's pre-trained weights for
-        # any warm-start workflow. ``None`` → raw K̂ (backward-compat).
+        # K̂-standardization stats. When both are provided, the residual
+        # receives ``(log1p(K̂) − μ) / σ`` instead of raw ``K̂`` (still
+        # detached from the count head). This keeps the residual input
+        # O(1) when the count head is calibrated onto the count scale via
+        # ``init_mean``, where raw K̂ is O(10). ``None`` → raw K̂.
         if (khat_log1p_mean is None) != (khat_log1p_std is None):
             raise ValueError(
                 "khat_log1p_mean and khat_log1p_std must both be provided or both None; "
@@ -502,13 +585,12 @@ class ContinuousMixtureSpatial(nn.Module):
             self.register_buffer(
                 "khat_log1p_std", torch.tensor(float(khat_log1p_std), dtype=torch.float32)
             )
-        # G1 within-game shot GRU (paper §10, locked 2026-06-05). The
-        # GRU consumes the player's prior in-game shot sequence and
-        # emits a per-row vector that is added to the residual
-        # encoder's output. Wired only when ``residual_encoder`` is
-        # active. The module's output projection is zero-initialized,
-        # so the G1 augmentation contributes 0 at step 0 and the
-        # invariant ``G1 ≡ B2 at init`` holds bit-exactly.
+        # Within-game shot GRU. The GRU consumes the player's earlier
+        # shots in the same game and emits a per-row vector that is
+        # added to the residual encoder's output, so it requires
+        # ``residual_encoder``. Its output projection is
+        # zero-initialized, so at initialization the decoder equals the
+        # one without the GRU.
         if within_game_gru is not None and residual_encoder is None:
             raise ValueError(
                 "within_game_gru wired but residual_encoder is None — the within-game "
@@ -516,37 +598,26 @@ class ContinuousMixtureSpatial(nn.Module):
             )
         self.within_game_gru = within_game_gru
         self.cold_start_log_lik_floor = float(cold_start_log_lik_floor)
-        # Stratified-court kernel (Phase 1 C1, 2026-06-09). At
-        # ``stratified_epsilon=1.0`` the spatial decoder is bit-
-        # identical to the unstratified mainline. At any value in
-        # (0, 1), the per-(query, support) log-kernel gets an
-        # additive penalty ``log(epsilon)`` when the observed shot's
-        # zone differs from the support shot's zone. This stops
-        # Gaussian mass from leaking freely across the 3-point arc,
-        # the paint boundary, the corners, etc. — the half-court is
-        # a stratified space, not Euclidean.
+        # Stratified-court kernel. At ``stratified_epsilon=1.0`` the
+        # kernel is unchanged. At any value in (0, 1), the
+        # per-(query, support) log-kernel gets an additive penalty
+        # ``log(epsilon)`` when the evaluation point's zone differs from
+        # the support shot's zone, limiting Gaussian mass that leaks
+        # across the 3-point arc, the paint boundary, and the corners.
         if not 0.0 < stratified_epsilon <= 1.0:
             raise ValueError(f"stratified_epsilon must be in (0, 1]; got {stratified_epsilon}")
         self.stratified_epsilon = float(stratified_epsilon)
-        # Phase 2 α1 (causal redesign, 2026-06-09): Graphormer-style
-        # zone-pair edge bias on support attention, derived ONLY from
-        # ``x_n`` and ``support_xy`` (both causal). See
-        # :class:`CausalZoneBias` for the architecture and the locked
-        # leakage rule. The previous wrapper-direct ``zone_pair_bias``
-        # API was removed: it conditioned on ``z(y_n)`` and was a
-        # quiet predictive-density violation that drove a fake −1.6
-        # nat/shot val NLL improvement (see
-        # ``outputs/joint_b2_outcome_zone_pair_bias_v1/INVALID.md``).
+        # Zone-pair bias on support attention, derived only from ``x_n``
+        # and ``support_xy``. It must never condition on the zone of the
+        # observed shot: a bias on ``z(y_n)`` makes the support weights
+        # depend on the evaluation point, so the result is no longer a
+        # normalized predictive density.
         self.causal_zone_bias = causal_zone_bias
-        # Half-court boundary correction (AOAS audit item A1, 2026-06-13).
-        # When set, every call into
-        # :func:`shotcloud.training.spatial_losses.continuous_mixture_loglik`
-        # subtracts the analytic per-support-shot
-        # :math:`\\log Z_m(\\mathcal C)` so the predictive density is a
-        # proper density on the rectangular court ``court_bounds``,
-        # not on :math:`\\mathbb R^2`. ``None`` (the default) preserves
-        # the pre-A1 unconstrained-:math:`\\mathbb R^2` formulation and
-        # every existing trained checkpoint's bit-identical loss.
+        # Court-boundary correction. When set, every call into
+        # ``continuous_mixture_loglik`` subtracts the analytic
+        # per-support-shot ``log Z_m(C)`` so the predictive density
+        # integrates to one over the rectangle ``court_bounds`` rather
+        # than over R^2. ``None`` keeps the unbounded R^2 normalization.
         if court_bounds is not None:
             if len(court_bounds) != 4:
                 raise ValueError(
@@ -562,25 +633,25 @@ class ContinuousMixtureSpatial(nn.Module):
 
     @property
     def has_within_game_gru(self) -> bool:
+        """``True`` if a within-game GRU is wired into the residual."""
         return self.within_game_gru is not None
 
-    # Class-level annotations for ``register_buffer`` slots — keeps
-    # mypy happy about the Tensor arithmetic below (register_buffer's
-    # type stubs widen to ``Module | None``).
+    # Class-level annotations for the ``register_buffer`` slots, which
+    # the type stubs would otherwise widen to ``Module | None``.
     khat_log1p_mean: Tensor | None
     khat_log1p_std: Tensor | None
 
     @property
     def has_khat_standardization(self) -> bool:
+        """``True`` if K̂ is log1p-standardized before entering the residual."""
         return self.khat_log1p_mean is not None and self.khat_log1p_std is not None
 
     def _transform_khat_for_residual(self, mu: Tensor) -> Tensor:
         """Apply the optional log1p + standardize transform to K̂.
 
-        Always returns a detached tensor with no grad to the count head.
-        When no standardization stats are wired, returns the raw detached
-        K̂ — preserves bit-identical behavior for the B2 and K̂-only
-        paths trained before this option existed.
+        Always returns a detached tensor, so no gradient reaches the
+        count head. Without standardization stats, returns the raw
+        detached K̂.
         """
         k_hat = mu.detach()
         if self.khat_log1p_mean is not None and self.khat_log1p_std is not None:
@@ -589,23 +660,26 @@ class ContinuousMixtureSpatial(nn.Module):
 
     @property
     def has_residual(self) -> bool:
+        """``True`` if the low-rank residual tilt is wired."""
         return self.residual_encoder is not None and self.location_embedding is not None
 
     @property
     def has_outcome_residual(self) -> bool:
-        """``True`` iff the residual encoder consumes a per-shot
-        prior-outcome summary :math:`o_{n,r}` (paper Phase 2). The
-        trainer reads this flag to decide whether to forward the
-        ``o_n`` tensor through the spatial wrapper.
+        """``True`` if the residual encoder consumes a prior-outcome summary.
+
+        When set, :meth:`forward` requires the per-shot causal
+        prior-outcome tensor ``o_n``.
         """
         return self.residual_encoder is not None and self.residual_encoder.outcome_dim > 0
 
     @property
     def has_pooling_gate(self) -> bool:
+        """``True`` if the own/pooled pooling gate is wired."""
         return self.pooling_gate is not None
 
     @property
     def has_defense(self) -> bool:
+        """``True`` if an opponent reweighting field and its inputs are wired."""
         if self.defensive_field is None:
             return False
         if isinstance(self.defensive_field, ZoneReweightingDefense):
@@ -614,14 +688,17 @@ class ContinuousMixtureSpatial(nn.Module):
 
     @property
     def has_bandwidth_field(self) -> bool:
+        """``True`` if a per-support-shot bandwidth field is wired."""
         return self.bandwidth_field is not None
 
     @property
     def has_anisotropic_kernel(self) -> bool:
+        """``True`` if an anisotropic per-zone kernel replaces the isotropic one."""
         return self.anisotropic_kernel is not None
 
     @property
     def has_matchup(self) -> bool:
+        """``True`` if the matchup reweighting field and its features are wired."""
         return self.matchup_field is not None and self._matchup_features is not None
 
     def forward(
@@ -637,57 +714,66 @@ class ContinuousMixtureSpatial(nn.Module):
         prior_lengths: Tensor | None = None,
         o_n: Tensor | None = None,
     ) -> ContinuousMixtureOutputs:
-        """Compute the per-row continuous-mixture log-likelihood.
+        """Evaluate the per-row log-density at the observed shot coordinate.
 
         Parameters
         ----------
-        player_idx, snapshot_idx, x_n_raw, x_n
-            Standard collaborative-KDE inputs.
+        player_idx : Tensor of shape ``(B,)`` int64
+            Shooter vocabulary index.
+        snapshot_idx : Tensor of shape ``(B,)`` int64
+            Causal snapshot index of the shot's game.
+        x_n_raw : Tensor of shape ``(B, context_dim)``
+            Raw context vector, consumed by the backend's structured
+            relevance terms.
+        x_n : Tensor of shape ``(B, context_dim)``
+            Learned context vector ``f_ctx(x_n_raw)``, consumed by the
+            learned heads.
         shot_xy : Tensor of shape ``(B, 2)``
-            Exact observed shot coordinate, in court feet — the data
-            point the mixture is evaluated at.
+            Observed shot coordinate in court feet; the point at which
+            the mixture is evaluated.
         h_n : Tensor of shape ``(B, within_game_dim)`` or ``None``
-            Within-game causal shot history, required when the
-            residual encoder's ``within_game_dim > 0``.
+            Within-game causal shot history. Required when the residual
+            encoder's ``within_game_dim > 0``; also passed to the
+            pooling gate and the kernel defensive field.
         opp_idx : Tensor of shape ``(B,)`` int64 or ``None``
-            Per-row defending-team vocab index. Required iff
-            ``has_defense`` (see :attr:`has_defense`); ignored when
-            the wrapper has no defensive field wired.
+            Defending-team vocabulary index. Required when
+            :attr:`has_defense` or :attr:`has_matchup`.
         prior_seq : Tensor of shape ``(B, MAX_PRIOR_SHOTS, WITHIN_GAME_SEQ_DIM)`` or ``None``
-            Per-row padded prior-shot sequence for the G1 within-game
-            GRU. Required iff :attr:`has_within_game_gru`.
+            Padded sequence of the player's earlier shots in the same
+            game. Required if and only if :attr:`has_within_game_gru`.
         prior_lengths : Tensor of shape ``(B,)`` int64 or ``None``
-            Per-row valid prior-shot count. Required iff
-            :attr:`has_within_game_gru`.
+            Number of valid entries in ``prior_seq``. Required if and
+            only if :attr:`has_within_game_gru`.
+        o_n : Tensor of shape ``(B, outcome_dim)`` or ``None``
+            Causal prior-outcome summary. Required when
+            :attr:`has_outcome_residual`.
 
         Returns
         -------
         ContinuousMixtureOutputs
-            ``log_lik`` is the per-row log-density at ``shot_xy``;
-            the trainer typically takes ``-log_lik.mean()`` as the
-            spatial loss.
+            ``log_lik`` holds the per-row log-density at ``shot_xy``;
+            the spatial loss is typically ``-log_lik.mean()``.
+
+        Raises
+        ------
+        ValueError
+            If an input required by the wired components is missing, or
+            ``prior_seq``/``prior_lengths`` are given without a GRU.
         """
         collab = self.offensive_prior.forward_continuous(player_idx, snapshot_idx, x_n_raw, x_n)
         logits = collab.support_logits  # (B, M) — A + B
 
-        # Phase 2 α1 (causal redesign, 2026-06-09): zone-pair edge bias
-        # on support attention, derived from x_n + support_xy only.
-        # Zero-init B → no-op at step 0 (decoder bit-identical to
-        # the unbiased mainline). See :class:`CausalZoneBias` and the
-        # locked leakage rule above. The observed shot location is
-        # NOT passed in — the leakage-guardrail test enforces this.
+        # Zone-pair bias from x_n and support_xy only; the observed shot
+        # location is deliberately not an input (see CausalZoneBias).
         if self.causal_zone_bias is not None:
             edge_bias = self.causal_zone_bias(x_n=x_n, support_xy=collab.support_xy)
             logits = logits + edge_bias
-        # Kernel-shape dispatch (Tier-2 / Tier-1a / fixed):
-        # * ``anisotropic_kernel`` (Tier-2): precompute per-shot
-        #   ``log K_m(δ)`` from per-zone covariance and pass directly to
-        #   the loglik. Bypasses the σ machinery entirely. ``sigma_eff``
-        #   becomes a diagnostic-only placeholder in this mode (the
-        #   wrapper output's ``sigma`` reports collab's per-row σ as a
-        #   no-op-comparable baseline; the actual kernel shape comes
-        #   from ``log_kernel_eff``).
-        # * ``bandwidth_field`` (Tier-1a): per-(source, zone) scalar σ
+        # Kernel-shape dispatch:
+        # * ``anisotropic_kernel``: precompute per-shot ``log K_m(δ)``
+        #   from the per-zone covariance and pass it directly to the
+        #   log-likelihood, bypassing σ. ``sigma_eff`` is then only a
+        #   diagnostic (the backend's per-row σ).
+        # * ``bandwidth_field``: per-(source, zone) scalar σ
         #   → ``sigma_eff`` of shape (B, M).
         # * Neither: ``sigma_eff = collab.sigma`` of shape (B,).
         log_kernel_eff: Tensor | None = None
@@ -699,12 +785,10 @@ class ContinuousMixtureSpatial(nn.Module):
         else:
             sigma_eff = collab.sigma
 
-        # Stratified-court kernel mask (Phase 1 C1, 2026-06-09). At
-        # ``stratified_epsilon=1.0`` this is a no-op (zero tensor →
-        # bit-identical to mainline). Otherwise it's an additive
-        # log-multiplier on the per-(query, support) kernel value:
-        # ``0`` when query and support live in the same court zone,
-        # ``log(stratified_epsilon)`` when they differ.
+        # Stratified-court kernel mask: an additive log-multiplier on the
+        # per-(query, support) kernel value, ``0`` when query and support
+        # lie in the same court zone and ``log(stratified_epsilon)`` when
+        # they differ. Skipped entirely at ``stratified_epsilon=1.0``.
         log_kernel_extra: Tensor | None = None
         if self.stratified_epsilon != 1.0:
             from shotcloud.data.zones import zone_from_xy_torch
@@ -734,16 +818,17 @@ class ContinuousMixtureSpatial(nn.Module):
             assert self.defensive_field is not None
             assert self._defensive_features is not None
             if isinstance(self.defensive_field, ZoneReweightingDefense):
-                # D-lite path: only needs per-row defense features
-                # (the centered-zone block). No cache, no pairwise KDE.
+                # Zone-level reweighting: only needs per-row defense
+                # features (the centered-zone block); no cache, no
+                # pairwise kernel.
                 feat_buf = self._defensive_features.features.to(opp_idx.device)
                 def_features_per_row = feat_buf[opp_idx, snapshot_idx]  # (B, D_def)
                 defense_logits = self.defensive_field(
                     query_xy=collab.support_xy,
                     def_features=def_features_per_row,
                 )
-                # Cold-start = opponent's centered-zone block is all
-                # zero (D-lite contribution is identically zero).
+                # Cold start: the opponent's centered-zone block is all
+                # zero, so the reweighting is identically zero.
                 from shotcloud.features.defense_features import _ZONE_CENTERED_SLICE
 
                 czeros = def_features_per_row[:, _ZONE_CENTERED_SLICE].abs().sum(dim=-1)
@@ -781,10 +866,9 @@ class ContinuousMixtureSpatial(nn.Module):
             assert self.matchup_field is not None
             assert self._matchup_features is not None
             # Gather per-row Δ̂_{player_idx, snapshot_idx, opp_idx, :}
-            # and N^eff (the latter for the ESS-bucket diagnostic). The
-            # feature tensors live on CPU and are gathered onto the
-            # batch's device on the fly — same pattern as the D-lite
-            # defense features.
+            # and N^eff (the latter for diagnostics). The feature tensors
+            # live on CPU and are gathered onto the batch's device on the
+            # fly, as for the defense features.
             delta_buf = self._matchup_features.delta_hat.to(opp_idx.device)
             n_eff_buf = self._matchup_features.n_eff.to(opp_idx.device)
             delta_per_row = delta_buf[player_idx, snapshot_idx, opp_idx]  # (B, N_ZONES)
@@ -793,8 +877,8 @@ class ContinuousMixtureSpatial(nn.Module):
                 query_xy=collab.support_xy,
                 delta_hat=delta_per_row,
             )
-            # Matchup enters at the same stage as D-lite — both are
-            # zone-conditional opponent reweighting, summed into the
+            # Matchup enters at the same stage as the zone-level defense:
+            # both are zone-conditional opponent reweighting, summed into the
             # support logits before the residual and the own/pooled
             # subset softmax.
             logits = logits + matchup_logits
@@ -827,19 +911,18 @@ class ContinuousMixtureSpatial(nn.Module):
 
                 usage_dim = self.residual_encoder.usage_dim
                 if usage_dim == 1 and self.count_head is not None:
-                    # K̂-only diagnostic: residual sees ONLY the detached
-                    # predicted count — no causal-usage extract. Used to
-                    # decompose how much of the B2 cloud-metric gain is
-                    # carried by K̂ alone vs the (usage × K̂) interaction.
+                    # K̂-only diagnostic: the residual sees only the
+                    # detached predicted count, without the causal usage
+                    # vector.
                     mu, _ = self.count_head(x_n)
                     usage_for_residual = self._transform_khat_for_residual(mu).unsqueeze(-1)
                 elif usage_dim == USAGE_DIM:
-                    # B1: causal usage vector only (no K̂ column).
+                    # Causal usage vector only (no K̂ column).
                     usage_for_residual = extract_usage(
                         self.offensive_prior.traits, player_idx, snapshot_idx
                     )
                 elif usage_dim == USAGE_KHAT_DIM and self.count_head is not None:
-                    # B2 mainline: causal usage + detached K̂.
+                    # Mainline: causal usage + detached K̂.
                     base_usage = extract_usage(
                         self.offensive_prior.traits, player_idx, snapshot_idx
                     )
@@ -854,11 +937,8 @@ class ContinuousMixtureSpatial(nn.Module):
                         f"{USAGE_DIM} (B1 usage-only), {USAGE_KHAT_DIM} + "
                         "count_head (B2 usage + K̂)"
                     )
-                # Defensive shape check — the encoder rejects mismatched
-                # usage shapes with a clearer error, but the explicit
-                # assertion documents the contract for future maintainers.
                 assert usage_for_residual.shape[-1] == self.residual_encoder.usage_dim
-            # Phase 2: optional causal prior-outcome summary branch.
+            # Optional causal prior-outcome summary branch.
             # When the encoder's ``outcome_dim > 0`` we forward the
             # per-shot tensor; otherwise we leave it as ``None`` and
             # the encoder's validation enforces consistency.
@@ -874,13 +954,10 @@ class ContinuousMixtureSpatial(nn.Module):
             u = self.residual_encoder(
                 x_n, h_for_residual, usage=usage_for_residual, outcome=outcome_for_residual
             )
-            # G1: add the within-game GRU contribution to the residual
-            # encoder output before the location embedding. The GRU's
-            # output projection is zero-initialized, so at step 0 this
-            # adds the zero vector and the wrapper is bit-identical to
-            # the no-GRU B2 path. ``has_within_game_gru`` is the
-            # checkpoint flag eval-side reconstruction uses to rebuild
-            # the module with matching shape.
+            # Add the within-game GRU contribution to the residual encoder
+            # output before the location embedding. The GRU's output
+            # projection is zero-initialized, so at initialization this
+            # adds the zero vector.
             if self.has_within_game_gru:
                 if prior_seq is None or prior_lengths is None:
                     raise ValueError(
@@ -934,10 +1011,8 @@ class ContinuousMixtureSpatial(nn.Module):
                 masked_logits[cold_start, 0] = 0.0
             log_w = masked_logits - torch.logsumexp(masked_logits, dim=-1, keepdim=True)
             if log_kernel_eff is not None:
-                # Anisotropic path: court_bounds (isotropic) is not the
-                # right normalizer here; the anisotropic-kernel module
-                # would have to supply its own log_court_normalizer.
-                # Not threaded for the present submission.
+                # Anisotropic path: the isotropic court_bounds normalizer
+                # does not apply, so these kernels are normalized on R^2.
                 log_lik = continuous_mixture_loglik(
                     log_w,
                     collab.support_xy,
@@ -1035,17 +1110,17 @@ class ContinuousMixtureSpatial(nn.Module):
         from shotcloud.training.spatial_losses import continuous_mixture_loglik
 
         assert self.pooling_gate is not None
-        # Backend-agnostic own/pooled partition: read ``own_mask``
-        # directly from the collab output (PR3.0 contract). Both the
-        # L×R backend and the retrieval backend populate it.
+        # Backend-agnostic own/pooled partition: both the L×R backend
+        # and the retrieval backend populate ``own_mask``.
         own_mask = collab.own_mask
         pooled_mask = (~own_mask) & collab.support_mask
         own_available = own_mask.any(dim=-1)  # (B,)
         pooled_available = pooled_mask.any(dim=-1)  # (B,)
         own_support_count = own_mask.sum(dim=-1)  # (B,)
 
-        # Trait-derived log(1 + own causal shot count) — the same
-        # causal count the σ-head consumes (trait slot log1p_M).
+        # Own-history volume Ĥ for the gate: the trait slot
+        # log1p_minutes_M, log(1 + recency-weighted causal minutes), the
+        # same evidence measure the bandwidth head consumes.
         log1p_h_hat = self.offensive_prior.traits[player_idx, snapshot_idx][..., _SLOT_LOG1P_M]
 
         lam = self.pooling_gate(

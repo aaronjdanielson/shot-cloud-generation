@@ -1,16 +1,16 @@
-"""Density-surface evaluation scores for the cell-free spatial mixture.
+"""Density-surface evaluation scores for the continuous spatial mixture.
 
-The current cloud metrics (energy distance, sliced Wasserstein, zone L₁,
-rim-distance W₁/KS, mean shot-distance err) evaluate **finite sampled
-shot clouds** — they ask whether a generated finite cloud looks like
-the observed finite cloud. They can be insensitive to improvements in
-the underlying **predictive density surface** when (a) the model's
-density at observed shots increases without the finite-sample geometry
-shifting visibly, or (b) the noise floor of finite-K Wasserstein-type
-distances is comparable to the structural signal.
+Cloud metrics (energy distance, sliced Wasserstein, zone L₁, rim-distance
+W₁/KS, mean shot-distance error) evaluate **finite sampled shot clouds**:
+they ask whether a generated finite cloud looks like the observed finite
+cloud. They can be insensitive to improvements in the underlying
+**predictive density surface** when (a) the model's density at observed
+shots increases without the finite-sample geometry shifting visibly, or
+(b) the noise floor of finite-K Wasserstein-type distances is comparable
+to the structural signal.
 
-This module adds **proper density-surface scoring rules** that operate
-directly on the analytical Gaussian-mixture aggregate
+This module provides **proper density-surface scoring rules** that
+operate directly on the analytical Gaussian-mixture aggregate
 
 .. math::
 
@@ -23,12 +23,15 @@ support-shot locations (fixed per ``(player_idx, snapshot_idx)``), and
 ``Σ_m`` is the per-component covariance dictated by the kernel kind:
 
 * fixed isotropic: ``Σ_m = σ² I``;
-* Tier-1a per-source/zone σ: ``Σ_m = σ_m² I`` (still isotropic, but σ
-  varies per support shot);
-* Tier-2 Option 1 (radial-tangential): rank-2 spectral form
+* per-source/zone bandwidth
+  (:class:`~shotcloud.models.zone_source_bandwidth.ZoneSourceBandwidth`):
+  ``Σ_m = σ_m² I`` (still isotropic, but σ varies per support shot);
+* radial-tangential
+  (:class:`~shotcloud.models.anisotropic_kernel.RadialTangentZoneKernel`):
   ``Σ_m = σ_r²_z r̂ r̂ᵀ + σ_t²_z t̂ t̂ᵀ``;
-* Tier-2 Option 3 (bounded-correlation full): generic per-zone 2×2
-  positive-definite matrix.
+* bounded-correlation full covariance
+  (:class:`~shotcloud.models.anisotropic_kernel.FullCovarianceZoneKernel`):
+  a generic per-zone 2×2 positive-definite matrix.
 
 Scores (lower is better unless noted):
 
@@ -40,9 +43,9 @@ Scores (lower is better unless noted):
   Tests whether mass is placed in the local neighborhood of the shot
   even if not at the exact point.
 * :func:`zone_brier_and_ce` — predicted zone probabilities π_z
-  computed by Monte Carlo against observed zone fractions. Direct
-  attack on the zone-L₁ axis without the finite-sample noise of the
-  generated-cloud version.
+  computed by Monte Carlo against observed zone fractions. Scores the
+  zone distribution without the finite-sample noise of the
+  generated-cloud zone L₁.
 * :func:`hdr_coverage` — highest-density-region calibration. For
   several α ∈ {0.5, 0.8, 0.9}, what fraction of observed shots fall
   inside the model's α-HDR? Calibration test for the density surface.
@@ -129,7 +132,7 @@ def build_covariance_isotropic_scalar(
 
 
 def build_covariance_isotropic_per_shot(sigma_per_shot: Tensor) -> Tensor:
-    """``(M, 2, 2)`` Σ_m = σ_m² I (per-shot σ, Tier-1a)."""
+    """``(M, 2, 2)`` Σ_m = σ_m² I from a per-shot bandwidth of shape ``(M,)``."""
     if sigma_per_shot.dim() != 1:
         raise ValueError(f"sigma_per_shot must be (M,); got {tuple(sigma_per_shot.shape)}")
     s2 = sigma_per_shot.pow(2)
@@ -150,14 +153,15 @@ def build_covariance_radial_tangent(
     sigma_t_per_zone: Tensor,
     origin_eps: float = 1e-4,
 ) -> Tensor:
-    """``(M, 2, 2)`` Σ_m = σ_r² r̂ r̂ᵀ + σ_t² t̂ t̂ᵀ (Tier-2 Option 1).
+    """``(M, 2, 2)`` Σ_m = σ_r² r̂ r̂ᵀ + σ_t² t̂ t̂ᵀ in the rim-radial frame.
 
     Parameters
     ----------
     support_xy : Tensor of shape ``(M, 2)``
         Per-component support-shot coordinates in court feet.
     sigma_r_per_zone, sigma_t_per_zone : Tensor of shape ``(N_ZONES,)``
-        Bounded σ values from a :class:`RadialTangentZoneKernel`.
+        Bounded σ values from a
+        :class:`~shotcloud.models.anisotropic_kernel.RadialTangentZoneKernel`.
     origin_eps : float
         Below this radius, the radial frame is undefined; the support
         shot falls back to isotropic ``Σ = σ_r² I`` (the same fallback
@@ -222,8 +226,11 @@ def build_covariance_full_cov(
     sigma_y_per_zone: Tensor,
     rho_per_zone: Tensor,
 ) -> Tensor:
-    """``(M, 2, 2)`` from per-zone bounded-correlation (σ_x, σ_y, ρ)
-    (Tier-2 Option 3)."""
+    """``(M, 2, 2)`` covariances from per-zone bounded-correlation ``(σ_x, σ_y, ρ)``.
+
+    Each support shot takes the parameters of its court zone, as in
+    :class:`~shotcloud.models.anisotropic_kernel.FullCovarianceZoneKernel`.
+    """
     from shotcloud.models.zone_source_bandwidth import zone_from_xy_torch_bandwidth
 
     if support_xy.dim() != 2 or support_xy.shape[-1] != 2:
@@ -339,6 +346,7 @@ def smoothed_log_score(
     weights, centers, sigma_full
         Mixture parameters; same convention as :func:`quadratic_score`.
     observations : Tensor of shape ``(K, 2)``
+        Observed shots ``y_1..y_K``.
     h : float
         Neighborhood bandwidth in feet.
 
@@ -412,8 +420,7 @@ def zone_brier_and_ce(
     n_mc_samples: int = 10_000,
     generator: torch.Generator | None = None,
 ) -> dict[str, float]:
-    """Zone Brier score + cross-entropy between predicted and observed
-    zone distributions.
+    """Zone Brier score and cross-entropy of the predicted zone distribution.
 
     For each zone ``z ∈ [0, N_ZONES)`` the predicted probability is
 

@@ -1,13 +1,17 @@
 """Archetype dictionary and mixture network for the offensive prior.
 
-This module ships two complementary objects (paper §3.3):
+Deprecated; retained to reproduce the archetype-prior ablations of the
+grid-cell decoder. Superseded by the pooled analogue-player support of
+:class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial`.
+
+This module provides two complementary objects:
 
 * :class:`ArchetypeDictionary` — a frozen, indexed registry of
   per-anchor archetype surfaces ``{A_k^{(t_i)}}_{i=1..T, k=1..K}``.
   Each surface is a probability distribution over court cells. The
   surfaces are NOT learnable parameters; they are computed once by
-  the chronological pretraining pass (paper §6.3,
-  :doc:`scripts/pretrain_snapshots`) and frozen for the duration of
+  the chronological pretraining pass
+  (``scripts/legacy_pivot/pretrain_snapshots_legacy.py``) and frozen for the duration of
   joint training. This is what enforces the Causal Snapshot Principle
   for the archetype basis: the basis at time ``t`` was fit from data
   with date ``< t_{i(t)}``.
@@ -16,8 +20,8 @@ This module ships two complementary objects (paper §3.3):
   ``rho_xi(p, x_n) in Delta^{K-1}`` via the semi-structured form
   ``g_{xi,k}(p, x_n) = b_k + a_k^T r_p + d_k^T x_n``. Each archetype's
   role-vector signature ``a_k in R^{ROLE_PROFILE_DIM}`` is a directly
-  interpretable artifact of training (paper §3.3, "Why semi-structured
-  rather than a black-box MLP").
+  interpretable artifact of training, which is why the head is
+  semi-structured rather than a black-box MLP.
 
 Together they implement the archetype branch of the offensive prior:
 
@@ -30,9 +34,6 @@ Inference flow at training time::
     x_n = encoder.transform(df)                 # (B, CONTEXT_DIM)
     mixture = archetype_mixture(x_n)            # (B, K), softmax-normalized
     q_arch = archetype_dict(snapshot_idx, mixture)  # (B, C)
-
-See [docs/architecture.md](../../../docs/architecture.md) for the
-single-page system map and paper §3.3 for the math.
 """
 
 from __future__ import annotations
@@ -45,7 +46,7 @@ from torch import Tensor, nn
 from shotcloud.data.context import CONTEXT_DIM, FEATURE_LAYOUT
 from shotcloud.data.snapshots import ROLE_PROFILE_DIM, SnapshotStore
 
-#: Default archetype count locked in paper §3.3 for the proof-of-concept.
+#: Default archetype count ``K``.
 DEFAULT_K: int = 8
 
 
@@ -70,8 +71,8 @@ class ArchetypeDictionary(nn.Module):
     Notes
     -----
     The surfaces are *frozen*. They never receive gradient updates
-    during training. This is paper §3.3's frozen-after-pretrain
-    guarantee that makes the basis time-causal: A_k^{(t_i)} was fit
+    during training. This frozen-after-pretrain guarantee is what
+    makes the basis time-causal: A_k^{(t_i)} was fit
     from shots with date ``< t_i`` during the chronological
     pretraining pass, and joint training cannot pollute it with
     later data.
@@ -221,7 +222,7 @@ class ArchetypeDictionary(nn.Module):
 class ArchetypeMixture(nn.Module):
     """Semi-structured per-player-context archetype mixture network.
 
-    Implements paper §3.3's
+    Implements
 
     .. math::
         \\rho_{\\xi,k}(p, x_n) = \\mathrm{softmax}_k\\bigl[
@@ -254,17 +255,16 @@ class ArchetypeMixture(nn.Module):
     context_weight : nn.Parameter
         Shape ``(K, context_dim)``. Per-archetype context coefficient
         ``d_k``. Includes the role slice; it overlaps with `role_weight`
-        in the role coordinates by design (see paper §3.3).
+        in the role coordinates by design.
 
     Notes
     -----
     This is a tiny network: total parameters are
-    ``K * (1 + role_profile_dim + context_dim) ~= 280`` at
-    ``K=8, ROLE_PROFILE_DIM=8, CONTEXT_DIM=23``. Its small global
-    pool is what makes the parameter-sharing leakage bounded
-    (Class B in paper §2.5); we monitor it via the Temporal
-    Stability Audit but do not eliminate it via walk-forward
-    training in the headline model.
+    ``K * (1 + role_profile_dim + context_dim) = 288`` at
+    ``K=8, ROLE_PROFILE_DIM=8, CONTEXT_DIM=27``. As a globally pooled
+    parameter it is fit on the whole training window rather than
+    walk-forward; its small size bounds the leakage this
+    parameter sharing can introduce.
     """
 
     def __init__(
@@ -358,8 +358,8 @@ class ArchetypeMixture(nn.Module):
     ) -> None:
         """Populate parameters from a pretrained closed-form fit.
 
-        Paper §6.3 specifies that after the snapshot pretraining pass
-        the archetype mixture is initialized via ridge regression of
+        After the snapshot pretraining pass, the archetype mixture can be
+        initialized by ridge regression of
         ``log rho^{(t_T)}_{p, k}`` on the role profile and pregame
         context. This method copies those fitted coefficients in
         place. Sizes must match the constructor arguments.

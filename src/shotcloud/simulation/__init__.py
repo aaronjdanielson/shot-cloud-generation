@@ -1,1 +1,1 @@
-"""Sampling and shot-cloud assembly from the marked point process."""
+"""Sampling of shot locations from the fitted spatial factor."""

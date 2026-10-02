@@ -1,27 +1,30 @@
-"""Tier-2 anisotropic kernels: per-zone covariance for the spatial mixture.
+"""Per-zone anisotropic Gaussian kernels for the continuous spatial mixture.
 
-Two parameterizations, both replacing the current circular Gaussian
-kernel ``K_σ(y − s_m) = N₂(y; s_m, σ²I)`` with a zone-aware anisotropic
-Gaussian ``K_Σ(y − s_m) = N₂(y; s_m, Σ_m)``:
+Both modules replace the circular Gaussian kernel
+``K_σ(y − s_m) = N₂(y; s_m, σ²I)`` with a zone-aware anisotropic Gaussian
+``K_Σ(y − s_m) = N₂(y; s_m, Σ_m)`` whose covariance depends on the court
+zone of the support shot ``s_m``:
 
-* :class:`RadialTangentZoneKernel` — Option 1, basketball-aligned.
-  Per-zone ``(σ_r, σ_t)``. For each support shot ``s_m``, the principal
-  axes are radial (toward / away from basket) and tangential (along
-  the arc), set by ``s_m / ‖s_m‖``. 16 scalars total.
-* :class:`FullCovarianceZoneKernel` — Option 3, flexibility upper-bound.
-  Per-zone ``(σ_x, σ_y, ρ)`` in bounded-correlation form. The principal
-  axes can rotate freely per zone. 24 scalars total.
+* :class:`RadialTangentZoneKernel` — basketball-aligned. Per-zone
+  ``(σ_r, σ_t)``; for each support shot the principal axes are radial
+  (toward / away from the basket) and tangential (along the arc), set by
+  ``s_m / ‖s_m‖``. 16 scalars in total.
+* :class:`FullCovarianceZoneKernel` — court-frame. Per-zone
+  ``(σ_x, σ_y, ρ)`` in bounded-correlation form, so the principal axes
+  can rotate freely per zone. 24 scalars in total.
 
-Both modules expose ``forward(*, support_xy, shot_xy) -> (B, M)``
-returning the per-shot log-kernel value, which the spatial loglik adds
-to the support log-weights before the per-row logsumexp.
+Both expose ``forward(*, support_xy, shot_xy) -> (B, M)`` returning the
+per-support-shot log-kernel, which the spatial log-likelihood adds to the
+support log-weights before the per-row logsumexp. Both are alternatives
+to the isotropic kernel, evaluated as ablations.
 
-**Isotropic-collapse invariant** (load-bearing, tested for both
-modules): at ``σ_r = σ_t = σ_init`` (resp.
-``σ_x = σ_y = σ_init, ρ = 0``), the anisotropic kernel reduces to the
-fixed-σ isotropic Gaussian bit-exactly up to float32 precision. This
-guarantees the wrapper starts at the existing-mainline likelihood and
-anisotropy emerges only as training proceeds.
+Notes
+-----
+Isotropic-collapse invariant: at ``σ_r = σ_t = σ_init`` (respectively
+``σ_x = σ_y = σ_init, ρ = 0``) the anisotropic kernel equals the fixed-σ
+isotropic Gaussian up to float32 precision, so a model using either
+module starts from the isotropic-kernel likelihood and anisotropy is
+introduced only by training.
 """
 
 from __future__ import annotations
@@ -41,13 +44,14 @@ __all__ = [
 
 
 def _bounded_sigma_init_logit(sigma_min: float, sigma_max: float, sigma_init: float) -> float:
-    """Inverse-sigmoid the target into the raw-logit space.
+    """Return the raw logit that maps to ``sigma_init`` under the sigmoid bound.
 
     ``σ = σ_min + (σ_max − σ_min) · sigmoid(z)`` ⇔
-    ``z = logit((σ_init − σ_min) / (σ_max − σ_min))``. Identical
-    initialization pattern to :class:`ZoneSourceBandwidth` so the
-    isotropic-collapse invariant is bit-exact when both modules
-    share their canonical ``(σ_min, σ_max, σ_init)`` triple.
+    ``z = logit((σ_init − σ_min) / (σ_max − σ_min))``. This matches the
+    initialization of
+    :class:`~shotcloud.models.zone_source_bandwidth.ZoneSourceBandwidth`,
+    so both modules produce the same initial σ for the same
+    ``(σ_min, σ_max, σ_init)`` triple.
     """
     target = (sigma_init - sigma_min) / (sigma_max - sigma_min)
     target = min(max(target, 1e-6), 1.0 - 1e-6)
@@ -55,7 +59,7 @@ def _bounded_sigma_init_logit(sigma_min: float, sigma_max: float, sigma_init: fl
 
 
 class RadialTangentZoneKernel(nn.Module):
-    """Per-zone radial-tangential anisotropic kernel (Option 1).
+    """Per-zone radial-tangential anisotropic Gaussian kernel.
 
     For each support shot ``s_m``, the kernel covariance is
 
@@ -83,15 +87,24 @@ class RadialTangentZoneKernel(nn.Module):
     ``[σ_min, σ_max]``.
 
     **Isotropic collapse**: at ``σ_r = σ_t = σ_init``,
-    ``Σ_m = σ_init² (r̂ r̂ᵀ + t̂ t̂ᵀ) = σ_init² I`` (since the basis is
-    orthonormal). So the module reduces bit-exactly to the fixed-σ
-    isotropic Gaussian.
+    ``Σ_m = σ_init² (r̂ r̂ᵀ + t̂ t̂ᵀ) = σ_init² I`` because the basis is
+    orthonormal, so the module reduces to the fixed-σ isotropic
+    Gaussian.
 
-    **Origin guard**: ``‖s_m‖ < ε_r`` (default 1e-4) makes the radial
-    frame numerically unstable. Such support points fall back to the
-    isotropic kernel with ``σ = σ_r`` at that zone. The fallback
-    affects ~zero real NBA shots in practice (no one shoots from
-    coordinate (0, 0)); the guard exists purely for numerical safety.
+    **Origin guard**: the radial frame is undefined at the basket, so
+    support points with ``‖s_m‖ < origin_eps`` fall back to the
+    isotropic kernel with ``σ = σ_r`` of their zone. The guard exists
+    for numerical safety; real shots essentially never sit exactly at
+    the origin.
+
+    Parameters
+    ----------
+    sigma_min, sigma_max : float, default 1.0, 2.5
+        Bounds (feet) of every per-zone scale.
+    sigma_init : float, default 1.5
+        Initial value (feet) of every per-zone scale.
+    origin_eps : float, default 1e-4
+        Radius (feet) below which the origin guard applies.
 
     Attributes
     ----------
@@ -220,7 +233,7 @@ class RadialTangentZoneKernel(nn.Module):
 
 
 class FullCovarianceZoneKernel(nn.Module):
-    """Per-zone full covariance kernel in bounded-correlation form (Option 3).
+    """Per-zone full-covariance Gaussian kernel in bounded-correlation form.
 
     Per-zone covariance
 
@@ -253,8 +266,18 @@ class FullCovarianceZoneKernel(nn.Module):
     ``(σ_x, σ_y, ρ)`` per zone.
 
     **Isotropic collapse**: at ``σ_x = σ_y = σ_init, ρ = 0``,
-    ``Σ_z = σ_init² I``. Bit-exact reduction to the fixed-σ isotropic
-    Gaussian.
+    ``Σ_z = σ_init² I``, which is the fixed-σ isotropic Gaussian.
+
+    Parameters
+    ----------
+    sigma_min, sigma_max : float, default 1.0, 2.5
+        Bounds (feet) of the per-zone ``σ_x`` and ``σ_y``.
+    sigma_init : float, default 1.5
+        Initial value (feet) of every per-zone scale.
+    rho_max : float, default 0.8
+        Bound on ``|ρ|``; must lie in ``(0, 1)``.
+    rho_init : float, default 0.0
+        Initial per-zone correlation.
 
     Attributes
     ----------
@@ -316,12 +339,15 @@ class FullCovarianceZoneKernel(nn.Module):
         self.raw_rho = nn.Parameter(torch.full((N_ZONES,), float(rho_logit), dtype=torch.float32))
 
     def sigma_x(self) -> Tensor:
+        """Bounded ``σ_x`` per zone, shape ``(N_ZONES,)``."""
         return self.sigma_min + self.sigma_range * torch.sigmoid(self.raw_sx)
 
     def sigma_y(self) -> Tensor:
+        """Bounded ``σ_y`` per zone, shape ``(N_ZONES,)``."""
         return self.sigma_min + self.sigma_range * torch.sigmoid(self.raw_sy)
 
     def rho(self) -> Tensor:
+        """Bounded correlation ``ρ`` per zone, shape ``(N_ZONES,)``."""
         return self.rho_max * torch.tanh(self.raw_rho)
 
     def forward(
@@ -335,11 +361,15 @@ class FullCovarianceZoneKernel(nn.Module):
         Parameters
         ----------
         support_xy : Tensor of shape ``(B, M, 2)``
+            Support-shot coordinates in court feet (basket at origin).
         shot_xy : Tensor of shape ``(B, 2)``
+            Observed shot coordinates the mixture is evaluated at.
 
         Returns
         -------
         Tensor of shape ``(B, M)``
+            ``log K_z(y_b − s_{b,m})`` per (row, support shot), with
+            ``z`` the zone of ``s_{b,m}``.
         """
         if support_xy.dim() != 3 or support_xy.shape[-1] != 2:
             raise ValueError(f"support_xy must be (B, M, 2); got {tuple(support_xy.shape)}")

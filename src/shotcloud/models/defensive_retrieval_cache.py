@@ -1,27 +1,20 @@
-"""Per-(opponent, snapshot) defensive retrieval cache (PR-D0).
+"""Per-(opponent, snapshot) causal pool of shots allowed by each defense.
 
-The :class:`ContinuousAdaptiveDefensiveField` backend (PR-D1, not yet
-built) consumes this cache to build the cell-free defensive
-feasibility field
-
-.. math::
-
-    \\log a_\\delta(y \\mid d, x_n)
-    = \\log \\sum_{j \\in \\mathcal D_d^{<t_n}}
-            \\omega_{\\delta,j}(x_n)\\, K_h(y - s_j^{\\mathrm{opp}}),
-
-where :math:`\\mathcal D_d^{<t_n}` is the causal pool of shots
-attempted *against* opponent :math:`d` strictly before snapshot
-anchor :math:`t_n`. The pool is bounded by ``defensive_support_max``
-and a recency window in days; within the window, shots are ranked
-most-recent-first and the top-``M_def`` are retained.
+:class:`DefensiveRetrievalCache` supplies the allowed-shot pool
+:math:`\\mathcal D_d^{<t_n}` of
+:class:`~shotcloud.models.continuous_adaptive_defensive.ContinuousAdaptiveDefensiveField`,
+a kernel-based opponent reweighting field evaluated as an alternative to
+zone-level reweighting. For opponent :math:`d` and snapshot anchor
+:math:`t_n`, the pool holds the shots attempted *against* :math:`d` in
+the recency window ``[t_n − defensive_recency_window_days, t_n)``, most
+recent first, up to ``defensive_support_max``. Every shot in the pool
+predates the anchor, so the pool is causal by construction.
 
 This module is a pure data layer. Unlike the offensive
 :mod:`shotcloud.models.retrieval_cache`, it has **no pooled
-component** — defense is modelled as opponent-specific feasibility
-(paper §3.4), not as borrowing across opponents. Cold-start
-opponents (no causal allowed shots) get an empty mask; downstream
-the defensive field falls through to :math:`D_\\Delta = 0`.
+component**: defense is modelled as opponent-specific feasibility, not
+as borrowing across opponents. Opponents with no causal allowed shots
+get an empty mask, and the defensive field then contributes zero.
 
 Determinism notes (mirroring the offensive cache):
 
@@ -33,11 +26,10 @@ Determinism notes (mirroring the offensive cache):
   cannot be silently reused under a different config.
 * The cache config carries *only* fields that affect cache contents:
   ``shots_fingerprint, anchor_dates, defensive_support_max,
-  defensive_recency_window_days, ranking_kind, seed``. Downstream
-  attention hyperparameters (notably the recency half-life used by
-  PR-D1's relevance scorer) live with PR-D1's defensive-field
-  config, not here — changing them produces a new model checkpoint
-  without invalidating cache files whose indices are unchanged.
+  defensive_recency_window_days, ranking_kind, seed``. Attention
+  hyperparameters of the defensive field (such as its recency
+  half-life) belong to the field, so changing them does not invalidate
+  cache files whose indices are unchanged.
 """
 
 from __future__ import annotations
@@ -58,15 +50,13 @@ from shotcloud.training.dataset import OpponentVocab
 #: Default per-(opponent, snapshot) allowed-shot cap.
 DEFAULT_DEFENSIVE_SUPPORT_MAX: int = 1000
 
-#: Default recency window in days. Opponent schemes turn over more
-#: slowly than player shot diets; the 365-day default is the v1
-#: starting point recorded in
-#: :mod:`docs/defense_integration_proposal.md` and validated by
-#: empirical sensitivity later.
+#: Default recency window in days. Longer than the offensive pooled
+#: window because opponent schemes turn over more slowly than player
+#: shot diets.
 DEFAULT_DEFENSIVE_RECENCY_WINDOW_DAYS: int = 365
 
-#: Reserved for future variants (e.g. cosine-sim across opponents).
-#: Only ``"recency"`` is implemented in v1.
+#: Ranking used within the recency window; ``"recency"`` (most recent
+#: first) is the only implemented option.
 DEFAULT_DEFENSIVE_RANKING: str = "recency"
 
 
@@ -120,12 +110,7 @@ class DefensiveRetrievalCacheConfig:
 
 @dataclass
 class DefensiveRetrievalCache:
-    """Precomputed defensive retrieval indices + the global allowed-shot
-    table they reference.
-
-    Schema documented in
-    :mod:`docs/defense_integration_proposal.md` §7 PR-D0.
-    """
+    """Precomputed defensive retrieval indices and the allowed-shot table they reference."""
 
     config: DefensiveRetrievalCacheConfig
     #: ``(N_global, 2)`` float32 — coordinates of every allowed shot
@@ -161,6 +146,7 @@ class DefensiveRetrievalCache:
 
     @classmethod
     def load(cls, path: Path) -> DefensiveRetrievalCache:
+        """Load a cache written by :meth:`save`."""
         d = torch.load(path, weights_only=False)
         cfg_dict = d["config"]
         # JSON serialization turns the anchor_dates tuple into a list;
@@ -184,21 +170,15 @@ def _vocabulate_defensive(
     vocab and return ``(opp_idx, date_ord, xy)`` arrays sorted ascending
     by ``date_ord``.
 
-    Allowed-shot semantics: each row's ``opponent`` column identifies
-    the team the shot was attempted *against* — that's the defending
-    team, the key we index by. Rows missing ``opponent`` (typical at
-    train-window boundaries where ``_attach_opponent`` couldn't
-    resolve both teams) are dropped.
+    Each row's ``opponent`` column identifies the team the shot was
+    attempted *against*, i.e. the defending team, which is the key the
+    cache is indexed by. Rows missing ``opponent`` (games at the edge of
+    the data where the loader could not resolve both teams) are dropped.
 
-    Symmetric-bug enforcement (when ``shots_df`` carries ``team``):
-    a row with ``team == opponent`` would put a team's *own* shots
-    into its *own* defensive pool — which is the symmetric mistake the
-    test_4 acceptance criterion guards against. This shouldn't happen
-    if ``load_shots()._attach_opponent`` is correct (a team can't play
-    itself), but if it ever does we raise rather than silently
-    propagate. When the ``team`` column is absent (some test fixtures
-    or pre-canonical data sources), the invariant is delegated to the
-    loader and we skip the check.
+    When ``shots_df`` carries ``team``, a row with ``team == opponent``
+    would put a team's own shots into its own defensive pool; such rows
+    raise rather than propagate. Without a ``team`` column the check is
+    left to the loader.
     """
     if "opponent" not in shots_df.columns:
         raise ValueError(
@@ -219,7 +199,7 @@ def _vocabulate_defensive(
     if not keep.all():
         shots_df = shots_df.iloc[keep].reset_index(drop=True)
         opp_str = opp_str[keep]
-    # Symmetric-bug fence (only when ``team`` is present).
+    # Guard against a team's own shots entering its defensive pool.
     if "team" in shots_df.columns:
         team_str = shots_df["team"].astype(str).to_numpy()
         self_match = team_str == opp_str
@@ -254,10 +234,9 @@ def _build_indices_defensive(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Per-(opponent, snapshot) defensive retrieval.
 
-    For each ``(d, t_m)`` we find the rows where the shot was attempted
-    against opponent ``d`` and the date is in
-    ``[t_m − window, t_m)``, then keep the top
-    ``defensive_support_max`` by date descending.
+    For each opponent ``d`` and anchor ``t_m``, selects the shots
+    attempted against ``d`` with date in ``[t_m − window, t_m)`` and keeps
+    the ``defensive_support_max`` most recent.
 
     Returns ``(def_idx, def_mask)`` as numpy arrays; the caller wraps
     them into the :class:`DefensiveRetrievalCache`.
@@ -318,6 +297,7 @@ def build_defensive_retrieval_cache(
     anchor_dates : np.ndarray of shape ``(S,)``
         Snapshot anchor dates in **epoch days**.
     config : DefensiveRetrievalCacheConfig
+        Retrieval settings; their hash names the cache file.
     cache_dir : Path or None
         If given, the cache is loaded from
         ``cache_dir/defensive_retrieval_cache_{config.config_hash}.pt``
@@ -326,6 +306,17 @@ def build_defensive_retrieval_cache(
         (``.tmp`` + ``rename``).
     rebuild : bool
         Force a rebuild even when a cached file exists.
+
+    Returns
+    -------
+    DefensiveRetrievalCache
+
+    Raises
+    ------
+    ValueError
+        If ``anchor_dates`` disagrees with ``config.anchor_dates``, or
+        ``shots_df`` lacks an ``opponent`` column or has a row with
+        ``team == opponent``.
     """
     if anchor_dates.ndim != 1:
         raise ValueError(f"anchor_dates must be 1D; got shape {anchor_dates.shape}")
@@ -368,13 +359,11 @@ def build_defensive_retrieval_cache(
 
 
 def defensive_shots_fingerprint(shots_path: Path) -> str:
-    """Cheap, deterministic fingerprint of the shots file:
-    ``sha256(path, size, mtime_ns)`` truncated to 16 hex chars.
+    """Return a cheap fingerprint of the shots file for the cache key.
 
-    Identical recipe to the offensive
-    :func:`shotcloud.models.retrieval_cache.shots_fingerprint`; the
-    two caches can share fingerprints when the same shots file
-    underlies both.
+    The fingerprint is ``sha256(path, size, mtime_ns)`` truncated to 16 hex
+    characters, the same recipe as
+    :func:`shotcloud.models.retrieval_cache.shots_fingerprint`.
     """
     st = shots_path.stat()
     payload: dict[str, Any] = {

@@ -6,16 +6,13 @@ pool players, ``R`` historical shots each. Some of those ``L``
 players are the target player itself (own history); the rest are
 other players selected by similarity/availability (pooled support).
 
-Several post-training analyses --- the self-only support ablation
-and the pooling diagnostics --- need the same partition of support
-slots into *own* and *pooled*. This module provides the single
-shared helper :func:`support_source_masks` so the partition logic
-lives in one tested place.
+Post-training analyses such as the self-only support ablation and the
+pooling diagnostics need the same partition of support slots into
+*own* and *pooled*; :func:`support_source_masks` computes it.
 
 Terminology: the estimator interpolates between player-specific
-empirical support and *pooled* support from other players. We call
-the other-player contribution "pooled support" (not "borrowing" or
-"analogues").
+empirical support and *pooled* support from other players; the
+other-player contribution is called "pooled support" throughout.
 """
 
 from __future__ import annotations
@@ -68,6 +65,12 @@ def support_source_masks(
     SupportSourceMasks
         ``own``, ``pooled``, ``valid`` each ``(B, M)`` bool.
         ``own`` and ``pooled`` partition ``valid``.
+
+    Raises
+    ------
+    ValueError
+        If the input shapes are inconsistent or
+        ``n_shots_per_analogue`` is not positive.
     """
     if analogue_idx.dim() != 2:
         raise ValueError(f"analogue_idx must be (B, L); got {tuple(analogue_idx.shape)}")

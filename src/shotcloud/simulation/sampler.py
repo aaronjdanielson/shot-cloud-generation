@@ -1,4 +1,4 @@
-"""Sample shot locations from the continuous collaborative KDE.
+"""Sample shot locations from the AC-KDE kernel mixture.
 
 For a row whose support is :math:`\\{(s_j, \\omega_j)\\}_{j=1}^M`
 under bandwidth :math:`\\sigma`, the per-shot generative density is
@@ -15,11 +15,10 @@ A single sample is the ancestral pair
     \\qquad
     Y \\mid J=j \\sim \\mathcal N_2(s_j,\\sigma^2 I).
 
-This module's :func:`sample_locations` does that batched, with
-rejection sampling against the legal court rectangle. After
-``max_attempts`` rejections per slot, remaining off-court samples
-are clipped to the court bounds — this is the documented fallback
-so the output is always inside the court.
+:func:`sample_locations` draws these pairs in batch, with rejection
+sampling against the court rectangle. Samples still off the court after
+``max_attempts`` redraws are clipped to the court bounds, so every
+returned location lies on the court.
 """
 
 from __future__ import annotations
@@ -27,8 +26,9 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-#: Default court extents in feet (matches CourtGrid + plot conventions:
-#: basket at origin, x ∈ [-25, 25], y ∈ [-5, 47]).
+#: Default court extents in feet, matching the default
+#: :class:`~shotcloud.grids.CourtGrid` (basket at the origin,
+#: x ∈ [-25, 25], y ∈ [-5, 47]).
 DEFAULT_COURT_XLIM: tuple[float, float] = (-25.0, 25.0)
 DEFAULT_COURT_YLIM: tuple[float, float] = (-5.0, 47.0)
 
@@ -52,14 +52,13 @@ def sample_locations(
     support_xy : Tensor of shape ``(B, M, 2)``
         Support shot coordinates per row.
     log_omega : Tensor of shape ``(B, M)``
-        Log-mixture weights. Invalid slots should already be at
-        ``-inf`` (the wrapper's outer softmax does this). Cold-start
-        rows carry a dummy 0-logit at slot 0 and will sample from
-        ``support_xy[:, 0, :]``; callers should filter such rows
-        before evaluation.
+        Log mixture weights, with invalid slots at ``-inf`` (as produced
+        by the decoder's softmax). Rows with no mass, and cold-start rows
+        whose only weight is a placeholder at slot 0, sample around
+        ``support_xy[:, 0, :]``; callers should discard such rows.
     support_mask : Tensor of shape ``(B, M)``
-        Valid-support mask. Used only to validate shapes; the
-        actual mass is in ``log_omega``.
+        Valid-support mask. Only its shape is checked; the mass is
+        carried by ``log_omega``.
     sigma : Tensor of shape ``(B,)``
         Per-row Gaussian bandwidth in feet (same units as
         ``support_xy``).
@@ -69,17 +68,23 @@ def sample_locations(
         Court bounds for rejection sampling. Defaults match
         :class:`~shotcloud.grids.CourtGrid`.
     max_attempts : int, default 8
-        Maximum rejection-sampling rounds per slot. After this,
-        any remaining out-of-court samples are **clipped** to the
-        court bounds (documented fallback so the return is
-        guaranteed inside the legal court).
+        Maximum number of redraw rounds for off-court samples. Each
+        redraw keeps the sampled support shot and draws new Gaussian
+        noise. Samples still off the court afterwards are clipped to the
+        court bounds.
     generator : torch.Generator, optional
-        For deterministic sampling.
+        Random generator for reproducible sampling.
 
     Returns
     -------
     Tensor of shape ``(B, n_samples, 2)``
-        Sampled locations, all guaranteed inside the court rectangle.
+        Sampled locations, all inside the court rectangle.
+
+    Raises
+    ------
+    ValueError
+        On inconsistent shapes, non-positive ``n_samples`` or empty court
+        bounds.
     """
     if support_xy.dim() != 3 or support_xy.shape[-1] != 2:
         raise ValueError(f"support_xy must be (B, M, 2); got {tuple(support_xy.shape)}")
@@ -99,29 +104,23 @@ def sample_locations(
     if not (x_lo < x_hi and y_lo < y_hi):
         raise ValueError(f"court bounds invalid: x={court_xlim}, y={court_ylim}")
 
-    # Categorical sample J: torch.multinomial wants probabilities (or
-    # weights >= 0). Convert log_ω → ω; -inf slots become 0 weight.
+    # Categorical sample J from the nonnegative weights ω = exp(log ω);
+    # -inf slots get zero weight.
     omega = log_omega.exp()
-    # Multinomial requires positive total weight per row; cold-start
-    # rows have all zeros, which would raise. Patch with a uniform
-    # over slot 0 so sampling still returns a finite (meaningless)
-    # value — caller filters cold rows out.
+    # Sampling requires positive total weight per row. Rows with none get
+    # unit weight on slot 0, so they return a finite (meaningless) value
+    # that the caller discards.
     row_sum = omega.sum(dim=-1)
     if (row_sum <= 0).any():
         omega = omega.clone()
         bad = row_sum <= 0
         omega[bad, 0] = 1.0
 
-    # Sample with replacement across rows: (B, n_samples) indices.
-    # torch.multinomial samples per-row but doesn't accept a generator
-    # in all versions when input is 2D; fall back to a Categorical
-    # for generator support.
+    # (B, n_samples) component indices, drawn with replacement. With a
+    # generator, use inverse-CDF sampling, which honors the generator on
+    # every PyTorch version; otherwise torch.multinomial.
     if generator is not None:
-        # Use Categorical from torch.distributions for explicit generator
-        # support. Per-row Categorical via gather.
         probs = omega / omega.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        # Construct cumulative + uniform inverse-CDF sampling so we can
-        # honor the generator.
         cdf = probs.cumsum(dim=-1)  # (B, M)
         u = torch.rand(b, n_samples, device=device, generator=generator)
         idx = torch.searchsorted(cdf, u)  # (B, n_samples)
@@ -161,7 +160,7 @@ def sample_locations(
         candidate = centers + sigma_b * new_noise
         y = torch.where(bad_mask.unsqueeze(-1), candidate, y)
 
-    # Final clip fallback for any stubbornly off-court samples.
+    # Clip any samples still off the court.
     y = torch.stack(
         [
             y[..., 0].clamp(min=x_lo, max=x_hi),

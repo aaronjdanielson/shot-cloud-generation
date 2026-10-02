@@ -2,12 +2,16 @@
 
 Wraps:
 
-* a :class:`~shotcloud.models.CollaborativeKDE` for support attention,
-* an optional residual encoder + location embedding (reweights the
-  support attention by within-game context, same as the
-  continuous-mixture path),
-* a :class:`~shotcloud.models.mode_extractor.SupportModeExtractor`
-  that compresses the attended support into K court modes,
+* a :class:`~shotcloud.models.collaborative_kde.CollaborativeKDE` for
+  support attention,
+* an optional residual encoder and location embedding that tilt the
+  support attention by context (and, optionally, within-game history),
+  as in the continuous-mixture path,
+* a mode extractor
+  (:class:`~shotcloud.models.soft_kmeans_extractor.SoftKMeansModeExtractor`
+  by default, or
+  :class:`~shotcloud.models.mode_extractor.SupportModeExtractor`) that
+  compresses the attended support into K court modes,
 
 into a single :class:`nn.Module` that returns per-row log-likelihood
 under a small K-mode Gaussian mixture at the **exact observed shot
@@ -18,10 +22,11 @@ row's support coordinates. There is no global learnable basis of
 court modes — modes are *extracted* per (player, game, shot) from
 that row's attended support set.
 
-Parallel to :class:`~shotcloud.models.ContinuousMixtureSpatial`
-(the support-shot mixture path). Both consume the same upstream
-support attention; they differ only in how the per-shot density is
-formed from the attention.
+This is an alternative to
+:class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial`,
+evaluated as an ablation. Both consume the same upstream support
+attention; they differ only in how the per-shot density is formed
+from it.
 """
 
 from __future__ import annotations
@@ -64,26 +69,27 @@ class CollaborativeModeMixtureSpatial(nn.Module):
         When provided together, the residual contributes
         ``R_θ(s_j) = u_θ^T ψ(s_j)`` to the support attention
         (identical to the continuous-mixture path).
-    n_court_modes, mode_query_dim, mode_sigma_ft :
-        Forwarded to :class:`SupportModeExtractor`. Defaults: K=6,
-        d=32, σ=2.0 ft.
+    n_court_modes, mode_query_dim, mode_sigma_ft : int, int, float
+        Number of modes ``K``, query dimension, and per-mode Gaussian
+        scale in feet. Defaults: ``K=6``, ``d=32``, ``σ=3.0`` ft.
+        ``mode_query_dim`` is used only by the learned-query extractor.
     use_context_correction : bool, default True
         Mode-logit context bias ``b_k(x_n, h_n)`` on/off.
     bias_hidden_dim : int, default 32
         Hidden width of the bias MLP.
     lambda_omega : float, default 0.0
-        Mode-to-support attention's ω-bias weight; see
-        :class:`SupportModeExtractor` for the full spec. ``0.0``
-        (default, the strengthened-model spec) separates geometry
-        (α from queries only) from mass (ω only enters m_k).
+        Weight of the ω bias in the learned-query extractor's
+        mode-to-support attention; see
+        :class:`~shotcloud.models.mode_extractor.SupportModeExtractor`.
+        ``0.0`` separates geometry (α from queries only) from mass
+        (ω enters only the mode masses ``m_k``).
     tail_weight : float, default 0.0
-        ``λ_tail`` — mixing weight on the raw support KDE component
-        of the strengthened-model spec:
-        ``f = (1 - λ_tail) f_mode + λ_tail f_support``. Defends
-        undercoverage by giving observed shots a nonparametric
-        safety valve outside the K-mode mixture. Spec recommends
-        ``0.02–0.05``; default ``0.0`` preserves the pure mode-mixture
-        behavior for back-compat with v1 mode_mixture experiments.
+        ``λ_tail`` — mixing weight on the raw support-KDE component:
+        ``f = (1 - λ_tail) f_mode + λ_tail f_support``. A positive
+        value guards against undercoverage by keeping the density
+        bounded below by ``λ_tail · f_support`` for shots far from
+        every mode; values around ``0.02–0.05`` are typical. ``0.0``
+        gives the pure mode mixture.
     tail_sigma_ft : float, default 1.0
         ``σ_sup`` — per-shot Gaussian bandwidth for the support-KDE
         tail component. Only consulted when ``tail_weight > 0``.
@@ -91,6 +97,18 @@ class CollaborativeModeMixtureSpatial(nn.Module):
         Per-row log-likelihood for cold-start rows (all support
         masked out). Defaults to log of uniform density over a
         ~50×52 ft court.
+    extractor_kind : {"soft_kmeans", "learned_query"}, default "soft_kmeans"
+        Mode-extraction operator. ``"soft_kmeans"`` uses
+        :class:`~shotcloud.models.soft_kmeans_extractor.SoftKMeansModeExtractor`
+        (deterministic weighted farthest-point seeding plus a few
+        mean-shift iterations), so modes are clusters of the row's own
+        support by construction. ``"learned_query"`` uses
+        :class:`~shotcloud.models.mode_extractor.SupportModeExtractor`,
+        whose learned queries are shared across rows.
+    mode_kernel_bandwidth_ft : float, default 5.0
+        Mean-shift kernel bandwidth in feet (soft k-means extractor only).
+    mode_n_iterations : int, default 2
+        Number of mean-shift iterations (soft k-means extractor only).
     """
 
     def __init__(
@@ -107,13 +125,6 @@ class CollaborativeModeMixtureSpatial(nn.Module):
         tail_weight: float = 0.0,
         tail_sigma_ft: float = 1.0,
         cold_start_log_lik_floor: float = DEFAULT_COLD_START_LOG_LIK_FLOOR,
-        #: Which mode-extraction operator to use. ``"soft_kmeans"``
-        #: (default, the 2026-05-18 pivot) runs deterministic weighted
-        #: farthest-point sampling + a few mean-shift iterations over
-        #: the attended support — modes are clusters of *this row's*
-        #: support by construction. ``"learned_query"`` is the
-        #: original learned-query extractor (kept for ablation; the
-        #: empirical issue was that queries acted as global anchors).
         extractor_kind: str = "soft_kmeans",
         mode_kernel_bandwidth_ft: float = DEFAULT_MODE_KERNEL_BANDWIDTH_FT,
         mode_n_iterations: int = DEFAULT_N_ITERATIONS,
@@ -177,10 +188,12 @@ class CollaborativeModeMixtureSpatial(nn.Module):
 
     @property
     def has_residual(self) -> bool:
+        """Whether the low-rank residual tilt is active."""
         return self.residual_encoder is not None and self.residual_location_embedding is not None
 
     @property
     def n_court_modes(self) -> int:
+        """Number of extracted court modes ``K``."""
         return self.mode_extractor.n_modes
 
     def _support_attention(
@@ -191,11 +204,11 @@ class CollaborativeModeMixtureSpatial(nn.Module):
         x_n: Tensor,
         h_n: Tensor | None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Compute support attention ``ω_j``. Returns
-        ``(log_omega, residual_logits, cold_start)``.
+        """Compute support attention ``ω_j``.
 
-        Mirrors the continuous-mixture path's outer softmax block so
-        the two paths share the same support attention semantics.
+        Mirrors the continuous-mixture path's outer softmax so the two
+        decoders share the same support-attention semantics. Returns
+        ``(log_omega, residual_logits, cold_start)``.
         """
         logits = collab_support_logits
         residual_logits = torch.zeros_like(logits)
@@ -229,9 +242,22 @@ class CollaborativeModeMixtureSpatial(nn.Module):
         shot_xy: Tensor,
         h_n: Tensor | None = None,
     ) -> ContinuousMixtureOutputs:
-        """Per-row log-likelihood of the observed shot under the
-        per-player-game K-mode Gaussian mixture, optionally blended
-        with the raw support-KDE tail."""
+        """Per-row log-likelihood of the observed shot under the K-mode mixture.
+
+        The mode mixture is optionally blended with the raw support-KDE
+        tail (``tail_weight > 0``). Cold-start rows receive
+        ``cold_start_log_lik_floor``.
+
+        Returns
+        -------
+        ContinuousMixtureOutputs
+            ``log_weights`` holds the normalized mode log-weights
+            ``(B, K)`` and ``support_xy`` the per-row mode centers
+            ``(B, K, 2)``; ``support_log_weights`` holds the support
+            attention ``log ω`` and ``tail_responsibility`` the posterior
+            responsibility of the tail component (``None`` when
+            ``tail_weight == 0``).
+        """
         from shotcloud.training.spatial_losses import (
             continuous_mixture_loglik,
             mode_mixture_loglik,
@@ -263,8 +289,7 @@ class CollaborativeModeMixtureSpatial(nn.Module):
             sigma=mode_out.mode_sigma,
         )
 
-        # Strengthened-model support-tail mixture (paper §"strengthened"):
-        # f(y) = (1 - λ_tail) f_mode(y) + λ_tail f_support(y).
+        # Support-tail mixture: f(y) = (1 - λ_tail) f_mode(y) + λ_tail f_support(y).
         # f_support is the raw collab-support KDE evaluated at the
         # exact observed coord — the same component family used by
         # ContinuousMixtureSpatial but with its own fixed σ_sup. The

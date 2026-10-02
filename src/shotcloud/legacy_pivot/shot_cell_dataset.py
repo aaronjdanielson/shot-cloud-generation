@@ -1,19 +1,16 @@
-"""Pre-pivot per-shot dataset.
+"""Per-shot dataset for the low-rank tilt decoder.
 
-Moved from ``shotcloud.training.dataset`` to
-``shotcloud.legacy_pivot`` on 2026-05-15. Replaced in production
-by :class:`~shotcloud.training.GibbsShotDataset` (which routes
-``snapshot_idx`` and per-game count/timing targets in addition to
-the per-shot tuple).
+Deprecated; retained for :func:`~shotcloud.legacy_pivot.trainer.train_decoder`.
+Superseded by :class:`~shotcloud.training.GibbsShotDataset`, which also
+routes ``snapshot_idx`` and per-game count/timing targets.
 
 :class:`ShotCellDataset` yields per-shot
 ``(player_idx, cell_idx, log_q0_p, opponent_idx, x_n)`` 5-tuples
 ready for cross-entropy loss against the pre-Gibbs decoder.
 ``log_q0_p`` is a precomputed log base-measure vector for the
 player; the decoder needs it as input. ``opponent_idx`` is
-meaningful only when a :class:`DefensiveKDE` is attached (Phase
-2 — pre-pivot); defaults to ``0`` otherwise so the tuple shape
-is invariant.
+meaningful only when a :class:`DefensiveKDE` is attached;
+defaults to ``0`` otherwise so the tuple shape is invariant.
 
 Two base-measure variants are supported: :class:`KDEProduct`
 (geometric mixture with hand-picked or learnable weights) and

@@ -1,14 +1,21 @@
-"""Spatial training losses for the Gibbs / continuous-mixture decoders.
+"""Spatial log-likelihoods and losses for the spatial decoders.
 
-The model predicts a discrete distribution over court cells
-``log p_Θ(c | context) = log_probs[b, c]``. The observed data,
-however, are exact continuous coordinates ``y_b = (x_b, y_b)`` in
-court feet, not categorical cell labels. Training the spatial head
-against exact-cell cross-entropy throws away that geometric signal —
-a prediction one foot from the observed shot pays the same penalty
-as a prediction thirty feet away.
+Two families of losses are provided.
 
-This module exposes a distance-aware alternative.
+*Cell-free mixture likelihoods.* :func:`continuous_mixture_loglik`
+evaluates the AC-KDE density, a Gaussian kernel mixture over causal
+support shots, at the observed coordinate, optionally renormalized to
+the rectangular court with :func:`half_court_log_normalizer`.
+:func:`mode_mixture_loglik` does the same for a small per-row Gaussian
+mode mixture.
+
+*Grid-cell losses.* For decoders that output a distribution over court
+cells, ``log p_Θ(c | context) = log_probs[b, c]``, the observed data are
+still exact coordinates in feet. Exact-cell cross-entropy
+(:func:`exact_cell_nll`) ignores that geometry: a prediction one foot
+from the observed shot pays the same penalty as one thirty feet away.
+:func:`continuous_coordinate_nll` is a distance-aware alternative, and
+:func:`expected_distance_ft` is a geometric diagnostic.
 
 Continuous-coordinate marginal likelihood
 -----------------------------------------
@@ -23,20 +30,18 @@ kernel around the latent predicted cell center:
     f_\\Theta(y \\mid \\text{context})
     = \\sum_c p_\\Theta(c \\mid \\text{context})\\, K_\\tau(y - x_c).
 
-The per-shot NLL is then ``-log f_Θ(y_b | context_b)``. Computed in
-log-space via ``logsumexp(log_probs + log_K_τ)`` so the existing
-log-probability tensor never has to leave log-space.
-
-Recovers the exact-cell loss as :math:`\\tau \\to 0` when the
-observed coordinate equals a cell center.
+The per-shot NLL is ``-log f_Θ(y_b | context_b)``, computed as
+``logsumexp(log_probs + log_K_τ)`` so the computation stays in log space.
+It recovers the exact-cell loss as :math:`\\tau \\to 0` when the observed
+coordinate equals a cell center.
 
 Distance diagnostic
 -------------------
 
-``expected_distance_ft`` reports ``E_c[||x_c - y||]`` under the
-predicted cell distribution — a geometric sanity metric that responds
-to mass moving in the right *direction* even when exact-cell NLL is
-slow to improve.
+:func:`expected_distance_ft` reports ``E_c[||x_c - y||]`` under the
+predicted cell distribution, a geometric metric that responds to mass
+moving toward the observed shot even when the exact-cell NLL changes
+little.
 """
 
 from __future__ import annotations
@@ -48,11 +53,10 @@ from torch import Tensor
 
 #: Default rectangular court bounding box ``(x_min, x_max, y_min, y_max)``
 #: in feet, used by :func:`half_court_log_normalizer`. Matches the
-#: out-of-court filter applied in :func:`shotcloud.data.loaders.load_shots`:
-#: shots with ``|x|>25`` ft, ``y<-5`` ft, or ``y>47`` ft are dropped as
-#: out-of-court. With the basket at the origin and ``y`` pointing away
-#: from the basket, this bounding box covers the entire in-court region
-#: that the model ever evaluates.
+#: default out-of-court filter of :func:`shotcloud.data.loaders.load_shots`, which
+#: drops shots with ``|x| > 25``, ``y < -5`` or ``y > 47`` (basket at the
+#: origin, ``y`` pointing away from the basket), so the box covers every
+#: location the model evaluates.
 DEFAULT_COURT_BOUNDS: tuple[float, float, float, float] = (-25.0, 25.0, -5.0, 47.0)
 
 
@@ -63,8 +67,7 @@ def half_court_log_normalizer(
     *,
     eps: float = 1e-12,
 ) -> Tensor:
-    r"""Analytic ``log Z_m(\mathcal C)`` for an isotropic 2-D Gaussian
-    on the rectangular court ``\mathcal C``.
+    r"""Log on-court mass ``log Z_m(\mathcal C)`` of isotropic Gaussian kernels.
 
     For an isotropic Gaussian kernel ``K(y; s_m, \sigma_m^2 I)`` centered
     at ``s_m`` with bandwidth ``\sigma_m`` evaluated on the rectangular
@@ -126,10 +129,10 @@ def half_court_log_normalizer(
 
     Notes
     -----
-    The normalizer is for the **isotropic** kernel only. Anisotropic
-    kernels (the radial-tangential and full-covariance stress-test
-    variants) need a separate, kernel-specific normalizer that the
-    anisotropic-kernel module is responsible for producing.
+    The normalizer is for the isotropic kernel only. Anisotropic kernels
+    (:mod:`shotcloud.models.anisotropic_kernel`) need a kernel-specific
+    normalizer, passed to :func:`continuous_mixture_loglik` as
+    ``log_court_normalizer``.
     """
     if support_xy.dim() != 3 or support_xy.shape[-1] != 2:
         raise ValueError(f"support_xy must be (B, M, 2); got {tuple(support_xy.shape)}")
@@ -184,31 +187,28 @@ def continuous_coordinate_nll(
     ----------
     log_probs : Tensor of shape ``(B, C)``
         Log of the predicted cell distribution ``log p_Θ(c | ·)``.
-        Rows must be valid log-probabilities (i.e. ``logsumexp`` over
-        ``C`` is 0 within float tolerance). Not checked here — the
-        upstream Gibbs decoder is responsible.
+        Rows must be normalized (``logsumexp`` over ``C`` equal to 0 up
+        to float tolerance); this is not checked.
     shot_xy : Tensor of shape ``(B, 2)``
         Exact observed shot coordinates in court feet. Use the raw
         continuous coordinate (not the snapped cell center).
     cell_centers : Tensor of shape ``(C, 2)``
         Per-cell ``(x, y)`` centers in court feet, in the same flat
         image-layout order ``c = iy*nx + ix`` as ``log_probs``.
-    tau : float
-        Observation-kernel bandwidth in feet. Smaller → sharper
-        (loss approaches exact-cell NLL when ``tau → 0`` and the shot
-        lands on a cell center). Default 1.0 ft ≈ one grid cell width.
-    normalize_kernel : bool
-        When True (default) normalize ``K_τ(y - x_c)`` to sum to 1
-        over cells per shot, via log-softmax. Keeps the loss scale
-        stable at the court boundary where the un-normalized kernel
-        loses mass to absent cells.
+    tau : float, default 1.0
+        Observation-kernel bandwidth in feet. Smaller values are sharper;
+        the loss approaches the exact-cell NLL as ``tau → 0`` when the
+        shot lies on a cell center.
+    normalize_kernel : bool, default True
+        Normalize ``K_τ(y - x_c)`` to sum to one over cells for each shot
+        (a log-softmax). Keeps the loss scale stable near the court
+        boundary, where the unnormalized kernel loses mass to cells
+        outside the grid.
 
     Returns
     -------
     Tensor of shape ``(B,)``
-        Per-shot NLL. The caller decides whether to mean over the
-        batch — mirrors the existing per-shot pattern in
-        ``_epoch()``.
+        Per-shot NLL; reduction over the batch is left to the caller.
     """
     if tau <= 0:
         raise ValueError(f"tau must be > 0; got {tau}")
@@ -223,9 +223,21 @@ def continuous_coordinate_nll(
 def exact_cell_nll(log_probs: Tensor, cell_idx: Tensor) -> Tensor:
     """Per-shot categorical NLL ``-log p_Θ(c_obs | context)``.
 
-    The legacy spatial training objective. Retained as a comparability
-    metric when :func:`continuous_coordinate_nll` is the training
-    objective, so cross-run comparison stays meaningful.
+    The grid-cell training objective for ``spatial_likelihood="cell"``;
+    also reported as a comparison metric when
+    :func:`continuous_coordinate_nll` is optimized.
+
+    Parameters
+    ----------
+    log_probs : Tensor of shape ``(B, C)``
+        Log cell probabilities.
+    cell_idx : Tensor of shape ``(B,)``, int64
+        Observed cell per shot.
+
+    Returns
+    -------
+    Tensor of shape ``(B,)``
+        Per-shot NLL.
     """
     return -log_probs.gather(1, cell_idx.unsqueeze(1)).squeeze(1)
 
@@ -233,12 +245,11 @@ def exact_cell_nll(log_probs: Tensor, cell_idx: Tensor) -> Tensor:
 def expected_distance_ft(log_probs: Tensor, shot_xy: Tensor, cell_centers: Tensor) -> Tensor:
     """Per-shot ``E_c[||x_c - y||]`` under the predicted cell distribution.
 
-    Geometric diagnostic for whether the model is concentrating mass
-    near the observed shot. Useful when exact-cell NLL barely moves
-    but the distribution is in fact rotating toward the right region
-    of the court.
-
-    Returns ``(B,)`` in feet.
+    Geometric diagnostic of whether the predicted mass concentrates near
+    the observed shot; it can improve while the exact-cell NLL barely
+    changes. ``log_probs`` is ``(B, C)``, ``shot_xy`` is ``(B, 2)`` and
+    ``cell_centers`` is ``(C, 2)`` as in :func:`continuous_coordinate_nll`.
+    Returns a ``(B,)`` tensor in feet.
     """
     dist2 = _squared_distances(shot_xy, cell_centers)
     dist = dist2.clamp_min(0.0).sqrt()  # (B, C)
@@ -260,8 +271,7 @@ def continuous_mixture_loglik(
     log_court_normalizer: Tensor | None = None,
     eps: float = 1e-12,
 ) -> Tensor:
-    """Per-row continuous-mixture log-likelihood of the cell-free
-    collaborative kernel mixture (paper §"continuous collab KDE").
+    """Per-row log-likelihood of the cell-free AC-KDE kernel mixture.
 
     Evaluates
 
@@ -274,79 +284,72 @@ def continuous_mixture_loglik(
             - \\frac{\\|y_b - s_{b,m}\\|^2}{2\\sigma_b^2}
           \\right].
 
-    The unconstrained 2-D isotropic Gaussian density is on
-    :math:`\\mathbb{R}^2`. When the optional ``court_bounds`` argument
-    is provided (or an explicit per-(B, M) ``log_court_normalizer``
-    is supplied for the anisotropic path), the per-support-shot
-    boundary correction
+    Each Gaussian kernel is a density on :math:`\\mathbb{R}^2`. With
+    ``court_bounds`` (isotropic kernels) or ``log_court_normalizer`` (any
+    kernel), each support shot's log-kernel is reduced by the log of its
+    on-court mass
 
     .. math::
 
         Z_m(\\mathcal C)
-        = \\int_\\mathcal C \\varphi_2(u; s_m, \\sigma_m^2 I)\\, du
+        = \\int_\\mathcal C \\varphi_2(u; s_m, \\sigma_m^2 I)\\, du,
 
-    is computed analytically (isotropic case) via
-    :func:`half_court_log_normalizer` and subtracted from each
-    support shot's log-kernel so the predictive density is a proper
-    density on the rectangular court ``\\mathcal C`` rather than on
-    :math:`\\mathbb{R}^2`. When both ``court_bounds`` and
-    ``log_court_normalizer`` are ``None`` (the default) the function
-    behaves bit-identically to the v1 unconstrained-:math:`\\mathbb R^2`
-    formulation, preserving every existing trained checkpoint and
-    test.
+    computed analytically by :func:`half_court_log_normalizer` in the
+    isotropic case, so the predictive density integrates to one over the
+    rectangular court :math:`\\mathcal C`. With neither argument the
+    kernels are normalized on :math:`\\mathbb{R}^2`.
 
     Parameters
     ----------
     log_weights : Tensor of shape ``(B, M)``
-        Unnormalized log-scores per support shot when
-        ``weights_are_log_probs=False`` (the default — softmax-normalized
-        internally with a numerically stable
-        ``log_weights - logsumexp(log_weights)``). If you've already
-        normalized externally, pass ``weights_are_log_probs=True``.
+        Support log-weights. Unnormalized logits by default, normalized
+        internally as ``log_weights - logsumexp(log_weights)``; pass
+        ``weights_are_log_probs=True`` if they are already normalized.
     support_xy : Tensor of shape ``(B, M, 2)``
         Per-row support coordinates in court feet.
     shot_xy : Tensor of shape ``(B, 2)``
         Observed shot coordinate per row in court feet.
-    sigma : Tensor of shape ``(B,)`` or ``(B, M)``
-        Isotropic bandwidth in feet. ``(B,)`` = per-row (one σ shared
-        across the row's M support shots — the current fixed/per-row
-        path). ``(B, M)`` = per-support-shot (Tier-1a source/zone
-        bandwidth: each support shot carries its own σ derived from
-        its source ∈ {own, pooled} and zone ∈ [0, N_ZONES)).
+    sigma : Tensor of shape ``(B,)`` or ``(B, M)``, optional
+        Isotropic bandwidth in feet: one per row, or one per support shot
+        (e.g. a per-(source, zone) bandwidth). Exactly one of ``sigma``
+        and ``log_kernel`` must be given.
+    log_kernel : Tensor of shape ``(B, M)``, optional
+        Precomputed log-kernel ``log K_m(y_b - s_{b,m})``, e.g. from an
+        anisotropic kernel module. Replaces the isotropic kernel.
+    log_kernel_extra : Tensor of shape ``(B, M)``, optional
+        Additive log-multiplier on each kernel value, e.g. a cross-zone
+        attenuation that is 0 when the observed shot and the support shot
+        share a court zone and ``log(epsilon)`` otherwise.
+    weights_are_log_probs : bool, default False
+        Whether ``log_weights`` is already normalized.
     support_mask : Tensor of shape ``(B, M)``, optional
-        Bool mask; ``True`` for valid support, ``False`` for padded /
-        non-causal / empty-history slots. Invalid slots get a
-        ``-inf`` log-weight before normalization so they contribute
-        zero mass to the mixture. When ``None`` all slots are valid.
+        Boolean mask, ``True`` for valid support and ``False`` for padded
+        or empty slots. Invalid slots receive a ``-inf`` log-weight before
+        normalization and so carry no mass. ``None`` means all valid.
     court_bounds : 4-tuple of float, optional
-        ``(x_min, x_max, y_min, y_max)`` rectangular court bounding box
-        in feet. When provided (e.g.
-        :data:`DEFAULT_COURT_BOUNDS`) the per-support-shot half-court
-        normalizer is computed analytically via
-        :func:`half_court_log_normalizer` and subtracted from each
-        kernel value, so the predictive density is a proper density on
-        ``\\mathcal C``. **Only valid with the isotropic ``sigma`` path**
-        --- combining ``court_bounds`` with the precomputed
-        ``log_kernel`` (anisotropic) path raises. For the anisotropic
-        path, the kernel module must supply its own
-        ``log_court_normalizer``.
+        ``(x_min, x_max, y_min, y_max)`` court rectangle in feet, e.g.
+        :data:`DEFAULT_COURT_BOUNDS`. Requires the isotropic ``sigma``
+        path; mutually exclusive with ``log_court_normalizer``.
     log_court_normalizer : Tensor of shape ``(B, M)``, optional
-        Precomputed per-support-shot ``log Z_m(\\mathcal C)`` for the
-        anisotropic-kernel path. When provided, it is subtracted from
-        ``log_kernel`` (or from the isotropic ``log_kernel_eff``) and
-        ``court_bounds`` must be ``None``. The anisotropic-kernel
-        module is responsible for computing this from its own per-zone
-        covariance shape.
-    eps : float
-        Floor on ``sigma**2`` for the divisor.
+        Precomputed per-support-shot ``log Z_m(\\mathcal C)``, supplied by
+        a kernel module that defines its own kernel shape. Mutually
+        exclusive with ``court_bounds``.
+    eps : float, default 1e-12
+        Floor on ``sigma**2``.
 
     Returns
     -------
     Tensor of shape ``(B,)``
-        Per-row log-likelihood. Rows whose mask is all-``False``
-        (no valid support — e.g. cold-start with no causal analogue
-        history) get ``log_lik = -inf`` here; the caller is
-        responsible for any floor / fallback policy.
+        Per-row log-likelihood. Rows whose mask is all ``False`` (no valid
+        support) get ``-inf``; any floor or fallback is left to the
+        caller.
+
+    Raises
+    ------
+    ValueError
+        On shape mismatches, when both or neither of ``sigma`` and
+        ``log_kernel`` are given, or when ``court_bounds`` is combined
+        with ``log_court_normalizer`` or with ``log_kernel``.
     """
     if log_weights.dim() != 2:
         raise ValueError(f"log_weights must be (B, M); got {tuple(log_weights.shape)}")
@@ -361,11 +364,8 @@ def continuous_mixture_loglik(
         raise ValueError(
             f"shot_xy must be (B={log_weights.shape[0]}, 2); got {tuple(shot_xy.shape)}"
         )
-    # Mutually exclusive: either pass ``sigma`` (the current isotropic
-    # path) and let this function compute the log-kernel, or pass a
-    # precomputed ``log_kernel`` (the Tier-2 anisotropic path: the
-    # caller's kernel module has already produced the per-shot
-    # ``log K(δ)`` from its own per-zone covariance).
+    # Either ``sigma`` (isotropic kernel computed here) or a precomputed
+    # ``log_kernel`` from a kernel module with its own covariance shape.
     if (sigma is None) == (log_kernel is None):
         raise ValueError(
             "exactly one of `sigma` or `log_kernel` must be provided "
@@ -399,15 +399,13 @@ def continuous_mixture_loglik(
                 f"{tuple(support_mask.shape)} vs {tuple(log_weights.shape)}"
             )
         log_weights = log_weights.masked_fill(~support_mask, float("-inf"))
-        # Cold-start guard. ``logsumexp(all-inf)`` returns NaN in
-        # PyTorch (the max-subtraction trick computes -inf - -inf =
-        # NaN). Even though we overwrite the row's ``log_lik`` with
-        # -inf below via ``torch.where``, the backward pass through
-        # ``logsumexp`` already produces ``exp(... - NaN) = NaN`` for
-        # those rows, and ``0 * NaN = NaN`` poisons the shared σ /
-        # weight gradients. Force one dummy finite entry per
-        # cold-start row so the logsumexp is well-defined; the
-        # downstream torch.where discards the dummy value.
+        # Cold-start guard. ``logsumexp`` over an all-``-inf`` row is NaN
+        # (the max-subtraction computes -inf - -inf). Although such rows
+        # are overwritten with -inf below via ``torch.where``, the
+        # backward pass through ``logsumexp`` would still produce NaN, and
+        # ``0 * NaN = NaN`` would poison the shared σ and weight
+        # gradients. One finite placeholder entry per cold-start row keeps
+        # the logsumexp well defined; ``torch.where`` discards its value.
         no_valid_pre = ~support_mask.any(dim=-1)
         if no_valid_pre.any():
             log_weights = log_weights.clone()
@@ -421,17 +419,14 @@ def continuous_mixture_loglik(
     if sigma is not None:
         diff = shot_xy.unsqueeze(1) - support_xy  # (B, M, 2)
         dist2 = (diff * diff).sum(dim=-1)  # (B, M)
-        # sigma2 broadcasts: (B, 1) when sigma is (B,) (per-row), or (B, M)
-        # when sigma is (B, M) (per-support-shot, Tier-1a source/zone σ).
+        # sigma2 is (B, 1) for a per-row σ and (B, M) for a per-support σ.
         if sigma.dim() == 1:
             sigma2 = sigma.pow(2).clamp_min(eps).unsqueeze(-1)  # (B, 1)
         else:
             sigma2 = sigma.pow(2).clamp_min(eps)  # (B, M)
         log_kernel_eff = -math.log(2.0 * math.pi) - torch.log(sigma2) - 0.5 * dist2 / sigma2
     else:
-        # Anisotropic path: the caller's kernel module has already
-        # computed the per-shot ``log K(δ)`` with its own per-zone
-        # covariance shape. We just use it as-is.
+        # Precomputed log-kernel from the caller's kernel module.
         assert log_kernel is not None
         log_kernel_eff = log_kernel
 
@@ -441,26 +436,18 @@ def continuous_mixture_loglik(
                 f"log_kernel_extra must match log_weights shape (B, M); got "
                 f"{tuple(log_kernel_extra.shape)} vs {tuple(log_weights.shape)}"
             )
-        # Additive per-(query, support) log multiplier on the kernel.
-        # Stratified-court kernel (Phase 1 C1, 2026-06-09): each entry
-        # is 0 when the observed shot and the support shot live in the
-        # same court stratum (zone), or ``log(epsilon)`` when they
-        # don't. The mixture is therefore stratum-respecting: cross-
-        # stratum support shots contribute reduced mass even when
-        # their Euclidean distance is small.
+        # Additive per-(query, support) log-multiplier on the kernel. For
+        # the zone-stratified kernel each entry is 0 when the observed
+        # shot and the support shot share a court zone and log(epsilon)
+        # otherwise, so cross-zone support contributes reduced mass even
+        # at small Euclidean distance.
         log_kernel_eff = log_kernel_eff + log_kernel_extra
 
-    # Half-court boundary correction (AOAS audit item A1, 2026-06-13).
-    # Without this step the per-support-shot kernel ``K(y;s_m,σ_m^2 I)``
-    # is an unconstrained 2-D Gaussian on ℝ², which leaks mass off-court
-    # when s_m is near the rim, baseline, or corner; the resulting
-    # ``log f_Θ`` is unnormalized on the court ``C`` and is not
-    # directly comparable across architectures that allocate σ
-    # differently. ``court_bounds`` opts in to the analytic per-shot
-    # log Z_m subtraction (isotropic path), or callers on the
-    # anisotropic path can supply ``log_court_normalizer`` precomputed
-    # from their kernel module. Both ``None`` preserves the v1
-    # behavior bit-exactly.
+    # Court boundary correction. On ℝ² each kernel K(y; s_m, σ_m² I)
+    # leaks mass off the court when s_m is near an edge of the court
+    # rectangle, so log f_Θ is not normalized on the court and is not
+    # comparable across models that allocate σ differently. Subtracting
+    # log Z_m makes every kernel a density on the court rectangle.
     if court_bounds is not None and log_court_normalizer is not None:
         raise ValueError(
             "court_bounds and log_court_normalizer are mutually exclusive; "
@@ -484,13 +471,9 @@ def continuous_mixture_loglik(
         log_kernel_eff = log_kernel_eff - log_court_normalizer
 
     log_lik: Tensor = torch.logsumexp(log_w + log_kernel_eff, dim=-1)  # (B,)
-    # ``logsumexp`` of an all-``-inf`` row is NaN in PyTorch (the
-    # max-of-all-inf in the trick is -inf, so we get
-    # ``-inf + log(exp(0) + ...) = -inf + log(N*nan)``). We want
-    # a clean ``-inf`` sentinel for rows whose support is entirely
-    # masked out (cold-start with no causal analogue history) so the
-    # trainer can apply a floor / fallback without NaN-poisoning the
-    # backward pass.
+    # Rows with no valid support (cold start) get a clean -inf sentinel
+    # in place of the placeholder value, so the caller can apply a floor
+    # or fallback.
     if support_mask is not None:
         no_valid = ~support_mask.any(dim=-1)
         log_lik = torch.where(no_valid, torch.full_like(log_lik, float("-inf")), log_lik)
@@ -509,12 +492,12 @@ def continuous_mixture_nll(
     log_court_normalizer: Tensor | None = None,
     eps: float = 1e-12,
 ) -> Tensor:
-    """Per-row continuous-mixture NLL (the negation of
-    :func:`continuous_mixture_loglik`). Mirrors
-    :func:`continuous_coordinate_nll`'s per-shot return signature so
-    the trainer can plug it in interchangeably. ``court_bounds`` and
-    ``log_court_normalizer`` are forwarded to the underlying loglik;
-    see :func:`continuous_mixture_loglik` for the semantics."""
+    """Per-row continuous-mixture NLL, the negation of :func:`continuous_mixture_loglik`.
+
+    Supports the isotropic ``sigma`` path only; all arguments are
+    forwarded unchanged. Returns a ``(B,)`` tensor, like
+    :func:`continuous_coordinate_nll`.
+    """
     return -continuous_mixture_loglik(
         log_weights=log_weights,
         support_xy=support_xy,
@@ -537,14 +520,13 @@ def mode_mixture_loglik(
     court_bounds: tuple[float, float, float, float] | None = None,
     eps: float = 1e-12,
 ) -> Tensor:
-    """Per-row log-likelihood of a small K-mode Gaussian mixture
-    (paper §"collaborative mode mixture").
+    """Per-row log-likelihood of a small K-mode Gaussian mixture.
 
-    Used by the cell-free **mode-extraction** spatial path
+    Used by the mode-mixture spatial decoder
     (:class:`~shotcloud.models.collaborative_mode_mixture.CollaborativeModeMixtureSpatial`),
-    where the mode centers ``μ_k`` are **per-row** convex
-    combinations of the attended support coordinates rather than
-    fixed/learnable anchors.
+    an alternative to the support-shot mixture in which the mode centers
+    ``μ_k`` are per-row convex combinations of the attended support
+    coordinates.
 
     Evaluates
 
@@ -565,10 +547,14 @@ def mode_mixture_loglik(
         Per-row mode centers in court feet.
     shot_xy : Tensor of shape ``(B, 2)``
         Observed shot coordinate per row in court feet.
-    sigma : Tensor of shape ``(K,)`` or ``(B,)`` or ``(B, K)`` or scalar
-        Per-mode density bandwidth. Broadcast to ``(B, K)`` internally.
-    eps : float
-        Floor on ``sigma**2`` for the divisor.
+    sigma : Tensor of shape ``(K,)`` or ``(B,)`` or ``(B, K)``, or float
+        Mode bandwidth in feet, broadcast to ``(B, K)``.
+    court_bounds : 4-tuple of float, optional
+        ``(x_min, x_max, y_min, y_max)`` court rectangle in feet. When
+        given, each mode's Gaussian is renormalized to the rectangle via
+        :func:`half_court_log_normalizer`.
+    eps : float, default 1e-12
+        Floor on ``sigma**2``.
 
     Returns
     -------
@@ -609,12 +595,9 @@ def mode_mixture_loglik(
     sigma2 = sigma_bk.pow(2).clamp_min(eps)
     log_kernel = -math.log(2.0 * math.pi) - torch.log(sigma2) - 0.5 * dist2 / sigma2
 
-    # Half-court boundary correction for the mode-mixture path. The
-    # mode centers ``μ_k`` are per-row, learned mixture components
-    # (not historical shot locations), so they can land anywhere in
-    # the modelling region; using ``court_bounds`` here renormalizes
-    # each mode's Gaussian on the on-court rectangle, matching the
-    # ``continuous_mixture_loglik`` boundary correction.
+    # Court boundary correction, as in ``continuous_mixture_loglik``. Mode
+    # centers are learned per row rather than observed shot locations,
+    # so they can lie anywhere in the modeling region.
     if court_bounds is not None:
         log_z = half_court_log_normalizer(mode_mu, sigma_bk, court_bounds)
         log_kernel = log_kernel - log_z

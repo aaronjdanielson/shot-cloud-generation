@@ -1,37 +1,37 @@
-"""Player-specific mode extractor from attended causal shot history.
+"""Learned-query mode extractor over attended causal support shots.
 
-Implements Phase 2 of the collaborative mode-extraction plan: takes
-the support-attention output of an upstream collaborative scorer and
-compresses it into a small per-row Gaussian mixture over learned
-court modes.
+:class:`SupportModeExtractor` takes the support attention produced by an
+upstream collaborative scorer and compresses it into a small per-row
+Gaussian mixture over ``K`` court modes. It is used by
+:class:`~shotcloud.models.collaborative_mode_mixture.CollaborativeModeMixtureSpatial`,
+an alternative spatial decoder evaluated as an ablation.
 
-**Mode centers are convex combinations of the row's support
-coordinates.** ``μ_{b,k} = Σ_j α_{b,k,j} s_{b,j}`` with
-``α_{b,k,j} ≥ 0`` summing to 1 over ``j``. This guarantees modes
-live in regions the target/analogue players actually shoot from —
-the modes are *inferred per (player, game, shot)*, not
-fixed/learnable as a global basis.
+Mode centers are convex combinations of the row's support coordinates,
+``μ_{b,k} = Σ_j α_{b,k,j} s_{b,j}`` with ``α_{b,k,j} ≥ 0`` summing to 1
+over ``j``, so modes lie in regions the target and analogue players
+actually shoot from. Modes are inferred per (player, game, shot) rather
+than learned as a global basis.
 
 Pipeline:
 
-1. Embed each support coord: ``e_j = ψ(s_j)`` via a learned
-   :class:`~shotcloud.models.LocationEmbedding`.
-2. K learnable mode queries ``q_k ∈ R^d``.
-3. Mode-to-support attention biased by support-attention log-prob:
+1. Embed each support coordinate, ``e_j = ψ(s_j)``, with a
+   :class:`~shotcloud.models.location_embedding.LocationEmbedding`.
+2. Use ``K`` learnable mode queries ``q_k ∈ R^d``.
+3. Mode-to-support attention, optionally biased by the support
+   attention:
 
-       α_{k,j} = softmax_j(q_k^T e_j / √d + log ω_j).
+       α_{k,j} = softmax_j(q_k^T e_j / √d + λ_ω log ω_j).
 
 4. Mode centers ``μ_k = Σ_j α_{k,j} s_j``.
 5. Mode evidence ``m_k = Σ_j ω_j α_{k,j}``.
-6. Mode logits ``ℓ_k = log m_k + b_k(x, h)`` where ``b_k`` is an
-   optional small context MLP (zero-init last layer → driven by
-   evidence at step 0).
+6. Mode logits ``ℓ_k = log m_k + b_k(x, h)``, where ``b_k`` is an
+   optional small context MLP whose last layer is zero-initialized, so
+   the logits are driven by the evidence alone at initialization.
 
-Cold-start safety: rows whose support set is entirely masked
-have their dummy-slot-0 patched (matching the upstream
-support-attention path) so the per-mode softmax stays well-
-defined; the trainer applies a uniform-court-density floor on
-``log_lik`` for those rows.
+Rows whose support set is entirely masked (cold start) have dummy slot 0
+patched, matching the upstream support-attention path, so the per-mode
+softmax stays well defined; the caller assigns those rows a
+uniform-court log-likelihood floor.
 """
 
 from __future__ import annotations
@@ -45,32 +45,32 @@ from torch import Tensor, nn
 from shotcloud.data.context import CONTEXT_DIM
 from shotcloud.models.location_embedding import LocationEmbedding
 
-#: Default ``K`` (number of court modes). Plan §7 v1 recommends K=6.
+#: Default ``K`` (number of court modes).
 DEFAULT_N_COURT_MODES: int = 6
 
 #: Default dimension of the support embedding ``e_j`` and mode
 #: queries ``q_k`` for the Q-K product.
 DEFAULT_MODE_QUERY_DIM: int = 32
 
-#: Default fixed per-mode density bandwidth σ in feet. Bumped from
-#: 2.0 → 3.0 on 2026-05-18 after the H2/H3 mode plots showed the
-#: 2-ft σ circles undercovered the local cluster spread; 3 ft is
-#: closer to the empirical mass radius and keeps log-lik smoother.
+#: Default fixed per-mode density bandwidth σ in feet, chosen to
+#: approximate the spatial spread of a local shot cluster so that each
+#: mode covers its cluster and the log-likelihood stays smooth.
 DEFAULT_MODE_SIGMA_FT: float = 3.0
 
 
 @dataclass(frozen=True)
 class ModeExtractorOutputs:
-    """Output bundle of :class:`SupportModeExtractor.forward`.
+    """Output bundle of a mode extractor's ``forward``.
 
-    Carries everything the trainer needs for both the mode-mixture
-    NLL and the per-epoch mode diagnostics.
+    Returned by both :class:`SupportModeExtractor` and
+    :class:`~shotcloud.models.soft_kmeans_extractor.SoftKMeansModeExtractor`;
+    carries the inputs to the mode-mixture NLL and the mode diagnostics.
     """
 
     mode_logits: Tensor  # (B, K) pre-softmax mode scores ℓ_k
     mode_mu: Tensor  # (B, K, 2) convex-combination mode centers
     mode_sigma: Tensor  # (K,) or (B, K) — per-mode density bandwidth
-    mode_attention: Tensor  # (B, K, M) mode-to-support α_{k,j}
+    mode_attention: Tensor  # (B, K, M) mode-to-support weights (α_{k,j} or r_{k,j})
     mode_mass: Tensor  # (B, K) support mass captured by each mode m_k
     cold_start: Tensor  # (B,) bool — rows with no valid causal support
 
@@ -78,11 +78,12 @@ class ModeExtractorOutputs:
 class SupportModeExtractor(nn.Module):
     """Mode-extraction head over attended support shots.
 
-    Construction-only piece; no support scoring inside. The caller
-    (typically :class:`CollaborativeModeMixtureSpatial`) supplies the
-    support attention via ``log_support_weights`` and the support
-    coordinates / mask. This keeps mode extraction independent of
-    *which* support scorer produced the attention.
+    The module does no support scoring of its own. The caller
+    (typically
+    :class:`~shotcloud.models.collaborative_mode_mixture.CollaborativeModeMixtureSpatial`)
+    supplies the support attention via ``log_support_weights`` together
+    with the support coordinates and mask, so mode extraction is
+    independent of the scorer that produced the attention.
 
     Parameters
     ----------
@@ -90,7 +91,7 @@ class SupportModeExtractor(nn.Module):
         K — number of court modes the extractor produces.
     mode_query_dim : int, default 32
         d — dimension of the support embedding and mode queries.
-    mode_sigma_ft : float, default 2.0
+    mode_sigma_ft : float, default 3.0
         Per-mode fixed isotropic density bandwidth in feet.
     context_dim : int, default :data:`CONTEXT_DIM` (27)
         Width of ``context`` input to ``b_k``.
@@ -104,15 +105,15 @@ class SupportModeExtractor(nn.Module):
         logits. When False, mode logits are driven purely by the
         support evidence ``log m_k`` (no context correction).
     lambda_omega : float, default 0.0
-        Weight on the ``log ω_j`` bias inside the mode-to-support
-        attention. ``0.0`` (default, the strengthened-model spec):
-        α uses **pure geometry** — α_{k,j} = softmax_j(q_k^T e_j / √d)
-        — and ω only enters the mode mass m_k = Σ_j ω_j α_{k,j}.
-        ``1.0``: the original support-weighted extraction
-        α_{k,j} = softmax_j(q_k^T e_j / √d + log ω_j). Intermediate
-        values blend the two. Separating geometry from mass
-        prevents high-ω shots from dominating both center formation
-        and mode probability.
+        Weight ``λ_ω`` on the ``log ω_j`` bias inside the mode-to-support
+        attention, in ``[0, 1]``. At ``0.0``, α is purely geometric,
+        ``α_{k,j} = softmax_j(q_k^T e_j / √d)``, and ω enters only the
+        mode mass ``m_k = Σ_j ω_j α_{k,j}``. At ``1.0``, extraction is
+        fully support-weighted,
+        ``α_{k,j} = softmax_j(q_k^T e_j / √d + log ω_j)``. Intermediate
+        values interpolate. Separating geometry from mass prevents
+        high-ω shots from dominating both center formation and mode
+        probability.
     """
 
     mode_queries: Tensor  # (K, d) — nn.Parameter
@@ -149,8 +150,9 @@ class SupportModeExtractor(nn.Module):
         self.history_dim = int(history_dim)
         self.lambda_omega = float(lambda_omega)
 
-        # Support embedding ψ(s_j) — must carry spatial signal at
-        # step 0 (not paired with a V=0 partner), so non-zero init.
+        # Support embedding ψ(s_j). It must carry spatial signal at
+        # initialization (unlike the residual-tilt embedding), so its
+        # projection is not zero-initialized.
         self.support_embedding = LocationEmbedding(rank=mode_query_dim, zero_init=False)
 
         # K learnable mode queries; small random init so the K queries
@@ -243,16 +245,15 @@ class SupportModeExtractor(nn.Module):
         qk_logits = torch.einsum("kd,bmd->bkm", self.mode_queries, e_j) / math.sqrt(
             self.mode_query_dim
         )
-        # Optional ω-bias (off by default per the strengthened-model
-        # spec — keeps α purely geometric so high-ω shots don't
-        # dominate both center formation and mode mass).
+        # Optional ω-bias. Off by default, keeping α purely geometric so
+        # high-ω shots don't dominate both center formation and mode mass.
         if self.lambda_omega > 0.0:
             qk_logits = qk_logits + self.lambda_omega * log_support_weights.unsqueeze(1)
         # Mask invalid support shots from per-mode softmax.
         qk_logits = qk_logits.masked_fill(~support_mask.unsqueeze(1), float("-inf"))
         # Cold-start safety: all-True masking sends every entry to
         # -inf → softmax NaN. Patch slot 0 with finite 0 per mode.
-        # The caller / trainer applies a log_lik floor for these rows.
+        # The caller applies a log_lik floor for these rows.
         if cold_start.any():
             qk_logits = qk_logits.clone()
             qk_logits[cold_start, :, 0] = 0.0
