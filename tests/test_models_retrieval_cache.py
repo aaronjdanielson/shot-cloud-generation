@@ -1,6 +1,6 @@
-"""Tests for ``shotcloud.models.retrieval_cache``.
+"""Tests for :mod:`shotcloud.models.retrieval_cache`.
 
-PR3.1 acceptance criteria:
+The numbered tests check these properties of the own/pooled support cache:
 
 1. Builds a deterministic cache for synthetic data.
 2. Enforces causality: no retrieved shot has date >= anchor date.
@@ -28,6 +28,7 @@ from shotcloud.models.retrieval_cache import (
     RetrievalCacheConfig,
     build_retrieval_cache,
     shots_fingerprint,
+    traits_fingerprint,
 )
 from shotcloud.training.dataset import PlayerVocab
 
@@ -43,14 +44,13 @@ def _epoch_day(s: str) -> int:
 def _build_simple_fixture(
     *, trait_dim: int = 3, seed: int = 0
 ) -> tuple[pd.DataFrame, PlayerVocab, np.ndarray, torch.Tensor]:
-    """4 players, 1 snapshot, controlled traits.
+    """Four players, one snapshot, controlled traits.
 
-    * Target = player 0, traits at snapshot point along the x-axis.
-    * Player 1 close to target (cos ≈ 0.9), player 2 medium (cos ≈ 0.5),
-      player 3 nearly orthogonal (cos ≈ 0.1).
-    * Each player has 2 shots BEFORE the snapshot anchor (causal) and 1
-      shot AT or AFTER the anchor (non-causal — used to verify the
-      causality test). All shots fall inside the recency window.
+    * The target is player 0, whose traits point along the x-axis.
+    * Players 1, 2, 3 have trait cosines 0.9, 0.5, 0.1 with player 0.
+    * Each player has two causal shots before the anchor and one shot on the anchor
+      date, which the strict ``< anchor`` cutoff must exclude. All shots fall inside
+      the recency window.
     """
     rng = np.random.default_rng(seed)
     anchor = _epoch_day("2024-04-15")
@@ -79,8 +79,8 @@ def _build_simple_fixture(
     vocab = PlayerVocab.from_ids([0, 1, 2, 3])
     anchor_dates = np.array([anchor], dtype=np.int64)
 
-    # Traits at the (only) snapshot. Player 0 along x; others at known
-    # cosines vs player 0.
+    # Traits at the single snapshot: player 0 along x, the others at known cosines
+    # with player 0.
     traits = torch.zeros(4, 1, trait_dim)
     traits[0, 0, 0] = 1.0
     # Player 1: cos = 0.9
@@ -132,8 +132,8 @@ def test_1_build_is_deterministic() -> None:
 
 
 def test_2_causality_no_retrieved_shot_at_or_after_anchor() -> None:
-    """Every valid own_idx / pooled_idx points at a global shot whose
-    date is strictly less than the snapshot anchor."""
+    """Every valid ``own_idx`` / ``pooled_idx`` points at a global shot dated strictly
+    before the snapshot anchor."""
     shots, vocab, anchors, traits = _build_simple_fixture()
     cfg = _default_config(anchors)
     c = build_retrieval_cache(
@@ -183,12 +183,10 @@ def test_4_pooled_pool_excludes_target_player() -> None:
 
 
 def test_5_pooled_retrieval_respects_cosine_sim_ranking() -> None:
-    """With dates ~equal across pool candidates (so the recency term
-    is roughly flat) and traits crafted to make cos(0, 1) >> cos(0, 2)
-    >> cos(0, 3), the top-2 pooled shots for player 0 come from
-    player 1 — not player 2 or 3."""
+    """With equal shot dates (flat recency term), player 0's top-2 pooled shots come
+    from player 1, the most similar shooter."""
     shots, vocab, anchors, traits = _build_simple_fixture()
-    # Make dates within 1 day of each other so the recency term is ~equal.
+    # Put every causal shot on the same date so the recency term is constant.
     a = int(anchors[0])
     shots = shots.copy()
     mask = shots["date"] < np.datetime64(a, "D")
@@ -200,14 +198,13 @@ def test_5_pooled_retrieval_respects_cosine_sim_ranking() -> None:
     pool_mask = c.pooled_mask[0, 0, :]
     pool_idx = c.pooled_idx[0, 0, :][pool_mask]
     shooters = c.global_shooter_idx[pool_idx]
-    # Both top-2 should be from player 1 (highest cosine sim, 0.9).
+    # Both top-2 shots come from player 1 (cosine 0.9).
     assert (shooters == 1).all(), f"expected top-2 from player 1; got {shooters.tolist()}"
 
 
 def test_5b_pooled_retrieval_ranks_higher_cosine_above_lower() -> None:
-    """With pooled_support_max=4 and 2 shots each from players 1, 2, 3
-    (6 total at ~equal recency), top-4 must come from players 1 and 2
-    (cos 0.9 and 0.5), not player 3 (cos 0.1)."""
+    """With ``pooled_support_max=4`` and two equal-date shots from each of players 1,
+    2, 3, the top 4 come from players 1 and 2 (cosine 0.9 and 0.5), not player 3."""
     shots, vocab, anchors, traits = _build_simple_fixture()
     a = int(anchors[0])
     shots = shots.copy()
@@ -226,9 +223,7 @@ def test_5b_pooled_retrieval_ranks_higher_cosine_above_lower() -> None:
 
 
 def test_6_padding_uses_negative_one_idx_and_false_mask() -> None:
-    """An own pool of size cap-many shots leaves the rest as -1/False.
-    Verified by giving player 0 only 2 own shots with cap=4 — slots
-    2,3 must be (-1, False)."""
+    """With cap 4 and two causal own shots, slots 2 and 3 are ``(-1, False)``."""
     shots, vocab, anchors, traits = _build_simple_fixture()
     cfg = _default_config(anchors, own_support_max=4)
     c = build_retrieval_cache(
@@ -262,9 +257,9 @@ def test_7_disk_round_trip_preserves_tensors_and_config(tmp_path: Path) -> None:
 
 
 def test_7b_build_with_cache_dir_loads_on_second_call(tmp_path: Path) -> None:
-    """First call writes the cache; second call loads it without
-    re-running the retrieval (verified by deleting the source shots
-    DataFrame's columns the cache doesn't need)."""
+    """With ``cache_dir`` set, the first call writes the cache and the second loads it
+    without rebuilding (the second call passes an empty DataFrame, on which a rebuild
+    would fail)."""
     shots, vocab, anchors, traits = _build_simple_fixture()
     cfg = _default_config(anchors)
     c1 = build_retrieval_cache(
@@ -277,8 +272,7 @@ def test_7b_build_with_cache_dir_loads_on_second_call(tmp_path: Path) -> None:
     )
     cache_file = tmp_path / f"retrieval_cache_{cfg.config_hash}.pt"
     assert cache_file.exists()
-    # Second call: any shots_df argument should be ignored when the
-    # cache file is present and the hash matches.
+    # shots_df is ignored when a cache file with a matching hash exists.
     c2 = build_retrieval_cache(
         shots_df=pd.DataFrame(),  # empty; if rebuild ran it would crash
         player_vocab=vocab,
@@ -292,8 +286,7 @@ def test_7b_build_with_cache_dir_loads_on_second_call(tmp_path: Path) -> None:
 
 
 def test_8_config_hash_changes_on_any_retrieval_defining_field() -> None:
-    """Each retrieval-defining field, when changed, must produce a
-    different ``config_hash``."""
+    """Changing any retrieval-defining field changes ``config_hash``."""
     anchors = np.array([_epoch_day("2024-04-15")], dtype=np.int64)
     base = _default_config(anchors)
     base_h = base.config_hash
@@ -307,6 +300,7 @@ def test_8_config_hash_changes_on_any_retrieval_defining_field() -> None:
             anchors, pooled_recency_half_life_days=60.0
         ),
         "seed": _default_config(anchors, seed=1),
+        "traits_hash": _default_config(anchors, traits_hash="other_traits"),
     }
     for field, variant in variants.items():
         assert variant.config_hash != base_h, f"{field} change did not alter config_hash"
@@ -314,9 +308,17 @@ def test_8_config_hash_changes_on_any_retrieval_defining_field() -> None:
     assert _default_config(anchors).config_hash == base_h
 
 
+def test_traits_fingerprint_tracks_trait_values() -> None:
+    """Equal trait values give equal fingerprints; any changed value gives a new one."""
+    traits = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    changed = traits.clone()
+    changed[0, 0, 0] += 1.0
+    assert traits_fingerprint(traits) == traits_fingerprint(traits.clone().numpy())
+    assert traits_fingerprint(traits) != traits_fingerprint(changed)
+
+
 def test_9_atomic_save_leaves_no_tmp_file(tmp_path: Path) -> None:
-    """After a successful save, no leftover ``.tmp`` file remains in
-    the cache dir."""
+    """After a successful save, no leftover ``.tmp`` file remains."""
     shots, vocab, anchors, traits = _build_simple_fixture()
     cfg = _default_config(anchors)
     c = build_retrieval_cache(
@@ -370,6 +372,23 @@ def test_config_validates_positive_fields() -> None:
             shots_fingerprint="x",
             anchor_dates=anchors,
             similarity_kind="dot_product",
+        )
+
+
+def test_build_rejects_traits_hash_mismatch() -> None:
+    """A config keyed to one trait table cannot be used with another."""
+    shots, vocab, anchors, traits = _build_simple_fixture()
+    cfg = _default_config(anchors, traits_hash=traits_fingerprint(traits))
+    build_retrieval_cache(
+        shots_df=shots, player_vocab=vocab, anchor_dates=anchors, traits=traits, config=cfg
+    )
+    with pytest.raises(ValueError, match="traits_hash"):
+        build_retrieval_cache(
+            shots_df=shots,
+            player_vocab=vocab,
+            anchor_dates=anchors,
+            traits=traits + 1.0,
+            config=cfg,
         )
 
 

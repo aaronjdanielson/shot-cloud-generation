@@ -1,4 +1,4 @@
-"""Tests for the Phase-4 :class:`shotcloud.kde.AdaptiveKDE`."""
+"""Tests for :class:`shotcloud.kde.AdaptiveKDE` and its kernel-matrix builder."""
 
 from __future__ import annotations
 
@@ -184,15 +184,16 @@ def test_adaptive_kde_subsample_caps_at_max() -> None:
 
 
 # ---------------------------------------------------------------------------
-# recent_stratified history policy (2026-05-16, q_self readiness work)
+# recent_stratified history policy
 # ---------------------------------------------------------------------------
 
 
 def _build_shots_with_zone_pattern(n_recent: int, n_old: int, seed: int = 0) -> pd.DataFrame:
-    """Synthetic per-player shots: ``n_old`` older shots from many zones,
-    then ``n_recent`` recent shots concentrated in the rim. Lets us
-    verify that recent_stratified keeps recency while still preserving
-    older-zone coverage."""
+    """Build one player's shots: ``n_old`` spread over all zones, then ``n_recent`` at the rim.
+
+    The pattern separates the recency and zone-coverage halves of the
+    ``recent_stratified`` policy.
+    """
     rng = np.random.default_rng(seed)
     base_date = pd.Timestamp("2024-01-01")
     # Older shots: spread across all 8 zones. Pick a representative

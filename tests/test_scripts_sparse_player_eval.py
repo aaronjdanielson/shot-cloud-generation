@@ -1,20 +1,17 @@
-"""Tests for :mod:`scripts.sparse_player_eval` (the H̄-stratified
-cloud-metric post-processor introduced 2026-05-24).
+"""Tests for ``scripts/sparse_player_eval.py``, which stratifies cloud metrics by causal
+shot history ``Ĥ``.
 
-Two run modes covered:
+Two input modes are covered:
 
-* **Legacy / two-way**: single ``--cloud-metrics`` + ``--label`` plus
-  ``--baseline-cloud-metrics`` + ``--baseline-label``. The reference
-  label defaults to the baseline label.
-* **Multi-run** (PR3 pooled_max sweep, 2026-05-24): repeated
-  ``--cloud-metrics LABEL:PATH`` entries plus ``--reference-label``.
-  The output JSON carries ``delta_vs_reference[label][bucket]`` and
+* **Single or two-run**: ``--cloud-metrics PATH`` with ``--label``, optionally with
+  ``--baseline-cloud-metrics`` and ``--baseline-label``; the baseline is the reference.
+* **Multi-run**: repeated ``--cloud-metrics LABEL:PATH`` with ``--reference-label``;
+  the output carries ``delta_vs_reference[label][bucket]`` and
   ``ratio_vs_reference[label][bucket]`` for every non-reference label.
 
-The unit tests verify the bucketing logic, the aggregation, the
-empty-bucket shape, the missing-h_hat error path, the parser for
-``LABEL:PATH``, the reference-label resolution rules, and the
-end-to-end main in both modes — without invoking any model.
+The tests cover bucketing, aggregation, the empty-bucket shape, missing ``h_hat``,
+``LABEL:PATH`` parsing, reference-label resolution, and ``main`` in both modes,
+without running a model.
 """
 
 from __future__ import annotations
@@ -46,8 +43,11 @@ def _fake_game(
     energy: float,
     self_energy: float = 1.0,
 ) -> dict[str, Any]:
-    """Build a minimal per_game record. The non-energy metrics get
-    deterministic scaled values so the aggregation tests can pin them."""
+    """Build a minimal ``per_game`` record.
+
+    The non-energy metrics are deterministic multiples of ``energy`` so the
+    aggregation tests can check exact values.
+    """
     model = {k: float(energy * (1.0 + i * 0.1)) for i, k in enumerate(_METRICS)}
     sb = {k: float(self_energy * (1.0 + i * 0.1)) for i, k in enumerate(_METRICS)}
     return {
@@ -92,8 +92,8 @@ def test_bucket_games_partitions_by_h_hat() -> None:
 
 
 def test_bucket_games_skips_missing_h_hat_silently() -> None:
-    """Records without h_hat are dropped by `_bucket_games` so the
-    caller can detect partial coverage via the missing-row count."""
+    """``_bucket_games`` drops records without ``h_hat``; callers detect partial
+    coverage from the missing-row count."""
     g1 = _fake_game(player_id="p1", h_hat=10.0, energy=2.0)
     g2 = _fake_game(player_id="p2", h_hat=10.0, energy=2.0)
     del g2["h_hat"]
@@ -109,8 +109,7 @@ def test_bucket_games_skips_missing_h_hat_silently() -> None:
 
 
 def test_bucket_aggregate_empty_bucket_shape() -> None:
-    """An empty bucket must still emit the full shape with NaNs so
-    callers iterate uniformly."""
+    """An empty bucket still has the full shape, filled with NaN."""
     out = spe._bucket_aggregate([], has_self_bootstrap=True)
     assert out["n_games"] == 0
     for k in _METRICS:
@@ -170,9 +169,8 @@ def test_read_cloud_metrics_succeeds_when_all_h_hat_present(tmp_path: Path) -> N
 def test_read_cloud_metrics_falls_back_when_config_missing_self_bootstrap(
     tmp_path: Path,
 ) -> None:
-    """Some older cloud_metrics files may not record
-    ``include_self_bootstrap`` in their config; infer it from the
-    presence of ``self_bootstrap`` on the first per_game record."""
+    """Without ``include_self_bootstrap`` in the config, self-bootstrap availability is
+    inferred from the first ``per_game`` record."""
     games = [_fake_game(player_id="p1", h_hat=10.0, energy=2.0)]
     p = tmp_path / "cm.json"
     p.write_text(json.dumps({"config": {}, "per_game": games}))
@@ -181,8 +179,8 @@ def test_read_cloud_metrics_falls_back_when_config_missing_self_bootstrap(
 
 
 def test_read_pooling_finds_aggregate_nested_layout(tmp_path: Path) -> None:
-    """``pooled_by_history_bucket`` lives under ``aggregate`` in the
-    actual on-disk layout pooling_diagnostics.py writes."""
+    """``pooled_by_history_bucket`` is read from under ``aggregate``, where
+    ``pooling_diagnostics.py`` writes it."""
     pooling_path = tmp_path / "pooling.json"
     pooling_path.write_text(
         json.dumps({"aggregate": {"pooled_by_history_bucket": {"26-100": 0.31}}})
@@ -192,7 +190,7 @@ def test_read_pooling_finds_aggregate_nested_layout(tmp_path: Path) -> None:
 
 
 def test_read_pooling_falls_back_to_top_level(tmp_path: Path) -> None:
-    """Top-level placement is also accepted for older / hand-edited files."""
+    """A top-level ``pooled_by_history_bucket`` is also accepted."""
     pooling_path = tmp_path / "pooling.json"
     pooling_path.write_text(json.dumps({"pooled_by_history_bucket": {"26-100": 0.31}}))
     out = spe._read_pooling(pooling_path)
@@ -211,16 +209,14 @@ def test_parse_cm_arg_recognizes_label_colon_path() -> None:
 
 
 def test_parse_cm_arg_falls_back_to_bare_path_when_prefix_has_slash() -> None:
-    """A path-typical prefix (contains ``/``) is not a label — the whole
-    value is the path."""
+    """A prefix containing ``/`` is not a label; the whole value is the path."""
     label, path = spe._parse_cm_arg("./outputs/run_a:b/cm.json")
     assert label is None
     assert path == Path("./outputs/run_a:b/cm.json")
 
 
 def test_parse_cm_arg_falls_back_to_bare_path_when_prefix_has_dot() -> None:
-    """A prefix containing ``.`` (file extension or relative path marker)
-    is not a label."""
+    """A prefix containing ``.`` (extension or relative-path marker) is not a label."""
     label, path = spe._parse_cm_arg("./cm.json")
     assert label is None
     assert path == Path("./cm.json")
@@ -244,7 +240,7 @@ def test_parse_cm_arg_no_colon_is_bare_path() -> None:
 
 
 def _ns(**kwargs: Any) -> Any:
-    """Minimal argparse.Namespace-like for spec resolution tests."""
+    """Build an ``argparse.Namespace`` with the fields spec resolution reads."""
     import argparse as _arg
 
     return _arg.Namespace(**kwargs)
@@ -266,7 +262,7 @@ def test_resolve_specs_multi_run_uses_parsed_labels(tmp_path: Path) -> None:
 
 
 def test_resolve_specs_legacy_label_applies_to_first_bare_path(tmp_path: Path) -> None:
-    """Bare-path --cloud-metrics + --label legacy form is preserved."""
+    """A bare-path ``--cloud-metrics`` takes its label from ``--label``."""
     p1 = tmp_path / "a.json"
     args = _ns(
         cloud_metrics=[(None, p1)],
@@ -334,9 +330,8 @@ def test_resolve_reference_label_defaults_to_last_in_multi_run(tmp_path: Path) -
 
 
 def test_resolve_reference_label_defaults_to_baseline_label_in_legacy_mode(tmp_path: Path) -> None:
-    """The legacy ``--baseline-cloud-metrics`` flag makes the baseline
-    label the implicit reference (back-compat for callers that don't
-    pass ``--reference-label``)."""
+    """Without ``--reference-label``, ``--baseline-cloud-metrics`` makes the baseline
+    label the reference."""
     p1 = tmp_path / "a.json"
     p2 = tmp_path / "b.json"
     args = _ns(
@@ -384,7 +379,8 @@ def test_resolve_reference_label_rejects_unknown_label(tmp_path: Path) -> None:
 
 
 def test_compute_delta_vs_reference_uses_gap_when_self_bootstrap_present() -> None:
-    """Δ = label_gap − reference_gap; ratio = label_gap / reference_gap."""
+    """With self-bootstrap present, ``Δ = label_gap − reference_gap`` and
+    ``ratio = label_gap / reference_gap``."""
     runs: dict[str, dict[str, Any]] = {
         "pm50": {
             "by_bucket": {
@@ -431,7 +427,7 @@ def test_compute_delta_vs_reference_skips_empty_buckets() -> None:
 
 
 def test_compute_delta_vs_reference_falls_back_to_model_without_sb() -> None:
-    """No self_bootstrap → Δ over the raw model metric, not the gap."""
+    """Without self-bootstrap, ``Δ`` is taken over the raw model metric."""
     g_a = _fake_game(player_id="p", h_hat=10.0, energy=3.0)
     g_b = _fake_game(player_id="p", h_hat=10.0, energy=2.0)
     runs: dict[str, dict[str, Any]] = {
@@ -525,8 +521,8 @@ def test_main_legacy_baseline_mode_emits_delta_vs_reference(tmp_path: Path) -> N
 def test_main_multi_run_with_reference_label_emits_delta_for_all_non_reference(
     tmp_path: Path,
 ) -> None:
-    """The PR3 pooled_max sweep call: four runs, pm500 as reference,
-    three Δ entries keyed by the non-reference labels."""
+    """A four-run sweep with ``pm500`` as reference gives ``Δ`` entries for the three
+    other labels."""
     # Construct four runs with increasing performance (smaller energy_distance).
     energies = {"pm50": 5.0, "pm100": 4.5, "pm200": 4.2, "pm500": 4.0}
     files: dict[str, Path] = {}

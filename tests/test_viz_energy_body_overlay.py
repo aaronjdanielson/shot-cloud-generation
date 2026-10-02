@@ -1,10 +1,9 @@
-"""Tests for the hero shot-cloud overlay renderers.
+"""Tests for the hero shot-cloud overlay renderers in
+:mod:`shotcloud.viz.energy_body_overlay`.
 
-Scope: shape + file-creation + metadata-formatting checks for the
-two new renderers in :mod:`shotcloud.viz.energy_body_overlay`. We
-don't pixel-compare the PNGs (matplotlib output is platform-noisy);
-we just verify the figures are produced without error and that the
-title-block / sidecar metadata round-trips cleanly.
+The PNGs are not compared pixel by pixel (matplotlib output varies across platforms);
+the tests check that figures are written, that the title block and sidecar metadata
+round-trip, and the interpolation and bootstrap helpers.
 """
 
 from __future__ import annotations
@@ -105,8 +104,8 @@ def test_render_bootstrap_writes_png(
 def test_render_overlay_with_2d_companion(
     tmp_path: Path, fake_data: dict[str, np.ndarray], fake_metadata: GameMetadata
 ) -> None:
-    """The 2D companion panel adds a second axes; the output should
-    be wider than the 3D-only variant."""
+    """The 2D companion panel adds a second axes, giving a larger file than the 3D-only
+    figure."""
     out_solo = tmp_path / "solo.png"
     render_predicted_with_observed_shots(
         predicted_xy=fake_data["predicted"],
@@ -123,27 +122,24 @@ def test_render_overlay_with_2d_companion(
         metadata=fake_metadata,
         companion_2d=True,
     )
-    # Both written; 2D companion should produce a larger file (more
-    # rendered pixels).
     assert out_solo.exists() and out_dual.exists()
     assert out_dual.stat().st_size > out_solo.stat().st_size
 
 
 def test_palette_config_defaults_are_complementary() -> None:
-    """Default palette pairs a warm cmap (predicted) with a cool
-    cmap (observed) so the dual-cloud figure remains visually
-    decodable."""
+    """The default palette pairs a warm colormap (predicted) with a cool one (observed)
+    and caps the bootstrap shell alphas at 0.4."""
     p = OverlayPaletteConfig()
     assert p.predicted_cmap == "plasma"
     assert p.observed_cmap == "cividis"
-    # Bootstrap alphas should be capped (per user spec: <=0.4).
+    # Bootstrap shell alphas are capped at 0.4.
     assert max(p.observed_shell_alphas) <= 0.4
 
 
 def test_metadata_title_block_includes_all_fields(
     fake_metadata: GameMetadata,
 ) -> None:
-    """Title block carries every paper-grade metadata line."""
+    """The title block includes every metadata field."""
     title, subtitle, extras = fake_metadata.title_block()
     assert "Test Player" in title
     assert "LAL @ BOS" in title
@@ -158,7 +154,7 @@ def test_metadata_title_block_includes_all_fields(
 
 
 def test_metadata_dict_roundtrip(fake_metadata: GameMetadata) -> None:
-    """Metadata to_dict produces a JSON-serializable mapping."""
+    """``GameMetadata.to_dict`` returns a JSON-serializable mapping."""
     import json
 
     d = fake_metadata.to_dict()
@@ -170,13 +166,12 @@ def test_metadata_dict_roundtrip(fake_metadata: GameMetadata) -> None:
 
 
 def test_bilinear_at_points_endpoint_consistency() -> None:
-    """Bilinear interp at grid-cell-center coords reproduces the
-    grid value exactly."""
+    """Bilinear interpolation at cell centers reproduces the grid values."""
     density = np.array([[0.0, 1.0], [2.0, 3.0]])
     xedges = np.array([0.0, 1.0, 2.0])
     yedges = np.array([0.0, 1.0, 2.0])
     # Cell centers: x=0.5, 1.5; y=0.5, 1.5.
-    # density[0,0]=0 is at (0.5, 0.5). density[1,1]=3 is at (1.5, 1.5).
+    # density[iy, ix]: density[0, 0] = 0 at (0.5, 0.5), density[1, 1] = 3 at (1.5, 1.5).
     xs = np.array([0.5, 1.5, 0.5, 1.5])
     ys = np.array([0.5, 0.5, 1.5, 1.5])
     got = _bilinear_at_points(density, xedges, yedges, xs, ys)
@@ -188,7 +183,7 @@ def test_bilinear_at_points_clamps_oob() -> None:
     density = np.array([[0.0, 1.0], [2.0, 3.0]], dtype=np.float64)
     xedges = np.array([0.0, 1.0, 2.0])
     yedges = np.array([0.0, 1.0, 2.0])
-    # Far-OOB → clamped to boundary cell.
+    # Far out-of-bounds points clamp to the boundary cells.
     xs = np.array([-100.0, 100.0])
     ys = np.array([0.5, 1.5])
     got = _bilinear_at_points(density, xedges, yedges, xs, ys)
@@ -197,7 +192,8 @@ def test_bilinear_at_points_clamps_oob() -> None:
 
 
 def test_bootstrap_resamples_shape() -> None:
-    """Bootstrap returns ``n_bootstraps * K`` rows in (?, 2)."""
+    """The bootstrap returns ``n_bootstraps * K`` rows of shape (·, 2), all drawn from
+    the observed points."""
     obs = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
     out = _bootstrap_resamples(obs, n_bootstraps=10, seed=0)
     assert out.shape == (30, 2)
@@ -207,8 +203,8 @@ def test_bootstrap_resamples_shape() -> None:
 
 
 def test_bootstrap_empty_observed_passthrough() -> None:
-    """Empty observed → empty bootstrap (the dual renderer falls
-    back to predicted-only in this case)."""
+    """No observed shots give an empty bootstrap (the dual renderer then shows the
+    predicted cloud only)."""
     empty = np.empty((0, 2))
     out = _bootstrap_resamples(empty, n_bootstraps=10, seed=0)
     assert out.shape == (0, 2)

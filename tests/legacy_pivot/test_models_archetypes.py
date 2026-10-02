@@ -1,6 +1,6 @@
-"""Tests for :mod:`shotcloud.models.archetypes`.
+"""Tests for :mod:`shotcloud.legacy_pivot.archetypes`.
 
-The archetype dictionary holds the frozen Layer-2 surfaces; the
+The archetype dictionary holds the frozen archetype surfaces; the
 mixture network produces ``rho_xi(p, x_n)``. Together they implement
 ``q^arch_xi(c | p, x_n) = sum_k rho_xi,k * A_k^{(t_i)}(c)``.
 
@@ -463,7 +463,7 @@ def test_mixture_initialize_from_pretrained() -> None:
 def test_end_to_end_q_arch_pipeline() -> None:
     """SnapshotStore → ArchetypeDictionary → ArchetypeMixture → q_arch.
 
-    Validates the full Layer-2 inference path: get bundles from store,
+    Validates the full archetype-prior inference path: get bundles from store,
     stack into a dictionary, compute mixture from x_n, combine.
     """
     shots = _synthetic_shots()

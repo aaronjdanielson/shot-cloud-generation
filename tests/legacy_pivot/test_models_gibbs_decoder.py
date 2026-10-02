@@ -1,11 +1,11 @@
-"""Tests for :class:`shotcloud.models.ConditionalGibbsDecoder` (paper §3.7).
+"""Tests for :class:`shotcloud.legacy_pivot.gibbs_decoder.ConditionalGibbsDecoder`.
 
 The decoder is a pure composition of four upstream modules:
 
-* :class:`AdaptiveOffensivePrior` (paper §3.2 + §3.3),
-* :class:`AdaptiveDefensiveField` (paper §3.4),
-* :class:`ContextResidualEncoder` (paper §3.5),
-* :class:`LowRankTiltDecoder` (paper §3.5).
+* :class:`~shotcloud.legacy_pivot.adaptive_prior.AdaptiveOffensivePrior`,
+* :class:`~shotcloud.legacy_pivot.adaptive_defensive.AdaptiveDefensiveField`,
+* :class:`~shotcloud.models.context_residual.ContextResidualEncoder`,
+* :class:`~shotcloud.legacy_pivot.tilt_decoder.LowRankTiltDecoder`.
 
 Load-bearing invariants tested here:
 
@@ -212,11 +212,10 @@ def test_defensive_uniform_fallback_slides_through_softmax() -> None:
         ]
     )
     early_store = build_snapshot_store_from_shots(early_rows, [np.datetime64("2023-01-15", "D")])
-    # Re-bind both submodules' anchor_dates to point at the early store.
-    # (We're testing the composition, not the underlying mask logic;
-    # easier to construct a fresh decoder with the early-anchor store.)
+    # Construct a fresh decoder against the early-anchor store; this test
+    # exercises the composition, not the underlying mask logic.
     early_off = AdaptiveOffensivePrior(
-        decoder.offensive_prior.relevance.__class__()  # placeholder kde — see note
+        decoder.offensive_prior.relevance.__class__()  # dead branch; the else arm builds the KDE
         if False
         else _force_relevance_only_setup(decoder, early_store)[0],
         early_store,
@@ -269,12 +268,9 @@ def _force_relevance_only_setup(
 ) -> tuple[AdaptiveKDE, PlayerVocab, AdaptiveKDE, OpponentVocab]:
     """Reconstruct the offensive + defensive AdaptiveKDEs that produced
     `decoder`, swapping in `store` as the new SnapshotStore."""
-    # We don't store the upstream KDEs on the decoder; rebuild a tiny
-    # synthetic dataset that mimics the original. For the uniform-
-    # fallback test we only need the modules to be constructable
-    # against the new store; the tests don't probe their internals.
-    # Easiest: recreate from scratch using the same procedure as
-    # _build_setup.
+    # The decoder does not hold its upstream KDEs, so rebuild them from a
+    # synthetic dataset generated as in _build_setup. The uniform-fallback
+    # test only needs the modules to be constructible against the new store.
     del decoder  # the input is only kept for signature parity
     rng = np.random.default_rng(0)
     rows = []
@@ -427,7 +423,7 @@ def test_decoder_owns_no_parameters_of_its_own() -> None:
 
 
 def test_offense_only_mode_equals_log_softmax_q_off() -> None:
-    """G1-D mode: with no defense and no residual, the decoder
+    """Offense-only mode: with no defense and no residual, the decoder
     reduces to ``log_softmax(log q_off)``."""
     full, _store, _pv, _ov, ctx, _df = _build_setup()
     offense_only = ConditionalGibbsDecoder(offensive_prior=full.offensive_prior)
@@ -450,7 +446,7 @@ def test_offense_only_mode_equals_log_softmax_q_off() -> None:
 
 
 def test_offense_plus_defense_mode_equals_log_softmax_off_plus_def() -> None:
-    """G2-A mode: with no residual, the decoder reduces to
+    """Offense-plus-defense mode: with no residual, the decoder reduces to
     ``log_softmax(log q_off + log a_δ)``."""
     full, _store, _pv, _ov, ctx, _df = _build_setup()
     off_plus_def = ConditionalGibbsDecoder(

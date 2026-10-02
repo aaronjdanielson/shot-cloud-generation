@@ -1,22 +1,22 @@
-"""Tests for the Phase 3 mode-routed AC-KDE spatial decoder.
+"""Tests for :mod:`shotcloud.models.mode_routed_spatial`, the mode-routed AC-KDE decoder.
 
-Five structural invariants the 2026-06-09 design lock requires the
-mode-routed forward to satisfy:
+The mode-routed decoder is an alternative to the single support softmax:
+a router ``π_k(x_n)`` over the eight court zones plus a softmax within each
+zone. The tests check five structural properties:
 
-1. **Leakage guardrail.** ``support_log_weights`` and ``mode_log_pi``
-   must NOT change when ``shot_xy`` changes (with everything else
-   held fixed). Inherits the locked rule from the α1 redesign — no
-   attention modifier may depend on y_n.
-2. **Finite log-likelihood.** A vanilla forward must produce a
-   finite log_lik on every row, including rows with empty modes.
-3. **Valid normalized mixture.** ``exp(mode_log_pi)`` must sum to
-   1 over available modes per row.
-4. **Empty modes safely excluded.** Modes with no causal support
-   have ``mode_log_pi = -inf`` and contribute zero to log_lik.
-5. **Gradients flow to the router.** One backward pass must
-   populate non-zero finite gradient on ModeRouter's parameters
-   (no dual-zero saddle here — π_k enters log_lik directly, not
-   multiplied by zero-init B as in CausalZoneBias).
+1. **No leakage.** ``support_log_weights`` and ``mode_log_pi`` are unchanged
+   when ``shot_xy`` changes with everything else held fixed; no attention
+   modifier depends on ``y_n``.
+2. **Finite log-likelihood** on every row, including rows with empty modes.
+3. **Normalized router.** ``exp(mode_log_pi)`` sums to 1 over available modes.
+4. **Empty modes excluded.** Modes with no causal support have
+   ``mode_log_pi = -inf`` and contribute nothing to ``log_lik``.
+5. **Router gradients.** One backward pass gives finite gradients on the
+   router. ``π_k`` enters ``log_lik`` directly rather than through a
+   zero-initialized multiplier, so there is no zero-gradient saddle at init.
+
+The tests also check constructor validation and that the router is
+registered for training and checkpointing.
 """
 
 from __future__ import annotations
@@ -48,12 +48,11 @@ def _build_mode_routed_spatial() -> tuple[ModeRoutedContinuousMixtureSpatial, di
 
 
 def test_mode_router_invariant_to_observed_shot() -> None:
-    """LEAKAGE GUARDRAIL (locked 2026-06-09): perturbing shot_xy while
-    holding everything else fixed must leave both ``mode_log_pi`` and
-    ``support_log_weights`` bit-identical. The mode router consumes
-    x_n only; the within-mode softmax depends on support_logits +
-    support_xy zones, neither of which involves y_n. If this test
-    fires, someone reintroduced y_n into the attention pipeline."""
+    """Perturbing ``shot_xy`` leaves ``mode_log_pi`` and ``support_log_weights`` bit-identical.
+
+    The router consumes ``x_n`` only, and the within-mode softmax depends on
+    support logits and support-shot zones, neither of which involves ``y_n``.
+    """
     torch.manual_seed(0)
     spatial, setup = _build_mode_routed_spatial()
     # Random non-zero router params so any leak is exercised.
@@ -75,9 +74,7 @@ def test_mode_router_invariant_to_observed_shot() -> None:
 
 
 def test_mode_routed_log_lik_is_finite() -> None:
-    """Vanilla forward must produce a finite log-density on every row,
-    including rows where some modes are empty. Tests the empty-mode
-    -inf handling via the masked-fill + clamp pattern in forward."""
+    """The forward pass gives a finite log-density on every row, including rows with empty modes."""
     torch.manual_seed(0)
     spatial, setup = _build_mode_routed_spatial()
     batch = _batch(setup, n_batch=16)
@@ -88,9 +85,7 @@ def test_mode_routed_log_lik_is_finite() -> None:
 
 
 def test_mode_pi_is_normalized_over_available_modes() -> None:
-    """For each row, exp(mode_log_pi) restricted to available modes
-    must sum to 1 (within float tolerance). Tests the
-    masked_fill(~mode_available, -inf) + softmax pattern."""
+    """``exp(mode_log_pi)`` sums to 1 per row, with unavailable modes masked to zero."""
     torch.manual_seed(0)
     spatial, setup = _build_mode_routed_spatial()
     batch = _batch(setup, n_batch=16)
@@ -100,20 +95,16 @@ def test_mode_pi_is_normalized_over_available_modes() -> None:
     pi = out.mode_log_pi.exp()  # (B, K) — unavailable modes -> 0
     # Sum over available modes per row.
     total = pi.sum(dim=-1)  # (B,)
-    # For cold-start rows (no modes available) we patched the first
-    # logit to 0 so the softmax gives all mass to mode 0; the row's
-    # log_lik is then overwritten by the cold-start floor. So total
-    # should be 1.0 for everyone (including cold-start).
+    # Cold-start rows (no modes available) put all router mass on mode 0
+    # and take their log_lik from the cold-start floor, so every row,
+    # cold-start included, sums to 1.
     assert torch.allclose(total, torch.ones_like(total), atol=1e-5), (
         f"mode_log_pi must softmax-normalize per row; got total per row: {total}"
     )
 
 
 def test_empty_modes_contribute_zero() -> None:
-    """For any row r where mode k has no causal support shots, the
-    contribution of mode k to log_lik must be exactly zero (i.e.,
-    mode_log_pi[r, k] = -inf, so exp(...)·f_k = 0). Tested by
-    constructing a row whose support is entirely in one zone."""
+    """A mode with no causal support shots has ``mode_log_pi = -inf`` and contributes zero."""
     torch.manual_seed(0)
     spatial, setup = _build_mode_routed_spatial()
     # The synthetic setup has small support sets; some modes will be
@@ -138,12 +129,12 @@ def test_empty_modes_contribute_zero() -> None:
 
 
 def test_mode_router_receives_gradient() -> None:
-    """One backward pass must populate non-zero finite gradient on
-    ALL ModeRouter parameters. Unlike CausalZoneBias (where π_q is
-    multiplied by zero-init B and gets no gradient on step 1), the
-    mode router's π_k enters log_lik DIRECTLY (via logsumexp_k(log_pi
-    + log_f_k)), so there's no dual-zero saddle and gradient should
-    flow on the first backward."""
+    """The first backward pass gives every router parameter a finite gradient, some non-zero.
+
+    ``π_k`` enters ``log_lik`` directly via ``logsumexp_k(log_pi + log_f_k)``,
+    unlike :class:`~shotcloud.models.continuous_mixture_spatial.CausalZoneBias`,
+    whose weights are multiplied by a zero-initialized ``B``.
+    """
     torch.manual_seed(0)
     spatial, setup = _build_mode_routed_spatial()
     batch = _batch(setup, n_batch=16)
@@ -163,8 +154,7 @@ def test_mode_router_receives_gradient() -> None:
 
 
 def test_mode_routed_rejects_pooling_gate_at_construction() -> None:
-    """The 2026-06-09 design lock chose option (iii): no pooling gate.
-    Constructing the class with a pooling_gate must raise."""
+    """The mode-routed decoder has no pooling gate; passing ``pooling_gate`` raises."""
     import pytest
 
     from shotcloud.models.pooling_gate import PoolingGate
@@ -180,8 +170,7 @@ def test_mode_routed_rejects_pooling_gate_at_construction() -> None:
 
 
 def test_mode_routed_rejects_causal_zone_bias_at_construction() -> None:
-    """Mode routing supersedes the additive causal zone bias.
-    Constructing the class with a causal_zone_bias must raise."""
+    """Mode routing replaces the additive causal zone bias; passing ``causal_zone_bias`` raises."""
     import pytest
 
     from shotcloud.models.continuous_mixture_spatial import CausalZoneBias
@@ -197,12 +186,12 @@ def test_mode_routed_rejects_causal_zone_bias_at_construction() -> None:
 
 
 def test_mode_router_is_in_collected_modules() -> None:
-    """REGRESSION (parallels test_causal_zone_bias_module_is_registered_child):
-    the mode router must end up in _collect_modules_for_spatial's
-    output so the optimizer trains it and the save/load pipeline
-    round-trips its parameters. Without this wiring, π_k would stay
-    uniform throughout training — silent no-op like the first α1
-    bug."""
+    """The router is collected for the optimizer and checkpointing.
+
+    It must appear in ``_collect_modules_for_spatial`` and in
+    ``spatial.parameters()``; otherwise ``π_k`` would silently stay at its
+    initial value throughout training.
+    """
     from shotcloud.models import ContextMLP, NegBinCountHead, TimingSoftmaxHead
     from shotcloud.training.train_gibbs import _collect_modules_for_spatial
 

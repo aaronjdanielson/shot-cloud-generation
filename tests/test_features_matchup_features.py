@@ -1,9 +1,9 @@
-"""Tests for the Tier-2a v2 (group-level) D-matchup feature pipeline.
+"""Tests for :mod:`shotcloud.features.matchup_features`, the group-level matchup features.
 
 Scope:
 
 * ``MatchupFeaturesConfig`` hash sensitivity to each tunable field
-  (including the new ``grouping_K``, ``grouping_seed``, ``traits_hash``).
+  (including ``grouping_K``, ``grouping_seed``, and ``traits_hash``).
 * ``assign_player_groups``: K-means assignment shape + determinism.
 * ``build_matchup_features`` arithmetic on a small synthetic dataset
   where we can hand-compute the expected Δ^int / Δ̂ / N^eff at the

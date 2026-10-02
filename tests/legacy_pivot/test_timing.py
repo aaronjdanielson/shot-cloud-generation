@@ -1,4 +1,4 @@
-"""Tests for :class:`shotcloud.models.ConstantRateTimingModel`."""
+"""Tests for :class:`shotcloud.legacy_pivot.timing.ConstantRateTimingModel`."""
 
 from __future__ import annotations
 

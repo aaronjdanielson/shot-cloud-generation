@@ -1,21 +1,23 @@
 """Tests for :class:`shotcloud.models.collaborative_kde.CollaborativeKDE`.
 
-Load-bearing invariants verified here:
+Invariants verified here:
 
-1. Shape and normalization: forward returns ``(B, n_cells)`` log-probs,
-   each row sums to 0 in exp space.
-2. Step-0 invariant: with all learnable params at init, α is uniform
-   over valid analogues, β is uniform within each analogue's causal
-   history, σ = sigma_init, and the kernel is isotropic Gaussian.
-3. Cold-start invariant: a target with no own-history still produces
-   valid log-probs by attending to analogue shots.
-4. Valid-analogue mask: analogues with no causal history get α = 0.
-5. σ widens for sparse-evidence players when ``a_M`` trained positive
-   (the softplus sign-prior is enforced).
-6. Step-0 bilinear-vs-concat equivalence: the two shot-attention
-   forms produce identical output at init (zero-init output layers
-   make β uniform under both).
-7. Gradient flow to all learnable parameters.
+1. Shape and normalization: forward returns ``(B, n_cells)`` log-probs whose
+   exponentials sum to 1 per row; α sums to 1 over analogues and β sums to 1
+   over each valid analogue's causal shots.
+2. Step-0 invariants: α is uniform over valid analogues and σ equals
+   ``sigma_init``.
+3. Valid-analogue mask: analogues with no causal history are flagged, and
+   when no analogue is valid α falls back to uniform instead of NaN.
+4. Step-0 bilinear-vs-concat equivalence: both shot-attention forms
+   zero-initialize their output layer, so β is uniform and the output is
+   identical at init.
+5. The ``"warm"`` ``h_z`` init keeps β within a small tolerance of uniform
+   while giving ``f_θ`` a non-zero gradient on the first step.
+6. The α similarity prior and the same-player bias act at init as configured.
+7. σ widens for low-evidence players when ``a_M`` is positive (softplus
+   sign constraint).
+8. Gradient flow to all learnable parameters.
 """
 
 from __future__ import annotations
@@ -194,12 +196,11 @@ def test_construction_rejects_invalid_sigma_bounds() -> None:
 
 
 def test_construction_allows_sigma_locked_when_min_equals_max() -> None:
-    """``sigma_min == sigma_max`` is a valid configuration (lock σ).
-    Used for the cell-free continuous-mixture ablation where the
-    learnable bandwidth was overfitting by widening; the locked-σ
-    mode forces the model to learn through the support weights
-    instead. Verified by checking the per-row σ at init is exactly
-    the locked value and stays there regardless of trait inputs."""
+    """``sigma_min == sigma_max`` is accepted and fixes σ at that value.
+
+    Locking σ makes the model fit through the support weights alone rather
+    than by adjusting the bandwidth.
+    """
     setup = _build_test_setup()
     kde = _make_kde(setup, sigma_min=1.5, sigma_max=1.5, sigma_init=1.5)
     batch = _make_batch(setup, n_batch=3)
@@ -257,15 +258,7 @@ def test_return_components_round_trip() -> None:
 
 
 def test_beta_rows_sum_to_one_per_valid_analogue() -> None:
-    """For every ``(b, l)`` with at least one causally-usable shot,
-    ``Σ_j β_{b,l,j} = 1`` (the shot-level softmax is properly
-    normalized). Rows whose analogue has no causal history get
-    β ≡ 0 instead — the defensive-fallback behavior the kernel sum
-    relies on.
-
-    This is invariant 3 from the math-preservation review:
-    ``Σ_{p'} α = 1`` (covered above) and ``Σ_j β = 1`` (covered here).
-    """
+    """``Σ_j β_{b,l,j} = 1`` for every analogue with causal shots; ``β ≡ 0`` for the rest."""
     setup = _build_test_setup()
     kde = _make_kde(setup)
     batch = _make_batch(setup, n_batch=3)
@@ -281,8 +274,7 @@ def test_beta_rows_sum_to_one_per_valid_analogue() -> None:
 
 
 def test_final_density_sums_to_one_per_batch_row() -> None:
-    """Invariant 1: ``Σ_c q_p^collab(c | x, t) = 1`` for every batch
-    row, end-to-end through the public forward."""
+    """``Σ_c q_p^collab(c | x, t) = 1`` for every row of the public forward."""
     setup = _build_test_setup()
     kde = _make_kde(setup)
     batch = _make_batch(setup, n_batch=4)
@@ -297,10 +289,11 @@ def test_final_density_sums_to_one_per_batch_row() -> None:
 
 
 def test_step0_sigma_equals_init() -> None:
-    """At step 0 (a_M, a_S init to large negative so softplus ≈ 0),
-    σ_p = sigma_init for every batch row. Tolerance accommodates the
-    residual softplus(-10) ≈ 4.5e-5 contribution from the evidence
-    terms; it's well below any training-relevant change in σ."""
+    """At step 0, σ_p equals ``sigma_init`` for every row.
+
+    ``a_M`` and ``a_S`` start at -10, so the evidence terms contribute only
+    softplus(-10) ≈ 4.5e-5; the tolerance absorbs that residual.
+    """
     setup = _build_test_setup()
     kde = _make_kde(setup, sigma_init=1.5)
     batch = _make_batch(setup, n_batch=3)
@@ -329,11 +322,12 @@ def test_step0_alpha_uniform_over_valid_analogues() -> None:
 
 
 def test_invalid_analogues_get_zero_alpha() -> None:
-    """An analogue with no causal shots at the target's anchor must
-    receive α = 0 (via -inf masking before softmax). We construct this
-    case by shifting the in-memory anchor_dates buffer to a date that
-    precedes every shot in the synthetic history — making every
-    analogue's causal-shot count zero."""
+    """With no analogue holding causal shots, every analogue is flagged invalid and α is uniform.
+
+    Invalid analogues are masked to -inf before the softmax; when a row has
+    no valid analogue at all, α falls back to uniform instead of NaN. The
+    case is built by moving every anchor date before the first pooled shot.
+    """
     setup = _build_test_setup()
     kde = _make_kde(setup)
     # Force every per-row causal mask to be zero: anchor < min(shot date).
@@ -352,19 +346,16 @@ def test_invalid_analogues_get_zero_alpha() -> None:
 
 
 # ---------------------------------------------------------------------------
-# v1.1 refactor invariants: bilinear vs concat at step 0, unique-dedupe path
+# Shot-attention forms: bilinear vs concat at step 0, unique-dedupe path
 # ---------------------------------------------------------------------------
 
 
 def test_step0_bilinear_and_concat_produce_identical_log_q() -> None:
-    """At step 0 the two shot-attention forms must agree.
+    """At step 0 the bilinear and concat shot-attention forms give the same ``log q_collab``.
 
-    Both forms zero-init their output layer so g_θ ≡ 0 at init,
-    which makes β uniform-over-causal-shots in both branches. The
-    rest of the forward (α, σ, separable kernel) is shared, so
-    ``log q_collab`` must be identical up to float-32 round-off.
-    The bilinear form is the v1.1 default; this test fences against
-    a re-parameterization slipping into the refactor.
+    Both forms zero-initialize their output layer, so the shot score is zero
+    and β is uniform over causal shots in both. The rest of the forward
+    (α, σ, separable kernel) is shared.
     """
     setup = _build_test_setup()
     batch = _make_batch(setup, n_batch=3)
@@ -378,17 +369,15 @@ def test_step0_bilinear_and_concat_produce_identical_log_q() -> None:
 
 # ---------------------------------------------------------------------------
 # Warm-init mode: β stays near-uniform but f_θ side has nonzero gradient
-# at step 0. Keep strict-init test above untouched — the warm tests are
-# additive, not replacements.
+# at step 0.
 # ---------------------------------------------------------------------------
 
 
 def test_warm_init_beta_max_deviation_from_uniform_below_tolerance() -> None:
-    """Per the math-preservation review: warm-init β must satisfy
-    ``max_j |β_j - 1/R| < 1e-3`` at step 0. The warm init's σ = 1e-3
-    on h_θ output (with f_θ default Kaiming, proj_dim=32) was chosen
-    so the per-shot score magnitudes stay well below the softmax
-    saturation regime, keeping β essentially uniform at init.
+    """Warm-init β satisfies ``max_j |β_j - 1/R| < 1e-3`` at step 0.
+
+    The warm ``h_θ`` output layer has weight std 1e-3 (with ``f_θ`` at its
+    default init), which keeps per-shot scores far below softmax saturation.
     """
     setup = _build_test_setup()
     kde = _make_kde(setup, shot_attention_form="bilinear", h_z_init="warm")
@@ -426,10 +415,11 @@ def test_warm_init_beta_max_deviation_from_uniform_below_tolerance() -> None:
 
 
 def test_warm_init_beta_kl_to_uniform_below_threshold() -> None:
-    """Per the math-preservation review: warm-init β must satisfy
-    ``KL(β || Unif) < 1e-4`` at step 0. KL is the stricter aggregate
-    measure (catches uniform-spread small drifts that max-deviation
-    might miss in average)."""
+    """Warm-init β satisfies ``KL(β || Unif) < 1e-4`` at step 0.
+
+    KL complements the max-deviation check by catching small drifts spread
+    across many shots.
+    """
     setup = _build_test_setup()
     kde = _make_kde(setup, shot_attention_form="bilinear", h_z_init="warm")
     batch = _make_batch(setup, n_batch=3)
@@ -460,11 +450,12 @@ def test_warm_init_beta_kl_to_uniform_below_threshold() -> None:
 
 
 def test_warm_init_log_q_close_to_strict_init_baseline() -> None:
-    """The warm-init log_q should differ from the strict-init baseline
-    by a small amount at step 0 — small enough to be a perturbation,
-    not a regime change. Tolerance is loose (1e-2) because the kernel
-    aggregation amplifies tiny β drifts into per-cell log-prob drifts
-    that scale with the spread of analogue shot locations."""
+    """Warm-init ``log_q`` is within 1e-2 of the zero-init ``log_q`` at step 0.
+
+    The tolerance is loose because kernel aggregation turns tiny β drifts
+    into per-cell log-prob drifts that scale with the spread of analogue
+    shot locations.
+    """
     setup = _build_test_setup()
     batch = _make_batch(setup, n_batch=3)
     kde_zero = _make_kde(setup, shot_attention_form="bilinear", h_z_init="zero")
@@ -480,12 +471,10 @@ def test_warm_init_log_q_close_to_strict_init_baseline() -> None:
 
 
 def test_warm_init_f_x_output_layer_receives_gradient_at_step_0() -> None:
-    """The whole point of warm init: ``f_θ``'s output-layer weights
-    must receive nonzero gradient on the very first step. With strict
-    zero init, ``h_θ(z) = 0`` everywhere → ``∂score/∂f_θ_out = 0`` →
-    f_θ_out grad = 0 → f_θ doesn't move until h_θ lifts off (the
-    dual-saddle bootstrap). With warm init ``h_θ(z) ≠ 0`` from step 0
-    so f_θ_out grad is nonzero immediately.
+    """Under warm init, ``f_θ``'s output layer receives a non-zero gradient on the first step.
+
+    With zero init ``h_θ(z) = 0``, so ``∂score/∂f_θ = 0`` and ``f_θ`` cannot
+    move until ``h_θ`` leaves zero. Warm init makes ``h_θ(z) ≠ 0`` from step 0.
     """
     setup = _build_test_setup()
     kde = _make_kde(setup, shot_attention_form="bilinear", h_z_init="warm")
@@ -501,9 +490,7 @@ def test_warm_init_f_x_output_layer_receives_gradient_at_step_0() -> None:
 
 
 def test_h_z_init_rejects_invalid_value() -> None:
-    """The constructor should reject any string outside {zero, warm}.
-    Guards against typos in CLI manifests when re-loading a checkpoint.
-    """
+    """``h_z_init`` values other than ``"zero"`` and ``"warm"`` raise ``ValueError``."""
     setup = _build_test_setup()
     with pytest.raises(ValueError, match="h_z_init"):
         _make_kde(setup, shot_attention_form="bilinear", h_z_init="hot")
@@ -515,9 +502,7 @@ def test_h_z_init_rejects_invalid_value() -> None:
 
 
 def test_alpha_prior_none_matches_legacy_uniform_init_alpha() -> None:
-    """``alpha_prior="none"`` (the default) preserves the legacy
-    behavior where α is uniform at init over valid analogues. Fences
-    against the similarity prior accidentally activating when off."""
+    """With ``alpha_prior="none"`` (the default), α is uniform over valid analogues at init."""
     setup = _build_test_setup()
     kde = _make_kde(setup, alpha_prior="none")
     batch = _make_batch(setup, n_batch=3)
@@ -528,14 +513,7 @@ def test_alpha_prior_none_matches_legacy_uniform_init_alpha() -> None:
 
 
 def test_alpha_prior_similarity_produces_non_uniform_alpha_at_init() -> None:
-    """``alpha_prior="similarity"`` with ``γ_init=2`` breaks the
-    uniform α at step 0 — the top-similarity analogue should get
-    strictly more α weight than the bottom-similarity analogue.
-
-    This is the load-bearing test for the 2026-05-17 α-prior
-    intervention: if step-0 α is still ~uniform, the prior isn't
-    actually being applied.
-    """
+    """With ``alpha_prior="similarity"`` and ``γ_init=2``, α departs from uniform at step 0."""
     setup = _build_test_setup()
     kde = _make_kde(setup, alpha_prior="similarity", alpha_prior_scale_init=2.0)
     batch = _make_batch(setup, n_batch=3)
@@ -551,9 +529,7 @@ def test_alpha_prior_similarity_produces_non_uniform_alpha_at_init() -> None:
 
 
 def test_alpha_prior_similarity_collapses_to_uniform_when_gamma_is_zero() -> None:
-    """When ``γ_sim`` is manually forced to zero, even with
-    ``alpha_prior="similarity"`` enabled the α distribution should
-    return to uniform — the prior is well-conditioned by γ."""
+    """With ``alpha_prior="similarity"`` but ``γ_sim = 0``, α is uniform."""
     setup = _build_test_setup()
     kde = _make_kde(setup, alpha_prior="similarity", alpha_prior_scale_init=2.0)
     with torch.no_grad():
@@ -566,11 +542,7 @@ def test_alpha_prior_similarity_collapses_to_uniform_when_gamma_is_zero() -> Non
 
 
 def test_same_player_bias_init_boosts_self_analogue_slot() -> None:
-    """With ``same_player_bias_init=1.0`` and the target player's own
-    id present in its analogue list (``ensure_self=True`` in our
-    fixture), the self slot should get a higher α weight than the
-    other slots at init.
-    """
+    """With ``same_player_bias_init=1.0``, the target's own analogue slot gets α above 1.5/L."""
     setup = _build_test_setup()
     kde = _make_kde(setup, same_player_bias_init=1.0)
     batch = _make_batch(setup, n_batch=4)
@@ -614,10 +586,7 @@ def test_alpha_prior_similarity_appears_in_learned_scalars_and_gets_gradient() -
 
 
 def test_bilinear_unique_dedupe_path_matches_naive_per_shot_h_compute() -> None:
-    """The torch.unique-with-inverse dedup must be a pure speed
-    optimization — the per-shot ``h_θ(z_j)`` values gathered by inverse
-    must match the values you'd get from running ``h_θ`` directly on
-    the per-batch ``(B*L*R, D)`` shot-context tensor."""
+    """The ``torch.unique`` deduplication of ``h_θ(z_j)`` matches evaluating ``h_θ`` per shot."""
     setup = _build_test_setup()
     kde = _make_kde(setup, shot_attention_form="bilinear")
     batch = _make_batch(setup, n_batch=3)
@@ -646,10 +615,11 @@ def test_bilinear_unique_dedupe_path_matches_naive_per_shot_h_compute() -> None:
 
 
 def test_sigma_widens_for_low_evidence_player_when_a_m_trained_positive() -> None:
-    """Manually set a_M > 0 and confirm σ for a low-M player > σ for a
-    high-M player. This verifies the softplus sign-prior:
-    σ ∝ sigmoid(a_0 − softplus(a_M)·log1p_M − ...). With softplus(a_M)
-    strictly positive, log1p_M ↑ → argument ↓ → σ ↓."""
+    """With ``a_M > 0``, a low-evidence player gets a wider σ than a high-evidence player.
+
+    σ is increasing in ``a_0 − softplus(a_M)·log1p_M − ...``, so larger
+    ``log1p_M`` lowers σ whenever ``softplus(a_M) > 0``.
+    """
     setup = _build_test_setup()
     kde = _make_kde(setup)
     # Push a_M well above zero so softplus(a_M) ≈ 1.
@@ -706,11 +676,7 @@ def test_gradient_flows_to_all_learnable_params(form: str) -> None:
 
 
 def test_phi_and_g_output_layers_receive_gradient_when_perturbed() -> None:
-    """Zero-init output layers won't get gradient at step 0 alone (their
-    gradient is zero in expectation). Verify gradients do flow once the
-    layers are perturbed off zero — proving the autograd path is
-    correct, not blocked anywhere. Concat form.
-    """
+    """In the concat form, ``φ`` and ``g`` output layers receive gradient once moved off zero."""
     setup = _build_test_setup()
     kde = _make_kde(setup, shot_attention_form="concat")
     with torch.no_grad():
@@ -726,11 +692,10 @@ def test_phi_and_g_output_layers_receive_gradient_when_perturbed() -> None:
 
 
 def test_bilinear_h_z_output_layer_receives_gradient_when_perturbed() -> None:
-    """Bilinear form's h_z output layer is zero-init; gradient through it
-    is zero at step 0 (just like the concat form's g[-1]). Perturb h_z
-    output weights off zero and verify the bilinear path's autograd is
-    not blocked anywhere — in particular, that the torch.unique-with-
-    inverse dedup doesn't break the gradient chain back to h_z and f_x.
+    """In the bilinear form, ``h_z`` and ``f_x`` output layers receive gradient once moved off zero.
+
+    This also checks that the ``torch.unique`` deduplication preserves the
+    gradient path back to ``h_z`` and ``f_x``.
     """
     setup = _build_test_setup()
     kde = _make_kde(setup, shot_attention_form="bilinear")
@@ -776,11 +741,10 @@ def test_learned_scalars_returns_expected_keys() -> None:
 
 
 def test_forward_continuous_own_mask_matches_support_source_masks() -> None:
-    """PR3.0 contract: ``CollaborativeContinuousOutputs.own_mask`` equals
-    the partition produced by
-    :func:`shotcloud.evaluation.support_masks.support_source_masks` —
-    the backend-agnostic field exactly replaces the helper call the
-    wrapper used to make."""
+    """``forward_continuous(...).own_mask`` equals the ``own`` mask of ``support_source_masks``.
+
+    See :func:`shotcloud.evaluation.support_masks.support_source_masks`.
+    """
     from shotcloud.evaluation.support_masks import support_source_masks
 
     setup = _build_test_setup()

@@ -1,23 +1,65 @@
 # shotcloud
 
-Adaptive Collaborative KDE (AC-KDE) for forecasting NBA player-game shot clouds.
+**Where will a player shoot tonight?** `shotcloud` forecasts the *shot cloud* of
+an NBA player-game — how many shots, when, and from where on the floor — and
+scores the forecast against the shots the player then takes.
+
+![Predicted shot density and observed shots for Victor Wembanyama, San Antonio at Denver](assets/shot_cloud_wembanyama.png)
+
+*Victor Wembanyama, San Antonio at Denver, a held-out game. Left: the predicted
+density with the 29 shots he took. Right: the same density as a surface over
+the half court, with each observed shot on a stem.*
 
 This repository holds the `shotcloud` Python package and the paper *Adaptive
 Collaborative KDE for Forecasting NBA Player-Game Shot Clouds*
 ([paper/shot_cloud.tex](paper/shot_cloud.tex)).
 
-Each player-game is modeled as a marked point process with three factors:
+## The model
+
+A player-game is a marked point process with three factors:
 
 - **Count** — the number of shots, from a negative-binomial count head.
 - **Timing** — when each shot is taken, from a 48-bin softmax over game minutes.
-- **Location** — where each shot is taken, from AC-KDE: a continuous kernel
-  mixture over *support shots* drawn from the player's own history and from
-  pooled shots of analogue players. Support weights combine shooter similarity,
-  shot-level attention, a low-rank contextual residual, and opponent
-  reweighting; a pooling gate splits mass between own and pooled support.
+- **Location** — where each shot is taken, from the Adaptive Collaborative KDE
+  (AC-KDE).
 
-Every feature is causal: it is computed only from information available before
-the game being predicted.
+AC-KDE places a kernel on every *support shot* and learns how much each one
+should count. The support has two parts: the player's own past shots, and
+shots pooled from *analogue* players with similar traits. The weights combine
+shooter similarity, shot-level attention, a low-rank contextual residual, and
+opponent reweighting, and a pooling gate decides how much mass goes to the
+player's own history and how much is borrowed. A rookie leans on the pool; a
+veteran is described mostly by his own shots.
+
+![Attention over own and pooled support shots](assets/attention_over_support.png)
+
+*What the model attends to for one game. (A) The predicted density with the
+observed shots. (B) Weights on the player's own past shots. (C) Weights on
+shots pooled from analogue players. About half of the mass is borrowed here,
+because the player is a rookie with a short history.*
+
+Every input is causal: it is computed only from information available before
+the shot being predicted.
+
+## Shot clouds
+
+![Predicted densities and observed shots for four player-games](assets/shot_cloud_gallery.png)
+
+*Predicted densities with observed shots for four held-out player-games.*
+
+The figures come from the package's own tools:
+`scripts/plot_hero_shot_clouds.py` draws the density overlays and
+`scripts/build_attention_figure.py` the attention panels. The renderer also
+works on any set of shot coordinates, with no model involved:
+
+```python
+from shotcloud.viz import EnergyBodyConfig, render_energy_body
+
+# x, y: shot coordinates in feet, basket at the origin
+render_energy_body(x, y, "shot_cloud.png", config=EnergyBodyConfig())
+```
+
+`uv run python examples/energy_body_demo.py` renders a synthetic example.
 
 ## Install
 
@@ -134,7 +176,8 @@ replication/     the paper's pipeline
 tests/           test suite
 paper/           paper source
 abstract/        conference abstract
-docs/            working log and design notes
+examples/        standalone rendering example
+assets/          images used in this README
 ```
 
 ## Development

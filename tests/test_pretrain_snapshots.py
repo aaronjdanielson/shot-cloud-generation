@@ -1,12 +1,10 @@
-"""Tests for :mod:`scripts.pretrain_snapshots` helpers.
+"""Tests for ``scripts/pretrain_snapshots.py``.
 
-The full ``run_pretrain`` pipeline is tested end-to-end on synthetic
-data; the soft position-mixture and anchor-grid helpers get unit
-tests.
-
-The script's heavyweight NMF fitter is exercised through a small
-end-to-end run on a tiny synthetic shot table so we get coverage of
-the warm-start path without the real NBA dataset.
+The soft position-mixture, anchor-grid, checkpoint, farthest-point initialization,
+and archetype-distance helpers get unit tests. ``run_pretrain`` runs end to end on a
+small synthetic shot table with ``with_archetypes=True``, which also covers the
+warm-started archetype fit, per-anchor checkpointing, resume, and output-overwrite
+guards.
 """
 
 from __future__ import annotations
@@ -18,7 +16,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# Add repo scripts/ to sys.path so test can import the script as a module.
+# Put scripts/ on sys.path so the script imports as a module.
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO / "scripts"))
 
@@ -50,8 +48,7 @@ def test_soft_position_mixture_pure_wing() -> None:
 
 
 def test_soft_position_mixture_in_between_smoothly_interpolates() -> None:
-    """RA-rate between breakpoints → mass shared across two adjacent
-    categories, sums to 1."""
+    """An RA rate between breakpoints splits mass across two adjacent categories."""
     out_low = pretrain_snapshots.soft_position_mixture(0.20)  # halfway guard↔wing
     np.testing.assert_allclose(out_low.sum(), 1.0, atol=1e-6)
     assert out_low[0] > 0 and out_low[1] > 0
@@ -88,7 +85,7 @@ def test_soft_position_mixture_clamps_to_unit_range() -> None:
 
 
 def test_build_position_mixtures_rim_big_classified_correctly() -> None:
-    """Player whose shots are all RA → big-dominated mixture."""
+    """A player shooting only in the restricted area gets a big-dominated mixture."""
     rng = np.random.default_rng(0)
     shots = pd.DataFrame(
         [
@@ -106,7 +103,7 @@ def test_build_position_mixtures_rim_big_classified_correctly() -> None:
 
 
 def test_build_position_mixtures_perimeter_player_classified_as_guard() -> None:
-    """Player whose shots are all 3-point territory → guard-dominated mixture."""
+    """A player shooting only from three gets a guard-dominated mixture."""
     rng = np.random.default_rng(1)
     shots = pd.DataFrame(
         [
@@ -123,7 +120,7 @@ def test_build_position_mixtures_perimeter_player_classified_as_guard() -> None:
 
 
 def test_build_position_mixtures_min_shots_filter() -> None:
-    """min_shots filter drops sparse players."""
+    """Players below ``min_shots`` are dropped."""
     shots = pd.DataFrame(
         [
             {"player_id": 1, "x": 0.0, "y": 2.5},  # 1 shot
@@ -167,7 +164,7 @@ def test_monthly_anchor_grid_first_of_month() -> None:
 
 
 def test_monthly_anchor_grid_count() -> None:
-    """Approximately one anchor per month over 3 years = ~36."""
+    """Three years of data give about 36 monthly anchors."""
     anchors = pretrain_snapshots.monthly_anchor_grid(
         np.datetime64("2018-01-01", "D"),
         np.datetime64("2020-12-01", "D"),
@@ -180,15 +177,15 @@ def test_monthly_anchor_grid_count() -> None:
 # ---------------------------------------------------------------------------
 
 
-_PLAYERS = tuple(range(1001, 1013))  # 12 synthetic players → enough for K=4 NMF
+_PLAYERS = tuple(range(1001, 1013))  # 12 synthetic players, enough for K=4 archetypes
 
 
 def _synthetic_dataset(tmp_path: Path) -> tuple[Path, Path]:
     """Synthetic shots + game-logs CSV pair under tmp_path.
 
-    Twelve players with varied shot-cluster centers spanning rim,
-    midrange, and three-point territory, so per-anchor NMF has
-    enough samples and the archetype basis has room to differentiate.
+    Twelve players with shot-cluster centers spread over rim, midrange and
+    three-point territory, so each anchor's archetype fit has enough distinct
+    players.
     """
     rng = np.random.default_rng(0)
     # Per-player shot-cluster centers (in tenths of feet to match NBA Stats).
@@ -238,7 +235,7 @@ def _synthetic_dataset(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def test_run_pretrain_end_to_end(tmp_path: Path) -> None:
-    """Tiny synthetic run produces a valid snapshot store + manifest."""
+    """A small synthetic run produces a causal snapshot store and its manifest."""
     shots_path, gl_path = _synthetic_dataset(tmp_path)
     output_path = tmp_path / "snapshots.pt"
 
@@ -254,8 +251,8 @@ def test_run_pretrain_end_to_end(tmp_path: Path) -> None:
         bandwidth=1.5,
         kappa=200.0,
         recency_half_life_days=365.0,
-        # Tiny iteration counts for test speed; these only need to be
-        # non-zero for the fit to produce simplex-valid output.
+        # Small iteration counts keep the test fast; any positive count yields
+        # simplex-valid output.
         w_max_iter=5,
         w_sinkhorn_iter=8,
         seed=0,
@@ -269,16 +266,16 @@ def test_run_pretrain_end_to_end(tmp_path: Path) -> None:
         assert bundle.archetype_surfaces is not None
         assert bundle.archetype_surfaces.shape == (4, store.bundles[0].archetype_surfaces.shape[1])
 
-    # Causality holds (the script asserts this internally; double-check here).
+    # The script checks causality before saving; check it again here.
     shots_df = pd.read_csv(shots_path)
     shots_df["date"] = pd.to_datetime(shots_df["game_date"])
-    # Reload via load_shots to match the script's processing path
+    # Reload via load_shots to match the script's processing path.
     from shotcloud.data import load_shots as _load_shots
 
     shots_loaded = _load_shots(shots_path)
     store.assert_causal(shots_loaded)
 
-    # Output artifact + manifest exist
+    # The output artifact and manifest exist.
     assert output_path.exists()
     manifest_path = output_path.with_suffix(".manifest.json")
     assert manifest_path.exists()
@@ -288,9 +285,40 @@ def test_run_pretrain_end_to_end(tmp_path: Path) -> None:
     assert all(p["has_archetypes"] for p in manifest["per_anchor"])
 
 
+def test_run_pretrain_without_archetypes_writes_store_and_manifest(tmp_path: Path) -> None:
+    """The default run (no archetype fit) saves the store and a manifest without fit diagnostics."""
+    shots_path, gl_path = _synthetic_dataset(tmp_path)
+    output_path = tmp_path / "snapshots.pt"
+
+    store = pretrain_snapshots.run_pretrain(
+        shots_path=shots_path,
+        game_logs_path=gl_path,
+        starters_path=None,
+        output_path=output_path,
+        start_date="2018-01-01",
+        end_date="2020-12-31",
+        K=4,
+        min_shots=5,
+        bandwidth=1.5,
+        kappa=200.0,
+        recency_half_life_days=365.0,
+        seed=0,
+        verbose=False,
+    )
+
+    assert len(store) > 0
+    assert all(bundle.archetype_surfaces is None for bundle in store.bundles)
+    assert output_path.exists()
+    manifest = json.loads(output_path.with_suffix(".manifest.json").read_text())
+    assert manifest["n_anchors"] == len(store)
+    assert manifest["params"]["with_archetypes"] is False
+    assert len(manifest["per_anchor"]) == len(store)
+    assert not any(p["has_archetypes"] for p in manifest["per_anchor"])
+    assert all("final_loss" not in p for p in manifest["per_anchor"])
+
+
 def test_run_pretrain_warm_starts_archetypes(tmp_path: Path) -> None:
-    """Successive snapshot bundles should have archetypes that drift
-    (warm-started fit) rather than being completely independent."""
+    """Warm-starting keeps archetype labels aligned between consecutive anchors."""
     shots_path, gl_path = _synthetic_dataset(tmp_path)
     output_path = tmp_path / "snapshots.pt"
 
@@ -310,18 +338,14 @@ def test_run_pretrain_warm_starts_archetypes(tmp_path: Path) -> None:
         with_archetypes=True,
     )
 
-    # With warm-starting, consecutive snapshots' archetype surfaces should
-    # be similar (small TV distance) — at least more similar than to a
-    # randomly-permuted version.
+    # Consecutive archetype surfaces are closer in TV distance under the same labels
+    # than under a permutation of the labels.
     assert len(store) >= 2
     a0 = store.bundles[0].archetype_surfaces
     a1 = store.bundles[1].archetype_surfaces
     assert a0 is not None and a1 is not None
     # Per-archetype TV distance.
     same_label_tv = 0.5 * np.abs(a0 - a1).sum(axis=1).mean()
-    # Permute archetype labels and compare; warm-started fits keep labels
-    # aligned, so the same-label TV should be smaller than the
-    # permuted-label TV on average.
     perm = np.array([1, 0, 3, 2])  # arbitrary non-identity permutation
     permuted_tv = 0.5 * np.abs(a0 - a1[perm]).sum(axis=1).mean()
     assert same_label_tv <= permuted_tv * 1.1, (
@@ -421,8 +445,8 @@ def test_save_load_anchor_checkpoint_roundtrip(tmp_path: Path) -> None:
 
 
 def test_save_load_anchor_checkpoint_handles_fallback_no_mixtures(tmp_path: Path) -> None:
-    """Checkpoints written from a fallback path (n_players < K) have no
-    mixtures / player_ids. Round-trip must preserve None."""
+    """Checkpoints from the fallback path (``n_players < K``) have no mixtures or player
+    ids, and the round trip preserves ``None``."""
     out = pretrain_snapshots._AnchorFitOutput(
         archetypes=np.full((4, 50), 1.0 / 50, dtype=np.float32),
         mixtures=None,
@@ -491,7 +515,7 @@ def test_load_anchor_checkpoint_rejects_K_mismatch(tmp_path: Path) -> None:
 
 
 def test_run_pretrain_writes_checkpoints_per_anchor(tmp_path: Path) -> None:
-    """When --checkpoint-dir is set, every assembled bundle gets a .npz."""
+    """With ``--checkpoint-dir`` set, every assembled bundle gets a ``.npz``."""
     shots_path, gl_path = _synthetic_dataset(tmp_path)
     output_path = tmp_path / "snapshots.pt"
     ckpt_dir = tmp_path / "checkpoints"
@@ -530,9 +554,8 @@ def test_run_pretrain_writes_checkpoints_per_anchor(tmp_path: Path) -> None:
 
 
 def test_run_pretrain_resume_skips_existing_anchor_fits(tmp_path: Path) -> None:
-    """Second run with --resume reuses checkpoints (no refit) and produces
-    archetypes byte-identical to the loaded files. Warm-start chain
-    is preserved because each loaded archetype seeds the next anchor."""
+    """A second run with ``--resume`` loads the checkpoints instead of refitting and
+    reproduces the archetypes exactly; each loaded archetype seeds the next anchor."""
     shots_path, gl_path = _synthetic_dataset(tmp_path)
     output_first = tmp_path / "snapshots_first.pt"
     output_second = tmp_path / "snapshots_resume.pt"
@@ -801,7 +824,7 @@ def test_run_pretrain_overwrite_output_replaces_existing(tmp_path: Path) -> None
 
 
 # ---------------------------------------------------------------------------
-# Farthest-point cold-start initialization (collapse-prevention)
+# Farthest-point cold-start initialization
 # ---------------------------------------------------------------------------
 
 
@@ -818,23 +841,21 @@ def test_fps_init_returns_K_valid_simplex_rows() -> None:
 
 
 def test_fps_init_picks_distinct_rows_when_P_geq_K() -> None:
-    """The farthest-point algorithm picks K mutually-distinct seed rows.
+    """Farthest-point sampling picks K mutually distinct seed rows.
 
-    Pairwise L1 between the K seeds should all be strictly positive (no
-    duplicates). Smoothing means the returned rows aren't byte-identical
-    to any single Q row, but the underlying selection is unique.
+    The returned rows are smoothed toward uniform, so they are not copies of rows of
+    ``Q``, but every pairwise L1 distance stays well above zero.
     """
     rng = np.random.default_rng(0)
     P, C, K = 20, 100, 8
     Q = rng.dirichlet(np.ones(C), size=P).astype(np.float32)
     A0 = pretrain_snapshots._fps_init_from_player_kdes(Q, K)
     pair_l1 = np.array([np.abs(A0[i] - A0[j]).sum() for i in range(K) for j in range(i + 1, K)])
-    # Min pairwise L1 is well above zero — atoms are not collapsed.
     assert pair_l1.min() > 0.05, f"FPS produced near-duplicate atoms: {pair_l1}"
 
 
 def test_fps_init_is_deterministic() -> None:
-    """FPS over Q is deterministic — no RNG dependency once Q is fixed."""
+    """FPS is deterministic given ``Q``."""
     rng = np.random.default_rng(0)
     Q = rng.dirichlet(np.ones(50), size=20).astype(np.float32)
     A0_a = pretrain_snapshots._fps_init_from_player_kdes(Q, K=6)
@@ -843,29 +864,26 @@ def test_fps_init_is_deterministic() -> None:
 
 
 def test_fps_init_first_seed_is_nearest_to_mean() -> None:
-    """First selected row should be the one closest to mean(Q) in L2.
+    """The first seed is the row of ``Q`` closest to ``mean(Q)`` in L2.
 
-    Construct Q so the mean is unambiguous — one row exactly equals
-    the mean, K - 1 rows are far away. FPS must pick the central row first.
+    ``Q`` holds seven uniform rows and seven near-delta rows, so a uniform row is
+    closest to the mean.
     """
     C = 50
-    central = np.full(C, 1.0 / C, dtype=np.float32)  # exactly uniform = mean of below
+    central = np.full(C, 1.0 / C, dtype=np.float32)  # uniform
     extreme_rows = []
     for k in range(7):
         v = np.zeros(C, dtype=np.float32)
         v[k * 7 % C] = 1.0  # near-deltas, far from uniform
         extreme_rows.append(v)
-    # Build Q so that mean = central exactly: include enough copies of `central`
-    # to pull the mean toward it. Use 7 extremes + 7 centrals.
     Q = np.stack([*extreme_rows, *([central] * 7)], axis=0)
     A0 = pretrain_snapshots._fps_init_from_player_kdes(Q, K=4, smoothing_eps=0.0)
-    # The first seed should be the central row (closest to mean).
     np.testing.assert_allclose(A0[0], central, atol=1e-5)
 
 
 def test_fps_init_raises_when_n_players_lt_K() -> None:
-    """FPS init contract: n_players >= K. Below that, callers should
-    use _seed_archetypes_from_player_kdes instead."""
+    """FPS initialization requires ``n_players >= K``; with fewer players callers use
+    ``_seed_archetypes_from_player_kdes``."""
     import pytest
 
     Q = np.full((3, 50), 1.0 / 50, dtype=np.float32)

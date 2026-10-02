@@ -2,7 +2,7 @@
 
 A generic neural conditional-density baseline for shot location. It
 sits between the classical reference KDE and the structured AC-KDE in
-the paper's baselines. The MDN consumes the same causal pregame context
+the paper's baselines. The MDN consumes the same causal context
 vector (the raw :math:`\\tilde x_n \\in \\mathbb R^{27}`) that the
 AC-KDE consumes and produces
 
@@ -54,7 +54,7 @@ class ConditionalMDN(nn.Module):
     Parameters
     ----------
     input_dim : int, default 27
-        Pregame-context dimension (matches :data:`shotcloud.data.context.CONTEXT_DIM`).
+        Context dimension (matches :data:`shotcloud.data.context.CONTEXT_DIM`).
     hidden_dim : int, default 128
         Width of each shared-trunk MLP layer.
     n_components : int, default 16

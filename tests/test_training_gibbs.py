@@ -1,24 +1,20 @@
 """Tests for :class:`GibbsShotDataset` and :func:`train_gibbs`.
 
-The dataset has to route the seven per-shot tensors and the
-per-game count/context table correctly. The trainer has to drive
-a coherent loss downward over a handful of epochs and respect the
-zero-init / no-residual baselines.
+The trainer tests use the grid-cell components from :mod:`shotcloud.legacy_pivot`
+(``AdaptiveOffensivePrior``, the grid defensive field, ``LowRankTiltDecoder``).
 
-Covered invariants:
+Covered:
 
-1. Dataset emits well-shaped tensors and a per-game table whose
-   total :math:`\\sum K_n` matches the number of shots used.
-2. Dataset's snapshot_idx is causal: every shot's anchor date is
-   ``<=`` the shot date.
-3. Out-of-vocab players / opponents are dropped.
-4. ``train_gibbs`` decreases total loss across epochs on a tiny
-   synthetic problem, and the trainable submodules all see
-   gradients.
-5. The zero-init invariant holds at step 0: with no residual
-   encoder and ``f_ctx`` residual-zero-init, the per-shot spatial
-   log-probs equal ``log_softmax(log q_off)`` from a fresh
-   ``AdaptiveOffensivePrior`` call.
+1. The dataset emits well-shaped per-shot tensors and a per-game table whose total
+   :math:`\\sum K_n` equals the number of shots.
+2. ``snapshot_idx`` is causal: every shot's anchor date is ``<=`` the shot date.
+3. Out-of-vocabulary players are dropped, ``game_idx`` is unique per (player, game),
+   and ``tau_bin`` is computed from game-elapsed seconds.
+4. ``train_gibbs`` lowers the total loss on a small synthetic problem, every trainable
+   submodule receives gradient, and the defense, anisotropic-kernel, count-loss
+   normalization, and freezing options behave as documented.
+5. At initialization, with no residual encoder and a zero-initialized ``f_ctx``, the
+   spatial log-probabilities equal ``log_softmax(log q_off)``.
 """
 
 from __future__ import annotations
@@ -49,11 +45,11 @@ from shotcloud.training import N_TIMING_BINS, GibbsShotDataset, train_gibbs
 
 
 def _build_synthetic_shots(seed: int = 0) -> pd.DataFrame:
-    """Four anchors, 4 players × 3 opponents, ~24 shots each across 3 games.
+    """Four players × three opponents × three games, eight shots per game.
 
-    Dates span Jan–Jun 2024, so the snapshot anchors at 2024-03-15
-    and 2024-04-15 have shots both before (causal pool) and after
-    (training-time rows).
+    Dates run from mid-January to early May 2024, so the snapshot anchors at
+    2024-03-15 and 2024-04-15 have shots both before them (causal pool) and after
+    them (training rows).
     """
     rng = np.random.default_rng(seed)
     rows: list[dict[str, object]] = []
@@ -70,10 +66,9 @@ def _build_synthetic_shots(seed: int = 0) -> pd.DataFrame:
                 )
                 for shot_i in range(8):
                     period = (shot_i % 4) + 1
-                    # time_remaining_sec is total game-elapsed seconds
-                    # (see loaders.py — the column name is a misnomer).
-                    # Spread shots through each period: shot 0 → 5 min in,
-                    # shot 1 → 7 min in, etc.
+                    # time_remaining_sec holds total game-elapsed seconds (see
+                    # shotcloud.data.loaders). Shots 0-3 fall 5 min into periods 1-4
+                    # and shots 4-7 fall 7 min in.
                     game_min = (period - 1) * 12 + 5 + (shot_i // 4) * 2
                     rows.append(
                         {
@@ -214,8 +209,8 @@ def test_dataset_emits_twelve_per_shot_tensors() -> None:
     train_set = setup["train_set"]
     assert len(train_set) > 0
     item = train_set[0]
-    # 12 fields: the original 9, the G1 prior_seq + prior_lengths (paper §10),
-    # and the Phase 2 prior_outcome summary (paper 2026-06-07 audit).
+    # 12 fields, including the within-game prior-shot sequence and its lengths and the
+    # prior-outcome features.
     assert len(item) == 12
     (
         player_idx,
@@ -267,12 +262,8 @@ def test_per_game_table_total_matches_n_shots() -> None:
 
 
 def test_spatial_hawkes_flag_extends_outcome_dim_to_17() -> None:
-    """Phase 1 B1: with ``with_spatial_hawkes_residual=True`` the
-    dataset's ``prior_outcome`` becomes 17-dim (9 outcome + 8
-    spatial-Hawkes) and the new attribute ``outcome_feature_dim``
-    exposes the realized dim. First-shot rows still produce all-zero
-    spatial-Hawkes slots so the AC-KDE step-0 invariant carries
-    through unchanged."""
+    """With ``with_spatial_hawkes_residual=True``, ``prior_outcome`` is 17-dimensional
+    (9 outcome + 8 spatial-Hawkes features) and ``outcome_feature_dim`` reports it."""
     from shotcloud.data.prior_outcomes import PRIOR_OUTCOME_DIM
     from shotcloud.data.prior_shot_kde import PRIOR_SHOT_KDE_DIM
 
@@ -298,24 +289,19 @@ def test_spatial_hawkes_flag_extends_outcome_dim_to_17() -> None:
     assert train_set_with.prior_outcome.shape[-1] == expected
     assert train_set_with.with_spatial_hawkes_residual is True
 
-    # The default-off path still emits 9-dim.
+    # The default emits the 9-dimensional outcome features.
     assert setup["train_set"].outcome_feature_dim == PRIOR_OUTCOME_DIM
     assert setup["train_set"].prior_outcome.shape[-1] == PRIOR_OUTCOME_DIM
     assert setup["train_set"].with_spatial_hawkes_residual is False
 
 
 def test_game_idx_unique_per_player_game_pair() -> None:
-    """Regression for pandas 3.x ``pd.factorize`` null-byte bug
-    (2026-06-08). On pandas 3.0.2 / numpy 2.4.4, factorize on a
-    numpy object array containing ``\\x00`` truncates the C-string
-    hash at the null byte, collapsing every game of a single player
-    into one ``game_idx``. The synthetic fixture has 4 players × 3
-    opponents × 3 game offsets = 36 distinct (player, game) pairs,
-    and each shot's ``game_idx`` must be unique to its (player_id,
-    game_id) tuple — i.e. the number of distinct ``game_idx`` values
-    equals the number of distinct (player_id, game_id) tuples in the
-    surviving (post-snapshot-filter) data, NOT the number of
-    distinct ``player_id`` values.
+    """``game_idx`` has one value per distinct (player_id, game_id) pair among the
+    retained shots, not one per player.
+
+    Keys joined with a ``\\x00`` separator would break this: ``pd.factorize`` on
+    pandas 3.x truncates object strings at a null byte, merging all of a player's
+    games.
     """
     import pandas as pd
 
@@ -324,9 +310,8 @@ def test_game_idx_unique_per_player_game_pair() -> None:
     df = setup["df"]
     store = setup["store"]
 
-    # The dataset drops shots whose date precedes the first snapshot
-    # anchor. To get the post-filter (player, game) pair count, replay
-    # the same filter on the fixture df.
+    # The dataset drops shots dated before the first snapshot anchor; replay that
+    # filter to count the retained (player, game) pairs.
     first_anchor = np.asarray(store.anchor_dates[0], dtype="datetime64[D]")
     eligible = df[df["date"].to_numpy().astype("datetime64[D]") >= first_anchor]
     eligible_keys = eligible["player_id"].astype(str) + "||" + eligible["game_id"].astype(str)
@@ -336,13 +321,10 @@ def test_game_idx_unique_per_player_game_pair() -> None:
         f"distinct (player, game) pairs = {n_distinct_pairs_post_filter} "
         "(was the null-byte separator reintroduced?)"
     )
-    # Sanity: with the synthetic 4-player fixture, the bug would
-    # collapse n_games to 4 (one per player). The post-filter count
-    # is much higher, so this assertion would fail under the bug.
+    # Merging games per player would give n_games equal to the player count.
     assert train_set.n_games > eligible["player_id"].nunique()
 
-    # And the per-shot game_idx must agree with the raw (player, game)
-    # pairing: the number of unique game_idx values equals n_games.
+    # The per-shot game_idx takes exactly n_games distinct values.
     game_idx = train_set.game_idx.cpu().numpy()
     n_unique_idx = int(pd.Series(game_idx).nunique())
     assert n_unique_idx == train_set.n_games
@@ -356,8 +338,8 @@ def test_dataset_snapshot_idx_is_causal() -> None:
     snap_idx_np = train_set.snapshot_idx.numpy()
     # Recover per-shot dates in the same row order the dataset emits.
     surviving = df.assign(date=pd.to_datetime(df["date"]).dt.normalize()).reset_index(drop=True)
-    # The dataset drops shots before the first anchor; align by the
-    # mapping (n_shots may be < len(df)).
+    # The dataset drops shots before the first anchor, so n_shots may be below
+    # len(df); apply the same filter to align rows.
     first_anchor = np.asarray(store.anchor_dates[0], dtype="datetime64[D]")
     eligible = surviving[surviving["date"].to_numpy().astype("datetime64[D]") >= first_anchor]
     eligible = eligible.reset_index(drop=True)
@@ -369,21 +351,14 @@ def test_dataset_snapshot_idx_is_causal() -> None:
 
 
 def test_tau_bin_uses_game_elapsed_seconds_semantic() -> None:
-    """``time_remaining_sec`` in the canonical schema is actually
-    *total game-elapsed seconds* (loader misnomer). ``tau_bin`` is
-    therefore ``floor(time_remaining_sec / 60)`` clamped to
-    ``[0, 47]``, **not** a function of seconds-remaining-in-period.
+    """``tau_bin`` is ``floor(time_remaining_sec / 60)`` clamped to ``[0, 47]``.
 
-    Regression test for the timing-bin bug surfaced by the first
-    real-data ``train_gibbs`` run (2026-05-15): the earlier formula
-    treated the column as period-remaining seconds, collapsed every
-    post-Q1 shot to bin 0 of its quarter, and only populated 16 of
-    48 bins on real data."""
+    Despite its name, ``time_remaining_sec`` in the canonical schema holds total
+    game-elapsed seconds, so the bin does not depend on ``period``.
+    """
     from shotcloud.training.gibbs_dataset import _compute_tau_bin
 
-    # Game-elapsed seconds covering all four quarters + overtime.
-    # period values shouldn't matter — the bin is implicit in the
-    # elapsed-seconds value.
+    # Game-elapsed seconds covering all four quarters and overtime.
     cases = [
         # (elapsed_sec, expected_bin)
         (0.0, 0),  # start of Q1
@@ -497,9 +472,8 @@ def test_train_gibbs_loss_decreases_with_residual() -> None:
 
 
 def test_train_gibbs_zero_init_spatial_logits_match_q_off() -> None:
-    """At step 0 with no residual and ContextMLP residual-zero-init,
-    spatial logits should equal ``log_softmax(log q_off)`` evaluated
-    with x_n == x_tilde."""
+    """At initialization ``f_ctx`` is the identity and, with a zero residual, the spatial
+    log-probabilities equal ``log_softmax(log q_off)``."""
     setup = _build_training_setup()
     offensive_prior = setup["offensive_prior"]
     context_mlp = setup["context_mlp"]
@@ -514,13 +488,12 @@ def test_train_gibbs_zero_init_spatial_logits_match_q_off() -> None:
     context_mlp.eval()
     with torch.no_grad():
         x_n = context_mlp(x_n_raw)
-        # Zero-init residual makes f_ctx an identity at step 0.
+        # The zero-initialized residual makes f_ctx the identity.
         torch.testing.assert_close(x_n, x_n_raw, atol=1e-6, rtol=0.0)
         log_q_off, _, _ = offensive_prior(player_idx, snap_idx, x_n_raw, x_n)
         expected = torch.log_softmax(log_q_off, dim=-1)
-        # The trainer's spatial slice goes through the same call, so
-        # an end-to-end check would be circular. Instead we verify the
-        # invariant that ``log_softmax(log q_off + 0) == log_softmax(log q_off)``.
+        # The trainer makes this same call, so comparing against it would be circular;
+        # check log_softmax(log q_off + 0) == log_softmax(log q_off) instead.
         zero_residual = torch.zeros_like(log_q_off)
         actual = torch.log_softmax(log_q_off + zero_residual, dim=-1)
         torch.testing.assert_close(actual, expected, atol=1e-6, rtol=0.0)
@@ -549,12 +522,8 @@ def test_train_gibbs_gradient_flows_to_all_submodules() -> None:
         learning_rate=5e-3,
         progress=False,
     )
-    # After a step, at least one parameter per submodule should
-    # have been updated. The initial state was fresh modules with
-    # zero-init residual tilts and a residual-zero-init f_ctx, so a
-    # straightforward sanity check is that the submodule parameters'
-    # collective L2 norm has changed (we can't be more specific
-    # without snapshotting initials).
+    # Every submodule with trainable parameters has a nonzero parameter norm after
+    # training.
     modules = [
         offensive_prior,
         count_head,
@@ -570,8 +539,8 @@ def test_train_gibbs_gradient_flows_to_all_submodules() -> None:
 
 def test_train_gibbs_restore_best_val_lowers_final_val_loss() -> None:
     setup = _build_training_setup()
-    # Tiny val set = the train set; the test only checks bookkeeping,
-    # not generalization.
+    # The validation set is the training set; only the best-epoch bookkeeping is
+    # checked.
     history = train_gibbs(
         offensive_prior=setup["offensive_prior"],
         count_head=setup["count_head"],
@@ -595,10 +564,9 @@ def test_train_gibbs_restore_best_val_lowers_final_val_loss() -> None:
 
 
 def test_train_gibbs_with_defense_loss_decreases() -> None:
-    """Offense + defense composition: spatial logits are
-    ``log_softmax(log q_off + log a_delta)``; the trainer must drive
-    loss downward and gradient must flow into the defensive field's
-    relevance parameters too."""
+    """With the grid defensive field, the spatial log-probabilities are
+    ``log_softmax(log q_off + log a_delta)``; the loss decreases and the field's
+    relevance parameters receive gradient."""
     setup = _build_training_setup(with_defense=True)
     assert setup["defensive_field"] is not None
     initial = train_gibbs(
@@ -629,8 +597,7 @@ def test_train_gibbs_with_defense_loss_decreases() -> None:
         progress=False,
     )
     assert history.train_total[-1] < initial_loss
-    # Defensive field's relevance params received gradient at some
-    # point during training (they're learnable scalars on RelevanceScore).
+    # The defensive field's RelevanceScore scalars received gradient during training.
     defensive_field = setup["defensive_field"]
     total = sum(
         float(p.detach().pow(2).sum()) for p in defensive_field.parameters() if p.requires_grad
@@ -639,7 +606,8 @@ def test_train_gibbs_with_defense_loss_decreases() -> None:
 
 
 def test_train_gibbs_with_defense_full_gibbs_loss_decreases() -> None:
-    """Full Gibbs composition: offense + defense + residual."""
+    """The loss decreases with the offensive prior, defensive field, and residual tilt
+    together."""
     setup = _build_training_setup(with_defense=True, with_residual=True)
     assert setup["defensive_field"] is not None
     initial = train_gibbs(
@@ -677,8 +645,7 @@ def test_train_gibbs_with_defense_full_gibbs_loss_decreases() -> None:
 
 
 def test_train_gibbs_defense_without_opp_vocab_raises() -> None:
-    """If defensive_field is provided but the dataset has no opp_vocab,
-    the trainer must reject the configuration loudly."""
+    """A defensive field with a dataset that has no ``opp_vocab`` raises."""
     setup = _build_training_setup(with_defense=True)
     # Build a parallel train_set without an opp_vocab.
     no_opp_set = GibbsShotDataset(
@@ -708,9 +675,8 @@ def test_train_gibbs_defense_without_opp_vocab_raises() -> None:
 
 
 def test_train_gibbs_with_factored_anisotropic_kernel_loss_decreases() -> None:
-    """Full factored σ(x, z_j) anisotropic kernel: trainer drives the
-    joint loss down over a handful of epochs and the kernel's σ
-    parameters end up varying (anisotropy actually engages)."""
+    """With the factored ``σ(x, z_j)`` anisotropic kernel the joint loss decreases and
+    the per-shot σ values move off their initial value."""
     setup = _build_training_setup(kernel_form="factored")
     initial = train_gibbs(
         offensive_prior=setup["offensive_prior"],
@@ -740,8 +706,7 @@ def test_train_gibbs_with_factored_anisotropic_kernel_loss_decreases() -> None:
     )
     assert history.train_total[-1] < initial_loss
 
-    # After training, σ_∥ and σ_⊥ should have drifted off init_sigma
-    # for at least some shots — confirming anisotropy actually engaged.
+    # After training, σ_∥ and σ_⊥ differ from init_sigma for at least some shots.
     kernel = setup["offensive_prior"].anisotropic_kernel
     assert kernel is not None
     df = setup["df"]
@@ -750,13 +715,12 @@ def test_train_gibbs_with_factored_anisotropic_kernel_loss_decreases() -> None:
     # Use first 32 shots as a batch sample.
     z_j_sample = ctx.unsqueeze(1).expand(-1, 5, -1)  # (32, 5, D)
     stats = kernel.sigma_stats(ctx, z_j_sample)
-    # At init both σs were exactly 1.5; after a few epochs they should
-    # spread (std > 0) and/or become anisotropic.
+    # Both σs start at exactly 1.5; after training they spread and/or differ.
     assert stats["sigma_par_std"] + stats["sigma_perp_std"] > 1e-4
 
 
 def test_train_gibbs_with_z_only_anisotropic_loss_decreases() -> None:
-    """The simplest anisotropic ablation (σ(z_j) only) also trains."""
+    """The anisotropic kernel with ``σ(z_j)`` only also trains."""
     setup = _build_training_setup(kernel_form="z_only")
     history = train_gibbs(
         offensive_prior=setup["offensive_prior"],
@@ -774,9 +738,8 @@ def test_train_gibbs_with_z_only_anisotropic_loss_decreases() -> None:
 
 
 def test_train_gibbs_count_loss_normalization_per_game_differs_from_per_shot() -> None:
-    """``per_game`` (new default) and ``per_shot`` (legacy) produce
-    distinct loss trajectories at the same ``lambda_count``. Both must
-    still drive total loss down.
+    """``per_game`` (default) and ``per_shot`` count-loss normalization give different
+    loss trajectories at the same ``lambda_count``, and both decrease the loss.
     """
     setup_a = _build_training_setup(seed=0)
     hist_per_game = train_gibbs(
@@ -809,8 +772,7 @@ def test_train_gibbs_count_loss_normalization_per_game_differs_from_per_shot() -
     # Both must decrease.
     assert hist_per_game.train_total[-1] < hist_per_game.train_total[0]
     assert hist_per_shot.train_total[-1] < hist_per_shot.train_total[0]
-    # And they must differ — same seed + setup, only the normalization
-    # changes the count term's contribution to the optimization loss.
+    # With the same seed and setup, only the normalization differs.
     assert hist_per_game.train_total[-1] != hist_per_shot.train_total[-1]
 
 
@@ -833,9 +795,7 @@ def test_train_gibbs_rejects_unknown_count_loss_normalization() -> None:
 
 
 def test_train_gibbs_freeze_count_holds_count_head_fixed() -> None:
-    """``freeze_count`` should leave the count head's parameters
-    unchanged after training; spatial submodules still update.
-    """
+    """``freeze_count`` leaves the count head unchanged while other submodules update."""
     setup = _build_training_setup()
     before_count = {n: p.detach().clone() for n, p in setup["count_head"].named_parameters()}
     before_ctx_mlp = {n: p.detach().clone() for n, p in setup["context_mlp"].named_parameters()}
@@ -864,13 +824,8 @@ def test_train_gibbs_freeze_count_holds_count_head_fixed() -> None:
 
 
 def test_train_gibbs_freeze_context_mlp_holds_both_fixed() -> None:
-    """``freeze_count`` + ``freeze_context_mlp`` together must hold
-    *both* the count head AND the context MLP fixed across joint
-    training (paper §5.2 Experiment B' falsification test for the
-    context_mlp-drift co-adaptation pathway). At least one other
-    submodule must still update so we know the trainer actually
-    stepped.
-    """
+    """``freeze_count`` with ``freeze_context_mlp`` holds both the count head and the
+    context MLP fixed while the timing head still updates."""
     setup = _build_training_setup()
     before_count = {n: p.detach().clone() for n, p in setup["count_head"].named_parameters()}
     before_ctx_mlp = {n: p.detach().clone() for n, p in setup["context_mlp"].named_parameters()}

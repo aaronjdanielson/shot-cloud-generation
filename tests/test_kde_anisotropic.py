@@ -355,18 +355,18 @@ def test_sigma_stats_returns_expected_keys() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Integration with AdaptiveOffensivePrior
+# Integration with the grid-cell AdaptiveOffensivePrior (shotcloud.legacy_pivot)
 # ---------------------------------------------------------------------------
 
 
 def test_anisotropic_prior_matches_isotropic_at_step_zero() -> None:
-    """At step 0 (zero-init anisotropic kernel with init_sigma matching
-    AdaptiveKDE.bandwidth), the q_phi computed via the anisotropic path
-    should be close to the isotropic-precomputed-M path. They won't be
-    bit-identical because the precomputed M uses a slightly different
-    normalization convention (scipy.ndimage gaussian_filter + L1
-    normalize), but they should agree to within a few percent in TV
-    distance on a clean test setup.
+    """At step 0 the anisotropic prior is within small TV distance of the isotropic prior.
+
+    With ``init_sigma`` equal to ``AdaptiveKDE.bandwidth``, the anisotropic
+    path matches the precomputed isotropic kernel matrix ``M`` up to tail
+    handling: ``M`` is built with ``scipy.ndimage.gaussian_filter`` and L1
+    normalization, the anisotropic kernel with a softmax over cells, so the
+    two are close but not bit-identical.
     """
     import pandas as pd
 
@@ -454,8 +454,7 @@ def test_anisotropic_prior_matches_isotropic_at_step_zero() -> None:
 
 
 def test_anisotropic_prior_construction_requires_coords() -> None:
-    """Older AdaptiveKDE instances (or fits that didn't populate coords)
-    should fail with a clear error rather than crash deep in forward."""
+    """An ``AdaptiveKDE`` without stored shot coordinates is rejected at construction."""
     import pandas as pd
 
     from shotcloud import AdaptiveKDE, PlayerVocab, RelevanceScore
@@ -498,7 +497,7 @@ def test_anisotropic_prior_construction_requires_coords() -> None:
         context_features=ctx,
         date=df["date"].to_numpy(),
     )
-    # Wipe coords to simulate an old fit.
+    # Remove the stored coordinates the anisotropic kernel needs.
     akde.coords = {}
     vocab = PlayerVocab.from_ids(akde.players)
     ad = ArchetypeDictionary.from_snapshot_store(store)

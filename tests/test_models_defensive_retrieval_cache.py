@@ -1,6 +1,6 @@
-"""Tests for ``shotcloud.models.defensive_retrieval_cache`` (PR-D0).
+"""Tests for :mod:`shotcloud.models.defensive_retrieval_cache`.
 
-The ten acceptance criteria from the build approval (2026-05-25):
+The numbered tests check these properties of the per-(opponent, snapshot) cache:
 
 1. Cache is deterministic for synthetic data.
 2. All retrieved shots are causal: ``shot_date < snapshot_anchor_date``.
@@ -44,13 +44,12 @@ def _epoch_day(s: str) -> int:
 
 
 def _build_simple_fixture(*, seed: int = 0) -> tuple[pd.DataFrame, OpponentVocab, np.ndarray]:
-    """4 teams (A/B/C/D), 1 snapshot, controlled allowed-shot histories.
+    """Four teams (A/B/C/D), one snapshot, controlled allowed-shot histories.
 
-    * 2 shots per (defending_team) pair before the anchor (causal).
-    * 1 shot per (defending_team) on the anchor date (non-causal —
-      tests the strict ``< anchor`` cutoff).
-    * Teams D has *zero* causal allowed shots in the window — used as
-      the cold-start cell.
+    * Two causal shots allowed by each of A, B, C before the anchor.
+    * One shot allowed by each of A, B, C on the anchor date, which the strict
+      ``< anchor`` cutoff must exclude.
+    * Team D has no allowed shots and serves as the cold-start cell.
     """
     rng = np.random.default_rng(seed)
     anchor = _epoch_day("2024-04-15")
@@ -61,7 +60,7 @@ def _build_simple_fixture(*, seed: int = 0) -> tuple[pd.DataFrame, OpponentVocab
     # For each defending team, build allowed shots by *some other* team
     # shooting against them.
     for defending in teams:
-        # Pick an attacking team that's not the defending team.
+        # The attacking team is never the defending team.
         for d in pre_dates:
             attacker_pool = [t for t in teams if t != defending] + ["E"]
             attacker = attacker_pool[int(rng.integers(0, len(attacker_pool)))]
@@ -128,8 +127,8 @@ def test_1_build_is_deterministic() -> None:
 
 
 def test_2_causality_no_retrieved_shot_at_or_after_anchor() -> None:
-    """Every valid ``def_idx`` points at a global shot whose date is
-    strictly less than the snapshot anchor."""
+    """Every valid ``def_idx`` points at a global shot dated strictly before the
+    snapshot anchor."""
     shots, vocab, anchors = _build_simple_fixture()
     cfg = _default_config(anchors)
     c = build_defensive_retrieval_cache(
@@ -144,8 +143,8 @@ def test_2_causality_no_retrieved_shot_at_or_after_anchor() -> None:
 
 
 def test_3_retrieved_shots_are_exactly_against_target_opponent() -> None:
-    """For each (opp, snapshot), every valid retrieved row has
-    ``opponent == opp`` in the global table."""
+    """Every valid slot of an (opponent, snapshot) cell holds a shot against that
+    opponent."""
     shots, vocab, anchors = _build_simple_fixture()
     cfg = _default_config(anchors)
     c = build_defensive_retrieval_cache(
@@ -162,21 +161,14 @@ def test_3_retrieved_shots_are_exactly_against_target_opponent() -> None:
 
 
 def test_4_cache_raises_when_any_row_has_team_equal_to_opponent() -> None:
-    """The cache enforces the load_shots() invariant that a team
-    cannot play itself: a row with ``team == opponent`` is a real
-    bug we want to surface loudly, not propagate silently. This is
-    the load-bearing fence for criterion #4 (no shots by team d
-    accidentally treated as allowed against d) — when ``team`` is
-    present in the dataframe, the cache enforces it.
+    """A row with ``team == opponent`` raises.
 
-    Cross-check on the clean fixture (`test_4b`) verifies that the
-    fence isn't over-eager: on legitimately attacker-vs-defender
-    rows the build proceeds and the global opponent indices are
-    correct."""
+    When a ``team`` column is present, this check guarantees that no shot by team ``d``
+    is treated as a shot allowed by ``d``.
+    """
     shots, vocab, anchors = _build_simple_fixture()
-    # Corrupt one row to have team == opponent, both in-vocab (so the
-    # row survives the in-vocab filter and the team-eq-opponent fence
-    # is the thing that fires).
+    # Both labels are in the vocabulary, so the row survives the vocabulary filter
+    # and the team == opponent check is what fires.
     shots = shots.copy()
     bad_row = shots.index[0]
     shots.loc[bad_row, "team"] = "A"
@@ -189,19 +181,13 @@ def test_4_cache_raises_when_any_row_has_team_equal_to_opponent() -> None:
 
 
 def test_4b_clean_fixture_passes_team_neq_opponent_check() -> None:
-    """Sanity: on the unaltered fixture (which respects the
-    load_shots() invariant), the build succeeds and every retrieved
-    row's defending opponent matches the index it was placed under.
-    This is what criterion #4 is *really* asking — that the
-    bookkeeping doesn't swap opponent for team."""
+    """On a fixture with ``team != opponent`` the build succeeds and each retrieved
+    shot's opponent matches its cell, so team and opponent are never swapped."""
     shots, vocab, anchors = _build_simple_fixture()
     cfg = _default_config(anchors)
     c = build_defensive_retrieval_cache(
         shots_df=shots, opp_vocab=vocab, anchor_dates=anchors, config=cfg
     )
-    # For every valid slot, the global opponent index must equal the
-    # row's d_idx. This is the same as test_3 but framed against
-    # criterion #4's "no team-as-opponent swap" concern.
     for d_idx in range(len(vocab)):
         mask = c.def_mask[d_idx, 0, :]
         if not mask.any():
@@ -211,8 +197,8 @@ def test_4b_clean_fixture_passes_team_neq_opponent_check() -> None:
 
 
 def test_5_padding_uses_negative_one_idx_and_false_mask() -> None:
-    """With cap=4 and only 2 causal allowed shots per non-cold-start
-    opp, slots 2,3 must be (-1, False)."""
+    """With cap 4 and two causal allowed shots per warm opponent, slots 2 and 3 are
+    ``(-1, False)``."""
     shots, vocab, anchors = _build_simple_fixture()
     cfg = _default_config(anchors, defensive_support_max=4)
     c = build_defensive_retrieval_cache(
@@ -230,8 +216,7 @@ def test_5_padding_uses_negative_one_idx_and_false_mask() -> None:
 
 
 def test_6_cold_start_opp_snapshot_cell_is_all_padding() -> None:
-    """Opponent D has zero allowed-shot history before the anchor.
-    Its full (cap-long) row must be -1 indices + False mask."""
+    """An opponent with no allowed shots before the anchor gets an all-padding row."""
     shots, vocab, anchors = _build_simple_fixture()
     cfg = _default_config(anchors)
     c = build_defensive_retrieval_cache(
@@ -245,10 +230,8 @@ def test_6_cold_start_opp_snapshot_cell_is_all_padding() -> None:
 
 
 def test_7_top_m_def_ordering_respects_recency() -> None:
-    """Top-M_def ordering is by date descending: with cap=2 and four
-    causal allowed shots against opp A on dates anchor-5, anchor-10,
-    anchor-15, anchor-20, the cache should keep the two most-recent
-    (anchor-5 and anchor-10) in that order."""
+    """With cap 2, the two most recent of four causal allowed shots are kept,
+    most recent first."""
     anchor = _epoch_day("2024-04-15")
     dates = [anchor - 20, anchor - 15, anchor - 10, anchor - 5]
     rows = []
@@ -286,9 +269,7 @@ def test_7_top_m_def_ordering_respects_recency() -> None:
 
 
 def test_7b_recency_tie_resolves_to_lower_original_index() -> None:
-    """When two allowed shots share the same date, the stable argsort
-    picks the lower original-index row first — deterministic and
-    reproducible across NumPy versions."""
+    """Shots with equal dates are ordered by original index (stable sort)."""
     anchor = _epoch_day("2024-04-15")
     # Three shots on the same date; cap=2.
     rows = []
@@ -336,9 +317,9 @@ def test_8_disk_round_trip_preserves_tensors_and_config(tmp_path: Path) -> None:
 
 
 def test_8b_build_with_cache_dir_loads_on_second_call(tmp_path: Path) -> None:
-    """First call writes the cache; second call loads it without
-    re-running the build (verified by passing an empty DataFrame on
-    the second call — if rebuild ran it would crash)."""
+    """With ``cache_dir`` set, the first call writes the cache and the second loads it
+    without rebuilding (the second call passes an empty DataFrame, on which a rebuild
+    would fail)."""
     shots, vocab, anchors = _build_simple_fixture()
     cfg = _default_config(anchors)
     c1 = build_defensive_retrieval_cache(
@@ -362,8 +343,7 @@ def test_8b_build_with_cache_dir_loads_on_second_call(tmp_path: Path) -> None:
 
 
 def test_9_config_hash_changes_on_any_retrieval_defining_field() -> None:
-    """Each retrieval-defining field, when changed, must produce a
-    different ``config_hash``."""
+    """Changing any retrieval-defining field changes ``config_hash``."""
     anchors = np.array([_epoch_day("2024-04-15")], dtype=np.int64)
     base = _default_config(anchors)
     base_h = base.config_hash
@@ -416,10 +396,9 @@ def test_config_validates_positive_fields() -> None:
 
 
 def test_build_rejects_missing_opponent_column() -> None:
-    """The cache requires a canonical ``opponent`` column (populated
-    by ``shotcloud.data.loaders.load_shots``). Without it, the
-    builder must raise a clear error rather than silently producing
-    an empty cache."""
+    """A shots frame without the ``opponent`` column (set by
+    :func:`~shotcloud.data.loaders.load_shots`) raises instead of yielding an empty
+    cache."""
     shots = pd.DataFrame(
         [
             {
@@ -441,9 +420,7 @@ def test_build_rejects_missing_opponent_column() -> None:
 
 
 def test_build_drops_rows_with_missing_opponent() -> None:
-    """Rows where ``opponent`` is NA (boundary games) are silently
-    dropped — they're not valuable for defense and shouldn't crash
-    the build."""
+    """Rows with a missing ``opponent`` are dropped without error."""
     shots = pd.DataFrame(
         [
             {

@@ -1,20 +1,22 @@
 """Tests for :class:`shotcloud.models.ContextResidualEncoder`.
 
-The encoder is the context-only residual-tilt input ``u_θ(x_n)``
-(paper §3.5). The load-bearing invariants:
+The encoder produces the context input ``u_θ`` of the low-rank residual
+tilt ``R_θ`` (see *Support-logit components* in the paper). Invariants:
 
-1. **Output shape contract.** ``forward(x_n) -> (B, rank)`` for any
-   batch size, with ``CONTEXT_DIM`` validation on the input.
-2. **No player identity.** The forward signature is
-   ``(x_n,) -> u`` only — there is no ``player_idx`` parameter. This
-   is structural, not runtime: the residual cannot leak player
-   identity because the encoder has no way to receive it.
-3. **Composition with `LowRankTiltDecoder` preserves the zero-init
-   invariant.** When the decoder's basis ``V`` is zero,
-   ``softmax(log q_0 + u^T V) == q_0`` exactly, regardless of the
-   encoder's output (which is small but nonzero by default,
-   avoiding the dual-zero saddle).
-4. **Gradient flows through both factors when V is nonzero.**
+1. **Output shape contract.** ``forward(x_n) -> (B, rank)`` for any batch
+   size, with ``context_dim`` validation on the input.
+2. **No player identity.** ``forward`` takes ``x_n`` plus the optional causal
+   channels ``h_n``, ``usage``, and ``outcome``, and no ``player_idx``; the
+   residual cannot carry player identity because the encoder cannot receive
+   it.
+3. **Zero-init composition.** Paired with the grid-cell
+   :class:`~shotcloud.legacy_pivot.tilt_decoder.LowRankTiltDecoder`, a zero
+   basis ``V`` gives ``softmax(log q_0 + u^T V) == q_0`` exactly, whatever the
+   encoder outputs. The encoder's own output is small but non-zero, so ``V``
+   still receives gradient.
+4. **Gradient flow** through both factors when ``V`` is non-zero.
+5. **Optional channels.** The within-game channel ``h_n`` is validated and
+   used when configured; the usage branch is an exact no-op at init.
 """
 
 from __future__ import annotations
@@ -46,30 +48,19 @@ def test_forward_rejects_wrong_input_dim() -> None:
 
 
 def test_no_player_idx_in_signature() -> None:
-    """Architectural check: the residual is context-only by construction.
-
-    Calling ``forward`` with the canonical context input must succeed
-    without any player identity threaded through. Any future regression
-    that adds a ``player_idx`` parameter would force a signature change
-    and break this test.
-    """
+    """``forward`` has no ``player_idx`` parameter: the residual is context-only by construction."""
     import inspect
 
     sig = inspect.signature(ContextResidualEncoder.forward)
     params = set(sig.parameters.keys())
     assert "player_idx" not in params
-    # Forward accepts (self, x_n) plus the optional within-game-history
-    # channel h_n (added 2026-05-17 per paper §3.5), the optional
-    # causal usage-state channel `usage` (added 2026-06-04 for the
-    # count-location coupling ablation), and the optional causal
-    # prior-outcome channel `outcome` (added 2026-06-07 Phase 2 of
-    # the audit). Player identity is still architecturally excluded.
+    # x_n plus the optional causal channels: within-game history h_n,
+    # usage state, and prior outcomes.
     assert params == {"self", "x_n", "h_n", "usage", "outcome"}
 
 
 def test_zero_init_invariant_via_decoder() -> None:
-    """When V=0 in the decoder, the full network output equals q_0
-    exactly regardless of the encoder's output."""
+    """With decoder basis ``V = 0``, the output equals ``q_0`` whatever the encoder outputs."""
     rank = 4
     n_cells = 50
     enc = ContextResidualEncoder(rank=rank)
@@ -87,11 +78,10 @@ def test_zero_init_invariant_via_decoder() -> None:
 
 
 def test_init_default_is_small_but_nonzero() -> None:
-    """Last-layer std should be ~1/sqrt(rank); output magnitude is small but nonzero.
+    """The last-layer weight std is about ``1/sqrt(rank)``, so ``u`` is small but non-zero.
 
-    Avoids the dual-zero saddle: encoder zero + decoder V=0 would
-    leave ∂(u^T V)/∂V = u = 0, so V never moves. The default init
-    keeps u nonzero so V receives a gradient signal.
+    A zero ``u`` together with a zero basis ``V`` would give
+    ``∂(u^T V)/∂V = u = 0`` and ``V`` would never move.
     """
     rank = 16
     enc = ContextResidualEncoder(rank=rank)
@@ -106,11 +96,7 @@ def test_init_default_is_small_but_nonzero() -> None:
 
 
 def test_init_std_scale_smaller_means_smaller_output() -> None:
-    """Decreasing init_std_scale should produce smaller outputs at step 0.
-
-    Useful when the user wants a tighter ``u`` to keep the residual
-    closer to zero in early training.
-    """
+    """A smaller ``init_std_scale`` gives smaller outputs at step 0."""
     torch.manual_seed(0)
     enc_default = ContextResidualEncoder(rank=8, init_std_scale=1.0)
     torch.manual_seed(0)
@@ -153,9 +139,11 @@ def test_invalid_constructor_args_raise() -> None:
 
 
 def test_default_hidden_dim_is_capacity_limited() -> None:
-    """The paper requires the residual to be capacity-limited so it
-    cannot dominate the KDE-derived geometry. Default hidden_dim=32
-    keeps the parameter count small."""
+    """The default encoder has fewer than 1500 parameters.
+
+    The residual is kept capacity-limited so it cannot dominate the
+    KDE-derived geometry.
+    """
     enc = ContextResidualEncoder(rank=8)
     n_params = sum(p.numel() for p in enc.parameters())
     # 27 -> 32 -> 8: 27*32 + 32 + 32*8 + 8 = 864 + 32 + 256 + 8 = 1160 params
@@ -163,14 +151,12 @@ def test_default_hidden_dim_is_capacity_limited() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Within-game-history channel (h_n) — paper §3.5 short-horizon term
+# Within-game-history channel (h_n)
 # ---------------------------------------------------------------------------
 
 
 def test_within_game_dim_zero_default_rejects_h_n() -> None:
-    """Default constructor (within_game_dim=0) preserves legacy
-    behavior; passing an h_n tensor should error loudly so callers
-    don't silently lose the short-horizon signal."""
+    """With the default ``within_game_dim=0``, passing ``h_n`` raises rather than being ignored."""
     import torch as torch_
 
     enc = ContextResidualEncoder(rank=4)
@@ -181,9 +167,7 @@ def test_within_game_dim_zero_default_rejects_h_n() -> None:
 
 
 def test_within_game_dim_positive_requires_h_n() -> None:
-    """When the encoder is constructed with within_game_dim > 0, h_n
-    is required. Forgetting to pass it should error, not silently
-    fall back to x_n-only."""
+    """With ``within_game_dim > 0``, omitting ``h_n`` raises rather than falling back to ``x_n``."""
     import torch as torch_
 
     enc = ContextResidualEncoder(rank=4, within_game_dim=10)
@@ -193,8 +177,7 @@ def test_within_game_dim_positive_requires_h_n() -> None:
 
 
 def test_within_game_channel_changes_output_for_different_h_n() -> None:
-    """The encoder must actually use h_n — if two batches share x_n
-    but differ in h_n, the outputs should differ."""
+    """Batches that share ``x_n`` but differ in ``h_n`` give different outputs."""
     import torch as torch_
 
     enc = ContextResidualEncoder(rank=4, within_game_dim=10)
@@ -207,9 +190,7 @@ def test_within_game_channel_changes_output_for_different_h_n() -> None:
 
 
 def test_within_game_channel_gradient_flows_to_h_n() -> None:
-    """Backward through ``u_θ(x_n, h_n)`` should populate ``h_n.grad``
-    when ``within_game_dim > 0`` — the short-horizon channel is
-    actually carrying gradient, not just being read."""
+    """Backward through ``u_θ(x_n, h_n)`` populates a non-zero ``h_n.grad``."""
     import torch as torch_
 
     enc = ContextResidualEncoder(rank=4, within_game_dim=10)
@@ -237,17 +218,15 @@ def test_within_game_dim_rejects_shape_mismatch_in_forward() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Causal usage-state branch (2026-06-04)
+# Causal usage-state branch
 # --------------------------------------------------------------------------- #
 
 
 def test_usage_branch_is_no_op_at_init_for_any_usage_vector() -> None:
-    """**Load-bearing invariant.** With ``usage_dim > 0`` and the
-    usage MLP's output layer zero-init, the encoder must be bit-
-    identical to the no-usage encoder at step 0 — for *every* usage
-    input. This is the equivalent of the Tier-1a / Tier-2 isotropic-
-    collapse invariant for the residual axis: turning the channel on
-    cannot disturb the existing mainline at step 0.
+    """At init, an encoder with a usage branch matches the no-usage encoder for any usage input.
+
+    The usage MLP's output layer is zero-initialized, so enabling the
+    channel leaves the step-0 model unchanged.
     """
     import torch as t
 
@@ -271,9 +250,7 @@ def test_usage_branch_is_no_op_at_init_for_any_usage_vector() -> None:
 
 
 def test_usage_branch_diverges_after_param_shift() -> None:
-    """After moving the usage MLP off zero-init, the encoder's
-    output must differ from the no-usage path — confirming the usage
-    signal actually reaches the output."""
+    """Once the usage MLP leaves zero init, the output differs from the no-usage path."""
     import torch as t
 
     t.manual_seed(0)

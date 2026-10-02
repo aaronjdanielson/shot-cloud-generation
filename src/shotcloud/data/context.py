@@ -9,8 +9,10 @@ and by the count and timing heads.
 
 1. a field of the shot row itself: period and time in period (the
    game-clock state at the moment of the shot) and home/away;
-2. a field of the joined per-game row: starter, minutes, and the
-   ``recent_*`` features, which use only prior games;
+2. a field of the joined per-game row: starter status and minutes
+   played in the shot's own game (box-score values, used as
+   conditioning variables), and the ``recent_*`` features, which use
+   only prior games;
 3. a lookup into the snapshot bundle ``S(t)`` active at the shot's
    date (:meth:`shotcloud.data.SnapshotStore.get_snapshot`): role
    profile, position mixture, and opponent-efficiency bucket, all fit

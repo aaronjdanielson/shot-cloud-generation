@@ -1,10 +1,10 @@
-"""Tests for :class:`shotcloud.models.AdaptiveOffensivePrior`.
+"""Tests for :class:`shotcloud.legacy_pivot.adaptive_prior.AdaptiveOffensivePrior`.
 
-Post-AA-KDE refactor: the prior consumes a :class:`SnapshotStore` and
-composes Layer-1 (relevance-weighted self-KDE) with Layer-2 (the
-adaptive archetype prior produced by an :class:`ArchetypeDictionary`
-+ :class:`ArchetypeMixture`). Forward takes ``snapshot_idx`` and
-applies the causal date mask on the per-player history pool.
+The prior consumes a :class:`SnapshotStore` and blends a
+relevance-weighted self-KDE with the archetype prior produced by an
+:class:`ArchetypeDictionary` and :class:`ArchetypeMixture`. Forward takes
+``snapshot_idx`` and applies the causal date mask on the per-player
+history pool.
 """
 
 from __future__ import annotations
@@ -43,12 +43,11 @@ def _build_setup(
 
     The single bundle anchored at 2024-04-01 makes every training shot
     (Jan-Mar 2024) causal-eligible (every history date < 2024-04-01).
-    Archetype surfaces are uniform — Layer-2 reduces to a uniform
-    fallback in these tests, which is the right control for testing
-    the Layer-1 + ESS path independently of the archetype layer. The
-    encoder runs in legacy (no-snapshot) mode so the snapshot-derived
-    slices of x_n stay zero; that's fine for testing the prior's
-    history/causal-mask machinery.
+    Archetype surfaces are uniform, so the archetype prior reduces to a
+    uniform fallback; this isolates the self-KDE + ESS path from the
+    archetype layer. The encoder runs in no-snapshot mode so the
+    snapshot-derived slices of x_n stay zero, which does not affect the
+    prior's history/causal-mask machinery.
     """
     g = CourtGrid(xlim=(-25.0, 25.0), ylim=(-5.0, 47.0), nx=20, ny=22)
     rng = np.random.default_rng(seed)

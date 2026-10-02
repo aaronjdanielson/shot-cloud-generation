@@ -1,7 +1,5 @@
 """Tests for :func:`shotcloud.evaluation.compute_timing_calibration`
 and the timing-only training loop :func:`shotcloud.training.train_timing_only`.
-
-Phase 3 of the 2026-06-07 audit.
 """
 
 from __future__ import annotations
@@ -22,9 +20,8 @@ def _make_synthetic_per_shot(
     n_shots: int = 600,
     seed: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Synthetic per-shot data where starter status (slot 6) cleanly
-    predicts tau_bin (starters in first half, bench in second half).
-    The starter/bench baseline should win on this data.
+    """Synthetic per-shot data in which starter status (slot 6) determines ``tau_bin``:
+    starters shoot in the first half of the game, bench players in the second.
     """
     g = torch.Generator().manual_seed(seed)
     x = torch.randn(n_shots, CONTEXT_DIM, generator=g)
@@ -70,7 +67,7 @@ def test_starter_bench_baseline_wins_when_starter_perfectly_encodes_timing() -> 
     ctx = ContextMLP(input_dim=CONTEXT_DIM, hidden_dim=32, residual=True)
     diag = compute_timing_calibration(th, ctx, x_train, tau_train, x_val, tau_val)
     bn = diag["baseline_nll_per_shot"]
-    # Starter/bench baseline is the right model for this synthetic process.
+    # The starter/bench baseline matches the generating process.
     assert bn["starter_bench"] < bn["global"]
     assert bn["starter_bench"] < bn["minutes_conditioned"]
     # Optimal NLL for two 24-bin half-uniform distributions is log(24) ≈ 3.18.
@@ -78,9 +75,8 @@ def test_starter_bench_baseline_wins_when_starter_perfectly_encodes_timing() -> 
 
 
 def test_uniform_head_yields_log48_nll() -> None:
-    """A fresh untrained TimingSoftmaxHead is the uniform-bin head, so
-    its per-shot NLL on any tau_bin distribution is exactly ``log(48)``.
-    """
+    """An untrained ``TimingSoftmaxHead`` is uniform over bins, so its per-shot NLL is
+    ``log(48)`` for any ``tau_bin`` distribution."""
     x_val, tau_val = _make_synthetic_per_shot(seed=1)
     x_train, tau_train = _make_synthetic_per_shot()
     th = TimingSoftmaxHead()

@@ -109,7 +109,7 @@ def test_forward_normalizes_to_probabilities(fitted_kde: HierarchicalKDE) -> Non
 def test_forward_matches_kde_product_at_default_init(fitted_kde: HierarchicalKDE) -> None:
     """At default init weights (1.0, 0.3, 0.2), forward must match KDEProduct."""
     log_qp, log_qg, log_ql = _components_for(fitted_kde, "A")
-    m = LearnableKDEProductWeights()  # defaults to v1 baseline
+    m = LearnableKDEProductWeights()  # default KDEProduct weights
     with torch.no_grad():
         log_q0 = (
             m(

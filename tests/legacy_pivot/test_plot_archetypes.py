@@ -1,4 +1,4 @@
-"""Tests for :mod:`scripts.plot_archetypes` —  loaders + new temporal figures.
+"""Tests for ``scripts/legacy_pivot/plot_archetypes.py``: checkpoint loaders and figures.
 
 The figure-rendering helpers are exercised end-to-end on a tiny
 synthetic checkpoint dir to confirm they don't raise; we don't
@@ -17,7 +17,7 @@ matplotlib.use("Agg")  # non-interactive backend for CI
 import numpy as np
 import pytest
 
-# Add repo scripts/ to sys.path so test can import the script as a module.
+# Put scripts/legacy_pivot/ on sys.path so the script can be imported as a module.
 _REPO = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_REPO / "scripts" / "legacy_pivot"))
 sys.path.insert(0, str(_REPO / "scripts"))

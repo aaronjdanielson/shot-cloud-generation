@@ -1,20 +1,15 @@
 """Tests for :func:`shotcloud.models._separable_kernel.separable_gaussian_density`.
 
-The separable kernel is load-bearing for the v1.1 CollaborativeKDE
-refactor — it replaces the dense ``(B, J, n_cells)`` kernel tensor in
-the forward pass. The tests in this module verify that the separable
-form is numerically equivalent to two reference implementations:
+The separable kernel lets :class:`~shotcloud.models.CollaborativeKDE` evaluate grid
+densities without materializing a dense ``(B, J, n_cells)`` kernel tensor. The tests
+check numerical equivalence with two references:
 
-1. A direct dense rank-1 outer product ``K_x ⊗ K_y`` (the algebra the
-   separable form claims to evaluate without materializing).
-2. The full 2-D isotropic-Gaussian softmax over flattened cells (the
-   v1.0 CollaborativeKDE code path), which is mathematically identical
-   because an isotropic Gaussian factors exactly across axes.
+1. A direct dense rank-1 outer product ``K_x ⊗ K_y``.
+2. The per-shot 2-D isotropic-Gaussian softmax over flattened cells, which is
+   identical because an isotropic Gaussian factors exactly across axes.
 
-Equivalence (1) tells us the separable form's bmm-based aggregation is
-faithful to its algebraic specification. Equivalence (2) tells us it is
-swapped in for the v1.0 dense kernel without changing the model — the
-refactor is a pure-speed change, not a re-parameterization.
+They also cover the row-sum invariant, image-layout cell ordering, gradient flow, and
+input validation.
 """
 
 from __future__ import annotations
@@ -67,10 +62,9 @@ def _dense_full2d_reference(
 ) -> torch.Tensor:
     """Per-shot 2-D Gaussian softmax over flattened cells.
 
-    This is the v1.0 CollaborativeKDE code path:
-    ``K = softmax_c(-||c - s||^2 / 2σ²)`` per shot, weighted, summed.
-    For an isotropic Gaussian this must equal the separable form by
-    rank-1 factorization. Returns image-layout ``(B, n_y * n_x)``.
+    Computes ``K = softmax_c(-||c - s||^2 / 2σ²)`` per shot, then the weighted sum over
+    shots. For an isotropic Gaussian this equals the separable form by rank-1
+    factorization. Returns image-layout ``(B, n_y * n_x)``.
     """
     b, j, _ = coords.shape
     nx = int(xcenters.shape[0])
@@ -92,15 +86,15 @@ def _dense_full2d_reference(
 
 
 # ---------------------------------------------------------------------------
-# Equivalence tests — the user-mandated B=2, L=3, R=4, n_x=8, n_y=7 case
+# Equivalence tests at B=2, L=3, R=4, n_x=8, n_y=7
 # ---------------------------------------------------------------------------
 
 
 def _user_spec_inputs(
     seed: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build (coords, weights, sigma, xcenters, ycenters) at the user-mandated
-    test shape ``B=2, L=3, R=4, n_x=8, n_y=7`` with ``J = L*R = 12``."""
+    """Build (coords, weights, sigma, xcenters, ycenters) at shape
+    ``B=2, L=3, R=4, n_x=8, n_y=7`` with ``J = L*R = 12``."""
     rng = np.random.default_rng(seed)
     b, j = 2, 12
     nx, ny = 8, 7
@@ -123,9 +117,8 @@ def _user_spec_inputs(
 def test_matches_dense_separable_reference_on_user_spec_shapes() -> None:
     """``separable_gaussian_density`` matches a direct ``K_x ⊗ K_y`` reference.
 
-    Verifies the bmm-based aggregation is faithful to the algebra it
-    claims to evaluate without materializing the full ``(B, J, n_x, n_y)``
-    tensor — the bottleneck the refactor exists to eliminate.
+    The ``bmm``-based aggregation evaluates the outer product without materializing the
+    ``(B, J, n_x, n_y)`` tensor.
     """
     coords, weights, sigma, xc, yc = _user_spec_inputs()
     got = separable_gaussian_density(coords, weights, sigma, xc, yc)
@@ -134,12 +127,10 @@ def test_matches_dense_separable_reference_on_user_spec_shapes() -> None:
 
 
 def test_matches_full_2d_softmax_reference_on_user_spec_shapes() -> None:
-    """Equals the v1.0 per-shot 2-D Gaussian-softmax kernel.
+    """``separable_gaussian_density`` matches the per-shot 2-D Gaussian softmax.
 
-    The isotropic Gaussian factors exactly across (x, y); per-axis
-    normalization is therefore equivalent to per-shot 2-D normalization.
-    A mismatch here would mean the refactor is not algebraically
-    identical to the v1.0 forward — a re-parameterization, not a speed-up.
+    The isotropic Gaussian factors exactly across (x, y), so per-axis normalization
+    equals per-shot 2-D normalization.
     """
     coords, weights, sigma, xc, yc = _user_spec_inputs()
     got = separable_gaussian_density(coords, weights, sigma, xc, yc)
@@ -148,7 +139,7 @@ def test_matches_full_2d_softmax_reference_on_user_spec_shapes() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Behavior under varying shapes (sanity beyond the user-spec case)
+# Behavior under varying shapes
 # ---------------------------------------------------------------------------
 
 
@@ -201,9 +192,8 @@ def test_per_batch_sum_equals_sum_of_weights() -> None:
 
 
 def test_single_shot_peaks_at_nearest_cell_in_image_layout() -> None:
-    """A single shot placed exactly at one (x_center, y_center) should
-    produce its largest density at the flat index ``c = iy*nx + ix``
-    matching that cell. Verifies image-layout C-ravel ordering."""
+    """A single shot at a cell center peaks at flat index ``c = iy*nx + ix``
+    (image-layout C-order ravel)."""
     nx, ny = 8, 7
     xcenters = torch.linspace(-15.0, 15.0, nx, dtype=torch.float32)
     ycenters = torch.linspace(-3.0, 30.0, ny, dtype=torch.float32)
@@ -229,9 +219,7 @@ def test_single_shot_peaks_at_nearest_cell_in_image_layout() -> None:
 
 
 def test_gradient_flows_to_coords_weights_and_sigma() -> None:
-    """All three of ``coords``, ``weights``, ``sigma`` should receive a
-    gradient — they parameterize the density, so a downstream loss must
-    feed back to each."""
+    """``coords``, ``weights`` and ``sigma`` all receive gradients."""
     coords, weights, sigma, xc, yc = _user_spec_inputs()
     coords = coords.clone().requires_grad_(True)
     weights = weights.clone().requires_grad_(True)

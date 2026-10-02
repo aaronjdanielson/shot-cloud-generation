@@ -151,10 +151,11 @@ def test_forward_shape_and_finiteness() -> None:
 
 
 def test_gradient_flows_to_all_modules() -> None:
-    """Gradients flow into the underlying collab params, the
-    mode-bias MLP of the default soft-k-means extractor, and the
-    residual encoder (location-embedding is non-zero init so R_θ has
-    nonzero scale)."""
+    """Gradients reach the collaborative KDE, the soft-k-means mode-bias MLP, and the residual.
+
+    The location embedding is built with ``zero_init=False`` so the residual
+    term is non-zero and its encoder receives gradient.
+    """
     setup = _build_setup()
     residual = ContextResidualEncoder(rank=4, within_game_dim=0)
     loc = LocationEmbedding(rank=4, zero_init=False)
@@ -175,8 +176,7 @@ def test_gradient_flows_to_all_modules() -> None:
 
 
 def test_learned_query_extractor_gradient_flows() -> None:
-    """The legacy ``extractor_kind='learned_query'`` path stays
-    available and its learnable pieces still receive gradient."""
+    """With ``extractor_kind='learned_query'``, the extractor's parameters receive gradient."""
     setup = _build_setup()
     spatial = CollaborativeModeMixtureSpatial(
         offensive_prior=setup["collab"],  # type: ignore[arg-type]
@@ -249,10 +249,10 @@ def test_residual_on_off_match_at_step_zero_when_loc_is_zero_init() -> None:
 
 
 def test_tail_weight_zero_matches_pure_mode_log_lik() -> None:
-    """``tail_weight = 0`` (default) reproduces the pure-mode log-lik
-    exactly. This is the back-compat guarantee — adding the
-    strengthened-model support-tail option doesn't disturb the v1
-    mode_mixture behavior unless explicitly enabled."""
+    """A positive ``tail_weight`` changes the log-likelihood of the default pure mode mixture.
+
+    With ``tail_weight = 0`` (the default) the support tail is disabled.
+    """
     setup = _build_setup()
     torch.manual_seed(0)
     spatial_no_tail = CollaborativeModeMixtureSpatial(
@@ -273,9 +273,7 @@ def test_tail_weight_zero_matches_pure_mode_log_lik() -> None:
 
 
 def test_tail_weight_provides_density_lower_bound() -> None:
-    """Per the spec §7 proposition: for any observed y,
-    f_Θ(y) ≥ λ_tail · f_support(y). Verified by comparing the
-    full mixture log-lik to the support-only log-lik scaled by λ_tail."""
+    """The support tail bounds the density below: ``f_Θ(y) ≥ λ_tail · f_support(y)``."""
     from shotcloud.training.spatial_losses import continuous_mixture_loglik
 
     setup = _build_setup()
@@ -319,10 +317,11 @@ def test_tail_weight_rejects_out_of_range() -> None:
 
 
 def test_lambda_omega_threads_through_wrapper() -> None:
-    """``lambda_omega`` is meaningful only for the legacy learned-query
-    extractor (the soft-k-means path uses ω in the mean-shift kernel
-    directly, not as a logit bias). Verify the kwarg still flows
-    through when that extractor is selected."""
+    """``lambda_omega`` reaches the learned-query extractor.
+
+    Only that extractor uses it, as a logit bias; the soft-k-means extractor
+    uses ω directly in its mean-shift kernel.
+    """
     setup = _build_setup()
     spatial = CollaborativeModeMixtureSpatial(
         offensive_prior=setup["collab"],  # type: ignore[arg-type]
@@ -333,8 +332,8 @@ def test_lambda_omega_threads_through_wrapper() -> None:
 
 
 def test_extractor_kind_dispatch() -> None:
-    """The default extractor is soft-k-means; passing
-    ``extractor_kind='learned_query'`` selects the legacy module."""
+    """The default extractor is soft-k-means; ``extractor_kind='learned_query'`` selects
+    :class:`~shotcloud.models.mode_extractor.SupportModeExtractor`."""
     from shotcloud.models.mode_extractor import SupportModeExtractor
     from shotcloud.models.soft_kmeans_extractor import SoftKMeansModeExtractor
 

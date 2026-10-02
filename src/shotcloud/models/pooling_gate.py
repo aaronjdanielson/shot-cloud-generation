@@ -77,7 +77,7 @@ class PoolingGate(nn.Module):
     bh_init : float, default :data:`DEFAULT_GATE_BH_INIT`
         Initial value of the pre-softplus slope parameter. The
         effective slope is ``softplus(b_H) ≥ 0``, so ``λ`` is
-        monotone non-decreasing in the own-history count for every
+        monotone non-decreasing in the own-history volume for every
         value this parameter can take during training.
     """
 
@@ -187,7 +187,7 @@ class PoolingGate(nn.Module):
         return lam
 
     def history_schedule(self, h_hat: float) -> float:
-        """Return ``λ`` at own-history count ``h_hat`` with ``g_θ = 0``.
+        """Return ``λ`` at own-history volume ``h_hat`` with ``g_θ = 0``.
 
         This is the gate's schedule at initialization, when the ``g_θ``
         output layer is zero.

@@ -1,20 +1,8 @@
-"""Tests for :class:`shotcloud.models.TimingSoftmaxHead` (paper §5).
+"""Tests for :class:`shotcloud.models.TimingSoftmaxHead`, the 48-bin timing factor.
 
-Load-bearing invariants:
-
-1. **Shape contract.** Forward returns ``(B, n_bins)`` log-probs
-   (rows sum to 0 in exp space). ``log_prob(t_bin, x_n)`` returns
-   ``(B,)``.
-2. **Zero-init invariant.** With ``zero_init_residual=True`` (default)
-   and ``a(t) = 0``, the timing distribution is uniform at step 0.
-3. **Baseline-only at step 0.** With ``zero_init_residual=True`` but
-   ``a(t)`` nonzero, the distribution at step 0 equals
-   ``softmax(a(t))`` regardless of ``x_n``.
-4. **Gradient flow.** Both the baseline and the residual MLP weights
-   receive nonzero gradients from log-likelihood.
-5. **No `player_idx` parameter.** Context-only by design.
-6. **Validation.** Invalid ``n_bins``, ``context_dim``, ``hidden_dim``
-   raise; out-of-range ``t_bin`` indexing surfaces clearly.
+Covers normalized ``(B, n_bins)`` log-probabilities, the zero-initialized residual
+(uniform at initialization, or ``softmax(a(t))`` for a nonzero baseline), gradient
+flow, the context-only signature, and input validation.
 """
 
 from __future__ import annotations
@@ -38,10 +26,10 @@ def test_forward_shape_and_normalization() -> None:
 
 
 def test_zero_init_gives_uniform_distribution() -> None:
-    """At step 0 with zero_init_residual=True and a(t)=0, the
-    distribution is uniform across bins regardless of x_n."""
+    """With ``zero_init_residual=True`` and ``a(t) = 0`` the distribution is uniform
+    for any ``x_n``."""
     head = TimingSoftmaxHead(zero_init_residual=True)
-    # Confirm both factors are zero at init.
+    # Both the baseline and the residual output layer start at zero.
     assert torch.equal(head.bin_baseline, torch.zeros_like(head.bin_baseline))
     assert torch.equal(head.fc2.weight, torch.zeros_like(head.fc2.weight))
     assert torch.equal(head.fc2.bias, torch.zeros_like(head.fc2.bias))
@@ -53,8 +41,7 @@ def test_zero_init_gives_uniform_distribution() -> None:
 
 
 def test_baseline_only_when_residual_is_zero() -> None:
-    """When the residual is zero-init, the per-row distribution
-    equals softmax(a(t)) regardless of x_n."""
+    """With a zero-initialized residual every row equals ``softmax(a(t))``."""
     head = TimingSoftmaxHead(zero_init_residual=True)
     # Set a(t) to a structured non-uniform pattern.
     with torch.no_grad():
@@ -70,8 +57,8 @@ def test_baseline_only_when_residual_is_zero() -> None:
 
 
 def test_random_init_residual_gives_context_dependent_output() -> None:
-    """With zero_init_residual=False, two different x_n produce
-    different log-probabilities."""
+    """With ``zero_init_residual=False``, different ``x_n`` give different
+    log-probabilities."""
     head = TimingSoftmaxHead(zero_init_residual=False)
     x_a = torch.randn(1, CONTEXT_DIM) * 5
     x_b = -x_a
@@ -111,27 +98,23 @@ def test_gradient_flows_to_baseline_and_residual() -> None:
 
 
 def test_zero_init_residual_baseline_grad_only_at_init() -> None:
-    """With zero_init residual, the residual MLP's *output* is zero at
-    step 0 — so the residual's contribution to the gradient passes
-    through fc2.weight via x_n's hidden activations. Gradient should
-    flow to both baseline AND fc2.weight on the first step."""
+    """With a zero-initialized residual, the first backward pass reaches both the
+    baseline and ``fc2.weight`` (through the nonzero hidden activations)."""
     head = TimingSoftmaxHead(zero_init_residual=True)
     x_n = torch.randn(8, CONTEXT_DIM)
     t_bin = torch.randint(0, 48, (8,), dtype=torch.long)
     nll = -head.log_prob(t_bin, x_n).mean()
     nll.backward()
-    # Baseline grad: yes (this is the only signal that moves the
-    # distribution at step 0).
+    # The baseline is the only term that moves the distribution at initialization.
     assert head.bin_baseline.grad is not None
     assert head.bin_baseline.grad.abs().sum().item() > 0
-    # fc2.weight grad: nonzero — the cross-entropy gradient at step 0
-    # depends on the hidden activation, which is nonzero.
+    # fc2.weight's gradient is proportional to the nonzero hidden activations.
     assert head.fc2.weight.grad is not None
     assert head.fc2.weight.grad.abs().sum().item() > 0
 
 
 def test_no_player_idx_in_signature() -> None:
-    """Architectural check: the timing head is context-only by design."""
+    """``forward`` takes only ``x_n``: the timing head is context-only."""
     sig = inspect.signature(TimingSoftmaxHead.forward)
     params = set(sig.parameters.keys())
     assert "player_idx" not in params

@@ -1,4 +1,4 @@
-"""Tests for :mod:`shotcloud.training.checkpoint`."""
+"""Tests for :mod:`shotcloud.legacy_pivot.checkpoint`."""
 
 from __future__ import annotations
 

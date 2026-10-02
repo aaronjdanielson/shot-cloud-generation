@@ -1,7 +1,5 @@
 """Tests for :func:`shotcloud.data.prior_outcomes.compute_prior_outcome_features`
 and the outcome branch of :class:`shotcloud.models.ContextResidualEncoder`.
-
-Phase 2 of the 2026-06-07 audit.
 """
 
 from __future__ import annotations
@@ -83,7 +81,7 @@ def test_recent_make_rate_window() -> None:
 
 
 def test_recent_dist_mean_normalized() -> None:
-    """Sanity-check the distance-mean slot stays in a reasonable range."""
+    """``recent_dist_mean`` is the mean distance of recent prior shots divided by 35 ft."""
     df = _hand_checkable_df()
     out = compute_prior_outcome_features(df)
     dist_idx = PRIOR_OUTCOME_FEATURE_NAMES.index("recent_dist_mean")
@@ -112,7 +110,7 @@ def test_empty_df_returns_empty_array() -> None:
 
 
 def test_multiple_player_games_independent() -> None:
-    """Cross-group counts must NOT leak between (player, game) groups."""
+    """Counts do not leak between (player, game) groups."""
     df = pd.DataFrame(
         {
             "x": [0.0, 0.0, 22.0, 22.0],
@@ -124,7 +122,7 @@ def test_multiple_player_games_independent() -> None:
         }
     )
     out = compute_prior_outcome_features(df)
-    # Both group's first shot must be all-zero (no prior shots in OWN group).
+    # Each group's first shot is all-zero (no earlier shots in its own group).
     np.testing.assert_array_equal(out[0], np.zeros(PRIOR_OUTCOME_DIM, dtype=np.float32))
     np.testing.assert_array_equal(out[2], np.zeros(PRIOR_OUTCOME_DIM, dtype=np.float32))
     # Group 2's second shot's FGA log1p = log1p(1) — not 2 (no leak from group 1).
@@ -133,10 +131,8 @@ def test_multiple_player_games_independent() -> None:
 
 
 def test_outcome_branch_zero_init_invariance() -> None:
-    """At init, the outcome branch contributes zero to the residual
-    regardless of the outcome input. Mirrors the existing usage-branch
-    contract — preserves AC-KDE's zero-init invariant.
-    """
+    """At initialization the outcome branch contributes zero to the residual for any
+    outcome input, like the usage branch."""
     torch.manual_seed(0)
     enc = ContextResidualEncoder(
         rank=8, context_dim=CONTEXT_DIM, within_game_dim=10, usage_dim=3, outcome_dim=9

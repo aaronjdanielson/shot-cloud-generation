@@ -1,17 +1,15 @@
-"""Tests for ``shotcloud.models._support_pool``.
+"""Tests for :mod:`shotcloud.models._support_pool`.
 
-The collaborative-KDE v1.1 refactor replaces four per-player padded
-``(n_players, max_R, *)`` buffers with a single :class:`GlobalSupportPool`
-plus an int64 :class:`PerPlayerSupportIndex`. These tests verify:
+:class:`GlobalSupportPool` stores every support shot once and
+:class:`PerPlayerSupportIndex` maps each player to rows of the pool. The tests check
+that:
 
-* The builder concatenates per-player histories without losing or
-  reordering shots.
-* Gathered ``(coords, context, dates)`` per player match the original
-  :class:`AdaptiveKDE` arrays element-for-element — the new layout is
-  a re-shape, not a re-fit.
-* Padding semantics: short-history players get ``-1`` tail entries;
-  players absent from ``AdaptiveKDE`` get an all-``-1`` row.
-* Input validation rejects malformed pools / indices.
+* the builder concatenates per-player histories without losing or reordering shots;
+* gathered ``(coords, context, dates)`` per player match the source
+  :class:`AdaptiveKDE` arrays element for element;
+* short-history players get ``-1`` tail entries and players absent from the
+  ``AdaptiveKDE`` get an all-``-1`` row;
+* malformed pools and indices are rejected.
 """
 
 from __future__ import annotations
@@ -103,10 +101,8 @@ def test_pool_shapes_match_total_shots_and_context_dim() -> None:
 
 
 def test_gathered_per_player_matches_adaptive_kde() -> None:
-    """For every player in ``vocab``, gather coords/context/dates by
-    their pool index and compare against the original AdaptiveKDE
-    per-player arrays. The pool is a flat re-shape, not a re-fit.
-    """
+    """Coords, context and dates gathered through each player's index equal the
+    ``AdaptiveKDE`` per-player arrays."""
     akde, _shots, _enc = _fit_adaptive_kde()
     vocab = PlayerVocab.from_ids(akde.players)
     pool, idx = build_support_pool_from_adaptive_kde(akde, vocab)
@@ -139,8 +135,7 @@ def test_gathered_per_player_matches_adaptive_kde() -> None:
 
 
 def test_pad_rows_for_short_history_player_have_minus_one_tail() -> None:
-    """A player with fewer shots than ``max_R`` should have ``-1`` in
-    the trailing slots; the rest hold valid pool ids."""
+    """A player with fewer shots than ``max_R`` has valid pool ids followed by ``-1``."""
     akde, _shots, _enc = _fit_adaptive_kde(shots_per_player=(5, 12, 1, 8))
     vocab = PlayerVocab.from_ids(akde.players)
     _pool, idx = build_support_pool_from_adaptive_kde(akde, vocab)
@@ -154,8 +149,7 @@ def test_pad_rows_for_short_history_player_have_minus_one_tail() -> None:
 
 
 def test_player_missing_from_adaptive_kde_gets_all_minus_one_row() -> None:
-    """Add an extra id to ``vocab`` that wasn't in the fit; its index
-    row should be all ``-1`` and ``real_mask`` should mark zero shots."""
+    """A vocabulary id absent from the fit gets an all-``-1`` row and no real shots."""
     akde, _shots, _enc = _fit_adaptive_kde()
     extra_ids = [*akde.players, 999]
     vocab = PlayerVocab.from_ids(extra_ids)

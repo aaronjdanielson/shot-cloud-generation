@@ -1,15 +1,9 @@
-"""Tests for ``shotcloud.models.location_embedding.LocationEmbedding``.
+"""Tests for :class:`shotcloud.models.location_embedding.LocationEmbedding`.
 
-Load-bearing invariants:
-
-* **Zero-init.** With ``zero_init=True`` (default) ``ψ(s) ≡ 0`` at
-  step 0 for any coordinate — preserves the V=0 / dual-saddle pattern.
-* **Differentiable.** Gradient flows to both the proj weights and
-  the input coordinates.
-* **Shape preservation.** ``(..., 2) → (..., rank)`` for any leading
-  batch shape.
-* **Fourier features actually fire** once the projection is perturbed
-  off zero — distinct coordinates produce distinct embeddings.
+Covers the zero-initialized projection (``ψ(s) ≡ 0`` at initialization, so the residual
+tilt starts at zero), gradient flow to the projection and the input coordinates,
+``(..., 2) → (..., rank)`` shape handling, and distinct embeddings for distinct
+coordinates once the projection is nonzero.
 """
 
 from __future__ import annotations
@@ -43,9 +37,8 @@ def test_output_shape_supports_arbitrary_leading_batch_shape() -> None:
 
 
 def test_distinct_coords_produce_distinct_embeddings_when_proj_nonzero() -> None:
-    """With non-zero projection weights, two distinct coordinates
-    should map to distinct embeddings. Verifies the Fourier-feature
-    bank is actually carrying spatial information into the projection."""
+    """With nonzero projection weights, distinct coordinates map to distinct
+    embeddings."""
     enc = LocationEmbedding(rank=8, zero_init=False)
     a = torch.tensor([[0.0, 5.0]])
     b = torch.tensor([[10.0, 20.0]])
@@ -64,8 +57,8 @@ def test_gradient_flows_to_proj_and_input_coords() -> None:
 
 
 def test_n_frequencies_zero_skips_fourier_features() -> None:
-    """``n_frequencies=0`` falls back to the linear (x_norm, y_norm)
-    projection. Useful as an ablation: pure-linear residual basis."""
+    """``n_frequencies=0`` reduces the embedding to a linear projection of
+    ``(x_norm, y_norm)``."""
     enc = LocationEmbedding(rank=4, n_frequencies=0, zero_init=False)
     # Raw feature dim is 2 (just linear x/y).
     assert enc.proj.in_features == 2
@@ -90,10 +83,10 @@ def test_rejects_wrong_last_dim() -> None:
 
 
 def test_normalization_brings_court_extent_close_to_unit_box() -> None:
-    """Heuristic check that x_scale=25 / y_scale=26 puts court coords
-    in roughly [-1, 1] before Fourier featurization. This matters for
-    the frequency choice — wavelengths are interpreted in the
-    normalized space."""
+    """The default scales map the court to ``|x_norm| ≤ 1`` and ``|y_norm| ≤ 47/26``.
+
+    Fourier wavelengths are defined in this normalized space.
+    """
     enc = LocationEmbedding(rank=4, zero_init=False)
     corners = torch.tensor([[-25.0, -5.0], [25.0, 47.0]])
     x_norm = corners[..., 0] / enc.x_scale

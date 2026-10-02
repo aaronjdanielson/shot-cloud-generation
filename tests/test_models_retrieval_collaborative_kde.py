@@ -1,31 +1,11 @@
-"""Tests for :class:`shotcloud.models.RetrievalCollaborativeKDE`.
+"""Tests for :class:`shotcloud.models.RetrievalCollaborativeKDE`, the retrieval support
+backend.
 
-PR3.2 acceptance criteria:
-
-1. Forward returns a :class:`CollaborativeContinuousOutputs` with the
-   correct shapes for the retrieval support layout (M = own_max +
-   pooled_max).
-2. ``own_mask`` agrees with the cache's ``own_mask`` (concatenated
-   into the ``(B, M)`` slot layout — True only on the own block).
-3. ``support_mask = own_mask | pooled_mask`` (no overlap because the
-   cache enforces disjointness by construction).
-4. Padded slots (cache index ``-1``) produce ``support_mask = False``.
-5. Gradient flows to all learnable parameters (``b_same``,
-   ``lambda_age``, ``a_0``/``a_M``/``a_S``/``a_R``, ``phi``,
-   ``f_x``/``h_z`` for bilinear).
-6. Step-0 σ equals ``sigma_init`` (a_M, a_S init to large negative so
-   softplus ≈ 0).
-7. The :class:`ContinuousMixtureSpatial` wrapper consumes the
-   retrieval backend without change.
-8. The pooling gate works under retrieval (``own_mask`` is the
-   backend-agnostic field; the wrapper does not branch on backend).
-9. ``train_gibbs`` accepts ``RetrievalCollaborativeKDE`` as
-   offensive_prior with ``spatial_likelihood='continuous_mixture'``
-   and produces finite loss after one epoch.
-10. ``train_gibbs`` rejects ``RetrievalCollaborativeKDE +
-    spatial_likelihood='mode_mixture'`` with an explicit
-    ``NotImplementedError`` (the mode-mixture variant has not been
-    ported to the retrieval support layout).
+Covers output shapes for the ``M = own_max + pooled_max`` slot layout, agreement of
+``own_mask`` / ``support_mask`` with the retrieval cache, padding, shooter identity on
+the own and pooled blocks, values at initialization, gradient flow, use under
+:class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial` with and
+without a pooling gate, ``train_gibbs`` integration, and construction checks.
 """
 
 from __future__ import annotations
@@ -58,9 +38,9 @@ def _build_setup(
     pooled_recency_window_days: int = 365,
     seed: int = 0,
 ) -> dict[str, object]:
-    """Synthetic fixture parallel to ``test_models_continuous_mixture_spatial._build_setup``
-    but with a retrieval cache + RetrievalCollaborativeKDE in place of
-    the L×R CollaborativeKDE."""
+    """Synthetic fixture mirroring ``test_models_continuous_mixture_spatial._build_setup``,
+    with a retrieval cache and ``RetrievalCollaborativeKDE`` in place of the
+    analogue-based ``CollaborativeKDE``."""
     rng = np.random.default_rng(seed)
     grid = CourtGrid(xlim=(-25.0, 25.0), ylim=(-5.0, 47.0), nx=14, ny=12)
     base_date = pd.Timestamp("2024-01-01")
@@ -82,9 +62,8 @@ def _build_setup(
                 }
             )
     shots = pd.DataFrame(rows)
-    # Mid-window anchor: leaves enough causal history per player for
-    # the cache to populate AND post-anchor shots for the GibbsShotDataset
-    # smoke trainer test.
+    # A mid-window anchor leaves causal history for the cache and post-anchor shots
+    # for the GibbsShotDataset used in the trainer tests.
     anchors = [np.datetime64("2024-01-15", "D")]
     store = build_snapshot_store_from_shots(
         shots,
@@ -207,7 +186,7 @@ def test_forward_returns_collaborative_continuous_outputs_with_correct_shapes() 
     assert out.own_mask.shape == (b, m)
     assert out.support_shooter.shape == (b, m)
     assert out.sigma.shape == (b,)
-    # Retrieval backend produces empty-L diagnostic tensors.
+    # The retrieval backend has no analogue axis, so these diagnostics are empty.
     assert out.analogue_idx.shape == (b, 0)
     assert out.alpha_scores.shape == (b, 0)
     # Dtypes.
@@ -230,9 +209,8 @@ def test_m_equals_own_plus_pooled_caps() -> None:
 
 
 def test_own_mask_matches_cache_own_block() -> None:
-    """own_mask in the (B, M) slot layout is exactly the cache's
-    per-player own_mask gathered for the batch's (player_idx,
-    snapshot_idx) and concatenated with False on the pooled block."""
+    """``own_mask`` equals the cache's own mask for each (player, snapshot) on the own
+    block and is False on the pooled block."""
     setup = _build_setup()
     kde: RetrievalCollaborativeKDE = setup["kde"]  # type: ignore[assignment]
     cache = setup["cache"]
@@ -249,8 +227,8 @@ def test_own_mask_matches_cache_own_block() -> None:
 
 
 def test_support_mask_is_own_or_pooled_block() -> None:
-    """support_mask = (own block from cache.own_mask) ∪ (pooled block
-    from cache.pooled_mask). The two blocks are disjoint by layout."""
+    """``support_mask`` is the cache's own mask on the own block and its pooled mask on
+    the pooled block."""
     setup = _build_setup()
     kde: RetrievalCollaborativeKDE = setup["kde"]  # type: ignore[assignment]
     cache = setup["cache"]
@@ -269,11 +247,9 @@ def test_support_mask_is_own_or_pooled_block() -> None:
 
 
 def test_padded_slots_have_false_support_mask() -> None:
-    """A small own/pooled cap that exceeds available causal shots
-    leaves trailing slots padded (-1 indices, False masks). Verify
-    no padded slot leaks through support_mask."""
-    # Cap larger than available causal own-history per player; the
-    # synthetic fixture gives ~35 own shots per player, so set cap=64.
+    """Caps larger than the causal history leave padded slots, all with
+    ``support_mask = False``."""
+    # The fixture has at most 35 shots per player, so cap 64 forces padding.
     setup = _build_setup(own_support_max=64, pooled_support_max=64)
     kde: RetrievalCollaborativeKDE = setup["kde"]  # type: ignore[assignment]
     cache = setup["cache"]
@@ -282,7 +258,7 @@ def test_padded_slots_have_false_support_mask() -> None:
         out = kde.forward_continuous(
             batch["player_idx"], batch["snapshot_idx"], batch["x_n_raw"], batch["x_n"]
         )
-    # The cache must have some -1 slots given cap >> shots/player.
+    # The cache has -1 slots because the cap exceeds the history.
     own_idx_b = cache.own_idx[batch["player_idx"], batch["snapshot_idx"]]  # type: ignore[attr-defined]
     assert (own_idx_b == -1).any().item(), "expected some -1 padding in own_idx"
     # Every padded slot maps to support_mask=False.
@@ -291,9 +267,7 @@ def test_padded_slots_have_false_support_mask() -> None:
 
 
 def test_pooled_block_shooters_are_not_target_player() -> None:
-    """Pooled retrieval excludes the target player; verify the per-slot
-    shooter identity respects that on the pooled block where the mask
-    is True."""
+    """No valid pooled slot holds a shot by the target player."""
     setup = _build_setup()
     kde: RetrievalCollaborativeKDE = setup["kde"]  # type: ignore[assignment]
     batch = _batch(setup, n_batch=4)
@@ -315,7 +289,7 @@ def test_pooled_block_shooters_are_not_target_player() -> None:
 
 
 def test_own_block_shooters_are_target_player_only() -> None:
-    """On the own block, valid slots must point at the target shooter."""
+    """Every valid own slot holds a shot by the target player."""
     setup = _build_setup()
     kde: RetrievalCollaborativeKDE = setup["kde"]  # type: ignore[assignment]
     batch = _batch(setup, n_batch=4)
@@ -335,14 +309,16 @@ def test_own_block_shooters_are_target_player_only() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Step-0 invariants
+# Values at initialization
 # ---------------------------------------------------------------------------
 
 
 def test_step0_sigma_equals_init() -> None:
-    """At step 0 (a_M, a_S init = -10 so softplus ≈ 0), σ = sigma_init.
-    Tolerance accommodates the residual softplus(-10) ≈ 4.5e-5 from the
-    evidence terms (same convention as CollaborativeKDE)."""
+    """At initialization ``σ`` equals ``sigma_init``.
+
+    ``a_M`` and ``a_S`` start at -10, so the evidence terms contribute only
+    ``softplus(-10) ≈ 4.5e-5``, which the tolerance absorbs.
+    """
     setup = _build_setup()
     kde: RetrievalCollaborativeKDE = setup["kde"]  # type: ignore[assignment]
     batch = _batch(setup, n_batch=3)
@@ -354,12 +330,13 @@ def test_step0_sigma_equals_init() -> None:
 
 
 def test_step0_support_logits_equal_b_same_on_own_block_only() -> None:
-    """At step 0, phi output layer is zero-init and h_z output layer is
-    zero-init (bilinear default) → A and B contribute 0; the only
-    score signal is ``b_same * is_self`` plus the recency term
-    ``-lambda_age * Δt`` (lambda_age init = 0). So support_logits are
-    zero everywhere when b_same=0, and exactly ``b_same`` on own slots
-    when b_same > 0 (with lambda_age held at 0)."""
+    """At initialization all support logits are zero.
+
+    The ``phi`` and ``h_z`` output layers are zero-initialized, so the shooter-similarity
+    and shot-attention terms vanish; ``b_same`` and ``lambda_age`` start at 0, so
+    the same-player and recency terms vanish too. A nonzero ``b_same`` would add
+    exactly ``b_same`` on own slots.
+    """
     setup = _build_setup()
     kde: RetrievalCollaborativeKDE = setup["kde"]  # type: ignore[assignment]
     batch = _batch(setup, n_batch=3)
@@ -367,8 +344,6 @@ def test_step0_support_logits_equal_b_same_on_own_block_only() -> None:
         out = kde.forward_continuous(
             batch["player_idx"], batch["snapshot_idx"], batch["x_n_raw"], batch["x_n"]
         )
-    # b_same default is 0 → all logits are 0 at step 0 (the recency
-    # term is also 0 because lambda_age init = 0).
     torch.testing.assert_close(out.support_logits, torch.zeros_like(out.support_logits))
 
 
@@ -398,8 +373,7 @@ def test_gradient_flows_to_all_learnable_params(form: str) -> None:
     out = kde.forward_continuous(
         batch["player_idx"], batch["snapshot_idx"], batch["x_n_raw"], batch["x_n"]
     )
-    # Mask invalid slots and take a simple loss over the support
-    # logits + sigma so every learnable param is reachable.
+    # A loss over the masked support logits and σ reaches every learnable parameter.
     masked_logits = out.support_logits.masked_fill(~out.support_mask, 0.0)
     loss = masked_logits.sum() + out.sigma.sum()
     loss.backward()
@@ -409,9 +383,8 @@ def test_gradient_flows_to_all_learnable_params(form: str) -> None:
         p = getattr(kde, name)
         assert p.grad is not None, f"{name} has no grad"
 
-    # phi first Linear: gradient tensor allocated. At step 0 the
-    # output-layer zero-init zeros the gradient in expectation
-    # (same convention as the L×R CollaborativeKDE step-0 test).
+    # phi's first layer has a gradient tensor; its values can be zero at initialization
+    # because the output layer is zero-initialized.
     assert kde.phi[0].weight.grad is not None  # type: ignore[union-attr]
 
     # Shot-attention path: gradient tensor allocated.
@@ -423,9 +396,7 @@ def test_gradient_flows_to_all_learnable_params(form: str) -> None:
 
 
 def test_lambda_age_receives_gradient_when_perturbed() -> None:
-    """lambda_age starts at 0 so its gradient at step 0 is zero in
-    expectation through the loss above. Perturb it off zero and verify
-    autograd is not blocked."""
+    """With ``lambda_age`` moved off 0, it receives a nonzero gradient."""
     setup = _build_setup()
     kde: RetrievalCollaborativeKDE = setup["kde"]  # type: ignore[assignment]
     with torch.no_grad():
@@ -446,9 +417,8 @@ def test_lambda_age_receives_gradient_when_perturbed() -> None:
 
 
 def test_wrapper_consumes_retrieval_backend() -> None:
-    """``ContinuousMixtureSpatial`` wraps either backend uniformly.
-    The retrieval backend should produce a finite per-row log-lik
-    via the same forward call (no branching at the wrapper)."""
+    """``ContinuousMixtureSpatial`` accepts the retrieval backend and returns a finite
+    per-row log-lik."""
     from shotcloud.models.continuous_mixture_spatial import (
         ContinuousMixtureOutputs,
         ContinuousMixtureSpatial,
@@ -464,9 +434,8 @@ def test_wrapper_consumes_retrieval_backend() -> None:
 
 
 def test_wrapper_with_pooling_gate_under_retrieval() -> None:
-    """Pooling gate works under retrieval: ``own_mask`` is the
-    backend-agnostic field that drives the gate's own/pooled
-    partition. λ should populate and lie in [0, 1]."""
+    """With the retrieval backend the pooling gate partitions support by ``own_mask``
+    and returns ``λ`` in [0, 1]."""
     from shotcloud.models.continuous_mixture_spatial import ContinuousMixtureSpatial
     from shotcloud.models.pooling_gate import PoolingGate
 
@@ -485,9 +454,8 @@ def test_wrapper_with_pooling_gate_under_retrieval() -> None:
 
 
 def test_wrapper_gate_lambda_one_recovers_own_only_loglik_under_retrieval() -> None:
-    """Forcing λ→1 (huge intercept) makes the gated log-lik equal an
-    own-only continuous-mixture log-lik for the retrieval backend
-    (same invariant as the L×R case)."""
+    """Forcing ``λ → 1`` (huge intercept) makes the gated log-lik equal the own-only
+    continuous-mixture log-lik."""
     from shotcloud.models.continuous_mixture_spatial import ContinuousMixtureSpatial
     from shotcloud.models.pooling_gate import PoolingGate
     from shotcloud.training.spatial_losses import continuous_mixture_loglik
@@ -526,9 +494,8 @@ def test_wrapper_gate_lambda_one_recovers_own_only_loglik_under_retrieval() -> N
 
 
 def test_train_gibbs_continuous_mixture_with_retrieval_backend_runs() -> None:
-    """End-to-end smoke: continuous-mixture trainer with the retrieval
-    backend produces finite NLL after one epoch and supports the
-    pooling gate."""
+    """One epoch of ``train_gibbs`` with the retrieval backend and a pooling gate gives a
+    finite mixture NLL and mean ``λ``."""
     from shotcloud.models import ContextMLP, NegBinCountHead, TimingSoftmaxHead
     from shotcloud.models.pooling_gate import PoolingGate
     from shotcloud.training import GibbsShotDataset, train_gibbs
@@ -570,9 +537,8 @@ def test_train_gibbs_continuous_mixture_with_retrieval_backend_runs() -> None:
 
 
 def test_train_gibbs_rejects_retrieval_with_mode_mixture() -> None:
-    """``RetrievalCollaborativeKDE + mode_mixture`` is not supported;
-    the trainer must raise an explicit ``NotImplementedError`` rather
-    than silently producing a wrong forward."""
+    """``train_gibbs`` raises ``NotImplementedError`` for the retrieval backend with
+    ``spatial_likelihood='mode_mixture'``."""
     from shotcloud.models import ContextMLP, NegBinCountHead, TimingSoftmaxHead
     from shotcloud.training import GibbsShotDataset, train_gibbs
 

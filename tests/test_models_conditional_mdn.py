@@ -1,10 +1,9 @@
 """Unit tests for :class:`shotcloud.models.ConditionalMDN`.
 
-The MDN is the generic-neural conditional-density baseline (paper
-§5.x); these tests pin its output shapes, log-density normalisation,
-sampling court-bound guarantees, and gradient behaviour under NLL
-training. They do not test paper-level claims --- those are in the
-matched-window evaluator scripts.
+The MDN is the generic neural conditional-density baseline (see
+*Baselines* in the paper); these tests pin its output shapes, log-density
+normalisation, court-bounded sampling, and gradient behaviour under NLL
+training.
 """
 
 from __future__ import annotations
@@ -143,16 +142,12 @@ def test_nll_descent_on_synthetic() -> None:
 
 
 def test_default_init_finite_on_court_scale_shots() -> None:
-    """Regression: default init must produce finite log-density and
-    finite gradients on shots drawn at the actual half-court scale
-    (x ∈ [-25, 25], y ∈ [-5, 47]).
+    """The default init gives finite log-densities and gradients on half-court-scale shots.
 
-    The original mu_bias=0 / log_sigma_bias=0 default put initial
-    mu near origin with sigma ~ 1 ft; a shot at (25, 47) then had
-    log-density ~ -200 and gradients on log_sigma ~ 500 per shot,
-    blowing up the optimizer after the first batch (NaN from epoch
-    1 on the full 1.86M-shot run, 2026-06-08). The court-scale init
-    fixes both.
+    Shots span ``x ∈ [-25, 25]``, ``y ∈ [-5, 47]``. Component means start
+    spread across the half-court with ``σ = init_sigma_ft``; means near the
+    origin with σ ≈ 1 ft would give log-densities near -200 and gradients
+    large enough to destabilize the first optimizer step.
     """
     torch.manual_seed(0)
     mdn = ConditionalMDN(input_dim=27, hidden_dim=64, n_components=32)

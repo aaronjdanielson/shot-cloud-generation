@@ -9,13 +9,10 @@ from shotcloud.evaluation.energy_distance import energy_distance
 
 
 def test_identical_clouds_u_stat_is_near_zero() -> None:
-    """U-statistic estimator: when ``x is y``, the result is exactly
-    ``-2 * within_mean / m`` (O(1/m), small for large m). This is the
-    expected behavior after the 2026-06-10 V→U switch (audit fix H1).
+    """The U-statistic estimate for identical clouds is O(1/m) and near zero.
 
-    For a 200-point cloud the magnitude is on the order of the within-
-    sample mean pairwise distance divided by 100 — small enough to
-    treat as ≈ 0 for paper reporting, but technically non-zero.
+    When ``x is y`` the estimate is ``-2 * within_mean / m``; for a 200-point
+    cloud that is the mean pairwise distance divided by 100.
     """
     rng = np.random.default_rng(0)
     x = rng.standard_normal((200, 2)) * 5.0
@@ -27,8 +24,7 @@ def test_identical_clouds_u_stat_is_near_zero() -> None:
 
 
 def test_u_stat_x_equals_x_exact_formula() -> None:
-    """When ``x is y``, the U-statistic energy distance equals
-    ``-2 * U_within / m`` exactly. Regression test for the V→U fix."""
+    """When ``x is y``, the energy distance equals ``-2 * U_within / m`` exactly."""
     rng = np.random.default_rng(42)
     x = rng.standard_normal((50, 2))
     m = x.shape[0]
@@ -43,10 +39,11 @@ def test_u_stat_x_equals_x_exact_formula() -> None:
 
 
 def test_v_stat_would_inflate_relative_to_u() -> None:
-    """Regression test for audit fix H1. The previous V-stat estimator
-    overestimates within-sample distance by a factor of ``(m-1)/m``,
-    biasing the energy distance upward. Verify our U-stat result is
-    LOWER than the would-be V-stat result on a known case.
+    """The estimator is the unbiased U-statistic, not the upward-biased V-statistic.
+
+    The V-statistic underestimates the within-sample mean distances by a
+    factor ``(m-1)/m``, inflating the energy distance by exactly
+    ``V_within_x / (m-1) + V_within_y / (n-1)``.
     """
     rng = np.random.default_rng(3)
     m, n = 20, 25
@@ -87,9 +84,7 @@ def test_increases_with_mean_separation() -> None:
 
 
 def test_negative_unclamped_returns_raw_value() -> None:
-    """For tiny near-identical clouds the U-statistic estimator can
-    be negative. With ``clamp_nonneg=True`` the negative result is
-    clamped to 0; with the default ``False`` it flows through."""
+    """Negative estimates pass through by default and clamp to 0 with ``clamp_nonneg=True``."""
     rng = np.random.default_rng(7)
     x = rng.standard_normal((10, 2))
     y = x.copy()

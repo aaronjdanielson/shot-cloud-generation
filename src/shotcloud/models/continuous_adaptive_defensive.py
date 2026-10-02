@@ -4,8 +4,8 @@
 additive term for the support logits of
 :class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial`
 from a kernel density over the shots opponent :math:`d` allowed strictly
-before the snapshot anchor of the current game. It is an alternative to the zone-level
-reweighting of
+before the snapshot anchor of the current game. It is an alternative to
+the zone-level reweighting of
 :class:`~shotcloud.models.zone_defense_reweighting.ZoneReweightingDefense`,
 evaluated as an ablation.
 

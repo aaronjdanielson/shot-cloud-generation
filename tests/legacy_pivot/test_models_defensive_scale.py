@@ -1,4 +1,4 @@
-"""Tests for :class:`shotcloud.models.LearnableDefensiveScale` (Phase 2)."""
+"""Tests for :class:`shotcloud.legacy_pivot.defensive_scale.LearnableDefensiveScale`."""
 
 from __future__ import annotations
 
@@ -72,7 +72,7 @@ def test_one_parameter_only() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 3 — context-conditioned mode (parallel to LearnableTemperature)
+# Context-conditioned mode (parallel to LearnableTemperature)
 # ---------------------------------------------------------------------------
 
 

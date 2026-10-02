@@ -1,4 +1,8 @@
-"""Tests for :class:`shotcloud.training.ShotCellDataset` + :class:`PlayerVocab`."""
+"""Tests for the legacy shot-cell dataset and player vocabulary.
+
+Covers :class:`shotcloud.legacy_pivot.shot_cell_dataset.ShotCellDataset` and
+:class:`PlayerVocab`.
+"""
 
 from __future__ import annotations
 
@@ -237,7 +241,7 @@ def test_dataset_components_require_kde_product(
 
 
 # ---------------------------------------------------------------------------
-# Defensive caching (Phase 2)
+# Defensive caching
 # ---------------------------------------------------------------------------
 
 
@@ -400,7 +404,7 @@ def test_dataset_getitem_shape_with_defense(
 
 
 # ---------------------------------------------------------------------------
-# Phase 3 — context features
+# Context features
 # ---------------------------------------------------------------------------
 
 

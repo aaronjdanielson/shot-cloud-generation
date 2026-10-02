@@ -1,18 +1,10 @@
-"""PR-D3 — wiring tests for the cell-free defense CLI / manifest /
-save-load / reconstruction path through :mod:`scripts.train_gibbs`.
+"""Tests for the opponent-reweighting wiring in ``scripts/train_gibbs.py``.
 
-Scope: prove the user-facing plumbing works. Numerical / training
-behaviour is covered by the PR-D2b smokes; here we only assert that:
-
-* The CLI accepts the new flags and resolves their defaults.
-* When ``--with-defense`` is on with ``spatial_likelihood=continuous_mixture``
-  the trainer constructs the cell-free defense triple, the manifest
-  records the right fields, and ``modules.pt`` round-trips the
-  defensive field's state.
-* The eval reconstruction path
-  (``plot_learned_density_modes._rebuild_collab_and_spatial``)
-  rebuilds the triple and loads the field's state.
-* The no-defense path is unchanged.
+Covers the defense CLI flags and their defaults, the builder for the continuous
+adaptive defensive field stack (field, allowed-shot cache, features, opponent
+vocabulary, and config hashes), and the inclusion of either kind of defensive field
+in the serialized ``modules.pt`` state. Training behavior is tested in
+``tests/test_training_defense_smoke.py``.
 """
 
 from __future__ import annotations
@@ -33,9 +25,7 @@ import train_gibbs as train_gibbs_script  # type: ignore[import-not-found]
 def _parse(argv: list[str]):
     return train_gibbs_script._parse_args(
         [
-            # Minimal set of required flags so argparse doesn't complain
-            # about missing required args. Most defaults are fine for
-            # CLI-presence tests.
+            # The required flags; every other flag keeps its default.
             "--snapshots",
             "data/snapshots.pt",
             "--shots",
@@ -52,8 +42,7 @@ def _parse(argv: list[str]):
 
 
 def test_cli_exposes_all_defense_flags() -> None:
-    """The full PR-D3 flag set parses with defaults — verifies every
-    `add_argument` for defense made it into the parser."""
+    """Every defense flag is registered and parses to its default."""
     args = _parse([])
     # Boolean + scalar defaults.
     assert args.with_defense is False
@@ -112,10 +101,8 @@ def test_cli_defense_override_values() -> None:
 
 
 def test_build_cellfree_defense_stack_returns_triple_and_hashes() -> None:
-    """The helper that the trainer calls when ``--with-defense`` +
-    ``continuous_mixture`` is selected. Tests with the same synthetic
-    fixture the PR-D2b training-smoke uses (compact, no real-data
-    dependency)."""
+    """``_build_cellfree_defense_stack`` returns a consistent field, cache, features,
+    opponent vocabulary, and 16-character config hashes on a synthetic fixture."""
     import numpy as np
     import pandas as pd
 
@@ -154,11 +141,8 @@ def test_build_cellfree_defense_stack_returns_triple_and_hashes() -> None:
     )
 
     args = _parse(["--with-defense"])
-    args.shots = Path("shots.csv")  # fake path; defensive_shots_fingerprint takes the
-    # actual stat() — provide a real one via a tmp file.
-
-    # Write a tiny temp file just so defensive_shots_fingerprint has a
-    # real stat() to hash.
+    args.shots = Path("shots.csv")
+    # defensive_shots_fingerprint hashes the file's stat(), so point it at a real file.
     import tempfile
 
     with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
@@ -186,45 +170,33 @@ def test_build_cellfree_defense_stack_returns_triple_and_hashes() -> None:
 
 
 def test_no_defense_path_unchanged_in_cli() -> None:
-    """A canonical no-defense invocation parses without touching any
-    of the new flags — verifies we didn't accidentally make them
-    required."""
+    """A no-defense invocation parses without any defense flags (none is required)."""
     args = _parse([])  # no --with-defense
     # Defense kwargs all carry their defaults.
     assert args.with_defense is False
-    # The new flags exist as parsed attributes but are untouched.
+    # The defense attributes exist and keep their defaults.
     assert args.defensive_support_max == 1000
     assert args.lambda_defense == pytest.approx(1e-4)
 
 
 # ---------------------------------------------------------------------------
-# Regression: cell-free defensive field must be saved to modules.pt
+# Serialization of the defensive field in modules.pt
 # ---------------------------------------------------------------------------
 
 
 def test_build_modules_state_includes_cellfree_defensive_field() -> None:
-    """**Regression for the 2026-05-27 modules.pt save bug.**
+    """``_build_modules_state`` saves a continuous-path defensive field under
+    ``defensive_field`` with its trained parameters.
 
-    Before the fix, the script's final save block keyed off the
-    grid-side ``defensive_field`` variable only, so cell-free
-    defense modules (D-field's ContinuousAdaptiveDefensiveField and
-    D-lite's ZoneReweightingDefense) were silently *not* included
-    in ``modules.pt``. Eval reconstruction would then load the
-    field at its init parameters (β_D ≈ 1e-3), evaluating the
-    model as if defense were disabled while the rest of the
-    modules were tuned in its presence — silently corrupting
-    every cell-free cloud-metric comparison.
-
-    The helper :func:`scripts.train_gibbs._build_modules_state`
-    must include ``defensive_field`` whenever either kind of
-    defensive field is wired.
+    Without it, evaluation would rebuild the field at its initial ``β_D`` and score
+    the model as if defense were disabled.
     """
     import torch
     from torch import nn
 
     from shotcloud.models.zone_defense_reweighting import ZoneReweightingDefense
 
-    # Minimal trivially-instantiable stubs for the wrapper inputs.
+    # Stand-in modules for the other inputs.
     op = nn.Linear(1, 1)
     ch = nn.Linear(1, 1)
     th = nn.Linear(1, 1)
@@ -247,16 +219,16 @@ def test_build_modules_state_includes_cellfree_defensive_field() -> None:
         "cellfree_defensive_field state must be included in modules.pt under "
         "the 'defensive_field' key"
     )
-    # The serialized state must carry the trained scalar, not just the init.
+    # The saved state carries the current β_D, not the initial value.
     saved_beta = state["defensive_field"]["beta_D"]
     assert torch.isclose(saved_beta, torch.tensor(0.5))
 
 
 def test_build_modules_state_no_defense_omits_defensive_field() -> None:
-    """No-defense runs must NOT carry a ``defensive_field`` key —
-    eval reconstruction's "defense wired?" gate keys off
-    ``manifest.defensive_features_hash``, and a stray
-    ``defensive_field`` in state would confuse downstream consumers.
+    """Without a defensive field the state has no ``defensive_field`` key.
+
+    Evaluation decides whether defense is wired from
+    ``manifest.defensive_features_hash``; a stray key would contradict it.
     """
     from torch import nn
 
@@ -276,9 +248,8 @@ def test_build_modules_state_no_defense_omits_defensive_field() -> None:
 
 
 def test_build_modules_state_includes_gridside_defensive_field() -> None:
-    """Symmetric coverage for the legacy grid-side path: when only
-    ``defensive_field`` (and not ``cellfree_defensive_field``) is
-    wired, it must still be serialized."""
+    """A grid-path ``defensive_field`` (with no ``cellfree_defensive_field``) is also
+    serialized."""
     from torch import nn
 
     legacy = nn.Linear(1, 1)

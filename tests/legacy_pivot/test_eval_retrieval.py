@@ -1,4 +1,4 @@
-"""Tests for :func:`shotcloud.evaluation.top_k_retrieval`."""
+"""Tests for :func:`shotcloud.legacy_pivot.eval_retrieval.top_k_retrieval`."""
 
 from __future__ import annotations
 

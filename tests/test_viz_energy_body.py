@@ -1,4 +1,4 @@
-"""Tests for the energy-body renderer."""
+"""Tests for the energy-body renderer in :mod:`shotcloud.viz.energy_body`."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from shotcloud.viz.energy_body import (
     render_energy_body,
 )
 
-# A small config for fast tests — coarse grid, fewer particles, low DPI.
+# A small config for fast tests: coarse grid, few particles, low DPI.
 FAST_CONFIG = EnergyBodyConfig(
     grid=CourtGrid(xlim=(-25.0, 25.0), ylim=(-5.0, 47.0), nx=20, ny=22),
     n_particles=500,
@@ -42,7 +42,7 @@ def _fake_shots(n: int = 800) -> tuple[np.ndarray, np.ndarray]:
 
 
 def test_config_defaults_match_canonical_hero_figure() -> None:
-    """The default config must keep producing the canonical hero figure."""
+    """The default config holds the settings of the canonical hero figure."""
     cfg = EnergyBodyConfig()
     assert cfg.grid.xlim == (-25.0, 25.0)
     assert cfg.grid.ylim == (-5.0, 47.0)
@@ -54,7 +54,7 @@ def test_config_defaults_match_canonical_hero_figure() -> None:
 
 
 def test_config_default_grid_is_independent_per_instance() -> None:
-    """default_factory must produce a fresh CourtGrid per instance, not a shared one."""
+    """Each config instance gets its own ``CourtGrid``."""
     a = EnergyBodyConfig()
     b = EnergyBodyConfig()
     assert a.grid is not b.grid
@@ -74,7 +74,7 @@ def test_config_is_frozen() -> None:
 
 
 def test_estimate_density_normalized() -> None:
-    """Returned density grid must be normalized so its peak is 1.0."""
+    """The returned density grid is normalized to a peak of 1.0."""
     x, y = _fake_shots(1000)
     density, height, gx, gy, (_xedges, _yedges) = estimate_density(x, y, FAST_CONFIG)
 
@@ -118,7 +118,7 @@ def test_estimate_density_uses_default_config_when_omitted() -> None:
 
 
 def test_render_energy_body_writes_nonempty_png(tmp_path: Path) -> None:
-    """The renderer should produce a non-empty PNG at the requested path."""
+    """The renderer writes a non-empty PNG at the requested path."""
     x, y = _fake_shots(800)
     out = tmp_path / "cloud.png"
     written = render_energy_body(x, y, out, config=FAST_CONFIG)
@@ -133,7 +133,7 @@ def test_render_energy_body_writes_nonempty_png(tmp_path: Path) -> None:
 
 
 def test_render_energy_body_deterministic_under_fixed_seed(tmp_path: Path) -> None:
-    """Two renders with the same config and same input data should be byte-identical."""
+    """Two renders with the same config and input give files within 2% in size."""
     x, y = _fake_shots(800)
     out1 = tmp_path / "a.png"
     out2 = tmp_path / "b.png"

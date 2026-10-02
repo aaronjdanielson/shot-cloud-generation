@@ -1,4 +1,4 @@
-"""Tests for :class:`shotcloud.legacy.LearnableTemperature` (precursor Phase 1)."""
+"""Tests for :class:`shotcloud.legacy.LearnableTemperature`."""
 
 from __future__ import annotations
 
@@ -135,12 +135,12 @@ def test_softmax_absorbs_partition_function() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 3 — context-conditioned mode
+# Context-conditioned mode
 # ---------------------------------------------------------------------------
 
 
 def test_context_dim_zero_is_default_scalar_mode() -> None:
-    """Default constructor still creates a scalar (no MLP)."""
+    """Default constructor creates a scalar temperature (no MLP)."""
     m = LearnableTemperature(init=1.5)
     assert m.context_dim == 0
     assert m.context_mlp is None

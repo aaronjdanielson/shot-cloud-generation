@@ -1,11 +1,10 @@
-"""Tests for the Tier-1a per-(source, zone) bandwidth module.
+"""Tests for :class:`~shotcloud.models.zone_source_bandwidth.ZoneSourceBandwidth`.
 
-Scope: unit behavior of :class:`ZoneSourceBandwidth` (init = σ_init
-everywhere, bounded outputs, source/zone indexing semantics, grad
-flow, state-dict round-trip, numpy/torch zone parity). Wrapper-level
-equivalence (zone_source at init ≡ fixed σ=1.5) is covered separately
-in :mod:`tests.test_models_continuous_mixture_spatial` so the wrapper
-test fixtures stay co-located with the rest of the wrapper checks.
+Covers the per-(source, zone) bandwidth table: uniform ``σ_init`` at initialization,
+bounded outputs, source and zone indexing, gradient flow, state-dict round trip, and
+agreement of the torch zone assignment with the NumPy one. Equivalence with the
+fixed-σ decoder at initialization is tested in
+``tests/test_models_continuous_mixture_spatial.py``.
 """
 
 from __future__ import annotations
@@ -22,8 +21,8 @@ from shotcloud.models.zone_source_bandwidth import (
 
 
 def test_zone_from_xy_torch_matches_numpy() -> None:
-    """``zone_from_xy_torch_bandwidth`` must agree with the canonical
-    numpy ``zone_from_xy_vectorized`` on a sweep of court coordinates."""
+    """``zone_from_xy_torch_bandwidth`` agrees with ``zone_from_xy_vectorized`` on a
+    sweep of court coordinates."""
     xs = np.linspace(-26.0, 26.0, 41)
     ys = np.linspace(-6.0, 48.0, 41)
     xx, yy = np.meshgrid(xs, ys, indexing="xy")
@@ -34,9 +33,8 @@ def test_zone_from_xy_torch_matches_numpy() -> None:
 
 
 def test_init_sigma_is_uniform_at_sigma_init() -> None:
-    """At ``sigma_init = 1.5`` every (source, zone) entry initializes
-    to σ = 1.5 exactly — the load-bearing invariant that makes the
-    wrapper bit-equivalent to the fixed-σ path at step 0."""
+    """Every (source, zone) entry starts at ``sigma_init``, so the decoder matches the
+    fixed-σ path at initialization."""
     bw = ZoneSourceBandwidth(sigma_min=1.0, sigma_max=2.5, sigma_init=1.5)
     table = bw.sigma_table()
     assert table.shape == (2, N_ZONES)
@@ -44,13 +42,11 @@ def test_init_sigma_is_uniform_at_sigma_init() -> None:
 
 
 def test_forward_shape_and_per_shot_sigma() -> None:
-    """``forward`` returns ``(B, M)`` with the correct source/zone
-    bandwidth per support shot."""
+    """``forward`` returns ``(B, M)`` with each support shot's (source, zone) bandwidth."""
     bw = ZoneSourceBandwidth(sigma_min=1.0, sigma_max=2.5, sigma_init=1.5)
-    # Tweak the raw logits to give distinguishable σ per (source, zone).
+    # Push own/rim toward σ_min and pooled/top-key 3 toward σ_max; other entries keep
+    # their initial value.
     with torch.no_grad():
-        # Make own/rim very sharp, pooled/topkey3 very smooth, leave
-        # other entries at the default init.
         bw.raw[ZoneSourceBandwidth.OWN, 0] = -5.0  # σ ≈ σ_min for own/rim
         bw.raw[ZoneSourceBandwidth.POOLED, 7] = 5.0  # σ ≈ σ_max for pooled/ATB3
     # Two rows. Row 0: rim shot (zone 0), own; row 1: top-key-3 (zone 7), pooled.
@@ -76,10 +72,10 @@ def test_forward_in_bounds() -> None:
 
 
 def test_out_of_court_shots_clamp_to_zone_zero_not_crash() -> None:
-    """Out-of-court support shots (zone == -1) must not crash the
-    indexed gather. The σ value for such shots is unspecified but
-    must be finite and positive (callers mask these shots out of the
-    mixture downstream)."""
+    """Out-of-court support shots (zone ``-1``) get a finite, positive σ.
+
+    The value itself is unspecified; callers mask these shots out of the mixture.
+    """
     bw = ZoneSourceBandwidth()
     # Backcourt + behind-baseline + far sideline = all zone -1.
     xy = torch.tensor([[[0.0, 60.0], [0.0, -10.0], [40.0, 5.0]]])
@@ -90,19 +86,19 @@ def test_out_of_court_shots_clamp_to_zone_zero_not_crash() -> None:
 
 
 def test_grad_flows_to_raw() -> None:
-    """``sum(σ_m)`` produces nonzero gradient on the raw logits for
-    every (source, zone) that any support shot maps to."""
+    """``sum(σ_m)`` gives a nonzero gradient on the raw logit of every (source, zone)
+    hit by a support shot and zero elsewhere."""
     bw = ZoneSourceBandwidth()
     xy = torch.tensor([[[0.0, 2.0], [-23.5, 5.0], [0.0, 24.0]]])  # rim, LC3, ATB3
     own = torch.tensor([[True, False, True]])
     out = bw(support_xy=xy, own_mask=own)
     out.sum().backward()
     assert bw.raw.grad is not None
-    # Hit cells: (OWN, 0), (POOLED, 3), (OWN, 7) — all should be nonzero.
+    # Hit cells: (OWN, 0), (POOLED, 3), (OWN, 7).
     assert bw.raw.grad[ZoneSourceBandwidth.OWN, 0].abs() > 0
     assert bw.raw.grad[ZoneSourceBandwidth.POOLED, 3].abs() > 0
     assert bw.raw.grad[ZoneSourceBandwidth.OWN, 7].abs() > 0
-    # Untouched cells must have exactly-zero grad (no leakage).
+    # Untouched cells have exactly zero gradient.
     assert bw.raw.grad[ZoneSourceBandwidth.OWN, 1] == 0
 
 
@@ -118,7 +114,7 @@ def test_state_dict_round_trip() -> None:
 
 
 def test_bad_bounds_rejected() -> None:
-    """Constructor rejects σ_min ≥ σ_max and sigma_init out of bounds."""
+    """``σ_min ≥ σ_max`` and an out-of-bounds ``sigma_init`` raise."""
     with pytest.raises(ValueError, match="must be <"):
         ZoneSourceBandwidth(sigma_min=2.0, sigma_max=1.0)
     with pytest.raises(ValueError, match="required"):

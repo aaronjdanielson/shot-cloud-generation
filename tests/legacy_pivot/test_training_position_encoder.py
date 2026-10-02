@@ -1,10 +1,7 @@
-"""Tests for :class:`shotcloud.legacy.PlayerPositionEncoder` plus its
-checkpoint round-trip and end-to-end training behavior.
+"""Tests for :class:`shotcloud.legacy.PlayerPositionEncoder`.
 
-The encoder lives under :mod:`shotcloud.legacy` post-2026-05-pivot:
-the residual tilt is now context-only (paper §3.5), so the player-id
-encoders have moved to legacy and are exercised here only via the
-legacy ``train_decoder`` flow that they were originally written for.
+Covers construction, gradient flow, the checkpoint round-trip, and
+end-to-end training through :func:`shotcloud.legacy_pivot.trainer.train_decoder`.
 """
 
 from __future__ import annotations

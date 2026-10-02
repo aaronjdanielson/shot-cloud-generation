@@ -1,8 +1,7 @@
 """Tests for :func:`shotcloud.data.compute_player_timing_history_features`.
 
-The featurizer is causal at game-date granularity (paper §5.2 timing
-audit Phase 3.4). A shot taken on date $D$ sees only shots from
-strictly-earlier-date games in the same player's history.
+The featurizer is causal at game-date granularity: a shot on date ``D`` sees only
+the same player's shots from games dated strictly before ``D``.
 """
 
 from __future__ import annotations
@@ -36,8 +35,8 @@ def _hand_checkable_df() -> pd.DataFrame:
                     "2024-01-15",
                 ]
             ),
-            # period is unused by the featurizer; time_remaining_sec
-            # is total elapsed seconds.
+            # The featurizer ignores period and reads time_remaining_sec as total
+            # elapsed seconds.
             "period": [1, 3, 2, 2, 1],
             "time_remaining_sec": [5 * 60, 30 * 60, 12 * 60, 20 * 60, 0],
         }
@@ -85,10 +84,8 @@ def test_third_game_history_aggregates_both_prior_games() -> None:
 
 
 def test_same_date_shots_do_not_leak_into_each_other() -> None:
-    """Same-day shots are the same game in this data; neither sees the
-    other in its 'prior' history. The featurizer's strict-prior cutoff
-    works at the date-day level.
-    """
+    """Shots on the same date (the same game) do not enter each other's history; the
+    strict cutoff is at day granularity."""
     df = pd.DataFrame(
         {
             "player_id": [101, 101],
@@ -113,12 +110,11 @@ def test_different_players_do_not_share_history() -> None:
         }
     )
     out = compute_player_timing_history_features(df, smoothing=0.0)
-    # Player 101's second shot should see only bin 5 (from their G1),
-    # NOT bin 30 (which is player 102's G1 shot).
+    # Player 101's second shot sees bin 5 from its own first game, not bin 30 from
+    # player 102's.
     assert out[1, 5] == pytest.approx(1.0, abs=1e-5)
     assert out[1, 30] == pytest.approx(0.0, abs=1e-5)
-    # Player 102's second shot should see only bin 30 (their G1),
-    # NOT bin 5 (player 101's G1).
+    # Player 102's second shot sees bin 30 from its own first game, not bin 5.
     assert out[3, 30] == pytest.approx(1.0, abs=1e-5)
     assert out[3, 5] == pytest.approx(0.0, abs=1e-5)
 

@@ -1,4 +1,4 @@
-"""Tests for Phase 0.5 + Phase 1.5 KDE diagnostic helpers."""
+"""Tests for the KDE diagnostic helpers in :mod:`shotcloud.legacy_pivot.eval_diagnostics`."""
 
 from __future__ import annotations
 
@@ -354,7 +354,7 @@ def test_summary_missing_bucket_column_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 1.5 — per-player trained NLL
+# Per-player trained NLL
 # ---------------------------------------------------------------------------
 
 
@@ -376,12 +376,12 @@ def test_trained_nll_with_zero_decoder_and_tau_one_matches_hier(
     """At V=0, u=0, τ=1, the trained model = the classical Hier-KDE.
 
     Therefore per-player trained NLL must equal the per-player
-    ``nll_hier_held`` from the Phase 0.5 frame.
+    ``nll_hier_held`` from :func:`build_per_player_diagnostics`.
     """
     encoder, decoder, vocab = _trained_setup(fitted_kde_two_players)
     held = _held_out_frame()
 
-    # Phase-0.5 reference frame.
+    # Classical-KDE reference frame.
     classical = build_per_player_diagnostics(
         fitted_kde_two_players, held, fitted_kde_two_players.grid
     ).set_index("player_id")

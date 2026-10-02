@@ -1,20 +1,9 @@
-"""Tests for ``shotcloud.models.mode_extractor.SupportModeExtractor``.
+"""Tests for :class:`shotcloud.models.mode_extractor.SupportModeExtractor`.
 
-Load-bearing invariants per plan Phase 7:
-
-1. **Shape test** — outputs are the documented shapes.
-2. **Convex hull test** — ``μ_k`` lies in the convex hull of valid
-   ``s_j`` because ``α_{k,j}`` is a probability vector.
-3. **Masking test** — masked support points don't contribute to
-   ``μ_k`` or ``m_k``.
-4. **Cluster recovery sanity** — with two well-separated support
-   clusters and K=2, the two extracted modes land near those
-   cluster centers.
-5. **Mode evidence test** — concentrating ``ω_j`` near one cluster
-   raises that cluster's ``m_k``.
-6. **Gradient flow** — NLL backpropagates through ``mode_logits``,
-   ``mode_mu``, support_embedding, and mode_queries.
-7. **All-masked safety** — cold-start rows don't NaN.
+Covers output shapes, mode centers inside the convex hull of valid support, masking,
+recovery of two well-separated clusters, mode mass tracking the support attention ``ω``,
+gradient flow through the mode-mixture NLL, finite outputs on cold-start rows, and the
+``lambda_omega`` attention bias.
 """
 
 from __future__ import annotations
@@ -37,18 +26,16 @@ from shotcloud.training.spatial_losses import mode_mixture_loglik
 def _normalized_log_weights(b: int, m: int, *, mask: torch.Tensor | None = None) -> torch.Tensor:
     """Build (B, M) log-probability weights uniform over valid supports.
 
-    Masked entries get -inf. Used so tests can supply a clean
-    ``log_support_weights`` input without depending on the upstream
-    collab scorer.
+    Masked entries get -inf. This supplies ``log_support_weights`` without an
+    upstream collaborative scorer.
     """
     if mask is None:
         mask = torch.ones(b, m, dtype=torch.bool)
     logits = torch.zeros(b, m)
     logits = logits.masked_fill(~mask, float("-inf"))
     log_w = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
-    # Cold-start rows: logsumexp(-inf) = NaN; replace with -inf so
-    # downstream ω.exp() = 0 — the extractor patches cold-start rows
-    # with its dummy slot 0.
+    # Cold-start rows give NaN from (-inf) - logsumexp(-inf); set them to -inf so
+    # ω.exp() = 0. The extractor patches cold-start rows with its dummy slot 0.
     cold = ~mask.any(dim=-1)
     if cold.any():
         log_w = torch.where(cold.unsqueeze(-1), torch.full_like(log_w, float("-inf")), log_w)
@@ -56,7 +43,7 @@ def _normalized_log_weights(b: int, m: int, *, mask: torch.Tensor | None = None)
 
 
 def test_default_constants_match_plan() -> None:
-    """Plan recommends K=6 for the first run; d=32 for query dim."""
+    """Default ``K = 6`` modes and query dimension ``d = 32``."""
     assert DEFAULT_N_COURT_MODES == 6
     assert DEFAULT_MODE_QUERY_DIM == 32
 
@@ -101,8 +88,7 @@ def test_mode_centers_lie_in_convex_hull_of_valid_support() -> None:
 
 
 def test_masked_support_does_not_affect_mode_center_or_mass() -> None:
-    """Putting a masked support point at an extreme coordinate must
-    not move ``μ_k`` (the mask should zero its contribution)."""
+    """A masked support point at an extreme coordinate does not pull ``μ_k``."""
     b, m, k = 1, 5, 2
     ext = SupportModeExtractor(n_modes=k, mode_query_dim=8)
     # Four normal supports; one masked-out at a wildly distant point.
@@ -115,33 +101,28 @@ def test_masked_support_does_not_affect_mode_center_or_mass() -> None:
     context = torch.zeros(b, CONTEXT_DIM)
     with torch.no_grad():
         out = ext(support_xy, log_w, mask, context)
-    # Mode centers must be inside the [0, 1]^2 box (the 4 valid
-    # supports). The wild masked support at (9999, 9999) would yank
-    # them out if it leaked.
+    # The valid supports span [0, 1]^2; any leakage from the masked point at
+    # (9999, 9999) would push the centers far outside it.
     assert (out.mode_mu.abs() < 100).all()
 
 
 def _inject_cluster_aligned_queries(
     ext: SupportModeExtractor, cluster_centers: torch.Tensor, scale: float = 100.0
 ) -> None:
-    """Set each mode query to a scaled support embedding of the
-    corresponding cluster center, so the Q-K softmax sharply
-    discriminates clusters. The scale factor compensates for the
-    random projection: raw ψ(cluster_a) and ψ(cluster_b) may have
-    similar magnitudes, and an order-1 Q-K product is dominated by
-    the ``log ω_j`` bias in the softmax. A 100x scaling makes the
-    Q-K logits the dominant signal, deterministically routing each
-    mode to its target cluster."""
+    """Set each mode query to a scaled embedding of its cluster center.
+
+    With a random projection, an order-1 Q-K product does not separate the clusters
+    sharply; scaling by ``scale`` makes the Q-K logits dominate the softmax, so each mode
+    attends to its own cluster deterministically.
+    """
     with torch.no_grad():
         psi_centers = ext.support_embedding(cluster_centers.unsqueeze(0)).squeeze(0)
         ext.mode_queries.copy_(psi_centers * scale)
 
 
 def test_cluster_recovery_with_two_well_separated_clusters() -> None:
-    """Plan §7 #4: with K=2 supports in two well-separated clusters
-    and queries aligned to the cluster centers, each mode's μ_k
-    should land near its assigned cluster center (mode 0 near
-    cluster A; mode 1 near cluster B)."""
+    """With K = 2 and queries aligned to two well-separated support clusters, each
+    mode center lands near its cluster center."""
     b, k = 1, 2
     cluster_a = torch.tensor([[-10.0, 5.0], [-9.5, 4.7], [-10.3, 5.4], [-9.8, 5.1]])
     cluster_b = torch.tensor([[10.0, 25.0], [10.2, 24.6], [9.7, 25.3], [10.4, 25.1]])
@@ -167,10 +148,10 @@ def test_cluster_recovery_with_two_well_separated_clusters() -> None:
 
 
 def test_concentrating_omega_on_a_cluster_raises_its_mode_mass() -> None:
-    """Plan §7 #5: when ω is concentrated near cluster A, the mode
-    aligned with cluster A captures more mass than the cluster-B mode.
-    Uses cluster-aligned queries so the per-cluster mode mapping is
-    deterministic."""
+    """Shifting ``ω`` toward a cluster raises the mass of the mode aligned with it.
+
+    Cluster-aligned queries make the mode-to-cluster mapping deterministic.
+    """
     b, k = 1, 2
     cluster_a = torch.tensor([[-10.0, 5.0]] * 4)
     cluster_b = torch.tensor([[10.0, 25.0]] * 4)
@@ -203,9 +184,8 @@ def test_concentrating_omega_on_a_cluster_raises_its_mode_mass() -> None:
 
 
 def test_gradient_flow_to_logits_and_centers_via_mode_mixture_nll() -> None:
-    """Compose extractor + mode_mixture_nll; backward should populate
-    extractor params + the upstream support attention (via
-    ``log_support_weights.requires_grad=True``)."""
+    """The mode-mixture NLL sends gradient to the extractor parameters and to the
+    upstream ``log_support_weights``."""
     b, m, k = 2, 20, 4
     ext = SupportModeExtractor(n_modes=k, mode_query_dim=8)
     support_xy = torch.randn(b, m, 2) * 5
@@ -220,7 +200,7 @@ def test_gradient_flow_to_logits_and_centers_via_mode_mixture_nll() -> None:
     assert ext.support_embedding.proj.weight.grad.abs().sum() > 0
     assert ext.mode_queries.grad is not None
     assert ext.mode_queries.grad.abs().sum() > 0
-    # The bias output layer is zero-init, gets nonzero grad via chain.
+    # The zero-initialized bias output layer still receives a nonzero gradient.
     bias_out = ext.mode_bias[-1]  # type: ignore[index]
     assert bias_out.weight.grad is not None
     assert bias_out.weight.grad.abs().sum() > 0
@@ -257,8 +237,7 @@ def test_constructor_rejects_invalid_arguments() -> None:
 
 
 def test_use_context_correction_false_yields_logits_equal_log_mass() -> None:
-    """With ``use_context_correction=False`` the mode bias is the
-    identity and mode logits collapse to ``log m_k`` exactly."""
+    """With ``use_context_correction=False`` the mode logits equal ``log m_k``."""
     b, m, k = 2, 10, 3
     ext = SupportModeExtractor(n_modes=k, mode_query_dim=8, use_context_correction=False)
     support_xy = torch.randn(b, m, 2)
@@ -272,14 +251,7 @@ def test_use_context_correction_false_yields_logits_equal_log_mass() -> None:
 
 
 def test_history_dim_zero_rejects_history_tensor_passed_in() -> None:
-    """If the extractor was built with ``history_dim=0`` but the
-    caller still passes a history tensor, we silently ignore it
-    (no error). Verified by running once without and once with the
-    history tensor — outputs should match.
-
-    The other direction (``history_dim > 0`` without a history) is
-    asserted in :func:`test_history_dim_positive_requires_history`.
-    """
+    """With ``history_dim=0`` a supplied history tensor is ignored without error."""
     b, m, k = 2, 8, 3
     ext = SupportModeExtractor(n_modes=k, mode_query_dim=8, history_dim=0)
     support_xy = torch.randn(b, m, 2)
@@ -312,11 +284,13 @@ def test_mode_queries_distinct_at_init_to_avoid_collapse() -> None:
 
 
 def test_recovers_uniform_mode_when_query_orthogonal_to_supports() -> None:
-    """If queries are exactly zero (or orthogonal to all e_j), the
-    Q-K bias is zero and α reduces to softmax(log ω_j) — i.e. a copy
-    of the support attention. ``μ_k`` then becomes the support-mean
-    (weighted by ω_j), the same for every mode k. A useful sanity
-    check that the math machinery doesn't add extra structure."""
+    """With zero queries and embeddings, every mode center is the ``ω``-weighted
+    support mean.
+
+    The Q-K term vanishes, so ``α`` reduces to ``softmax_j(λ_ω log ω_j)``; at the
+    default ``λ_ω = 0`` that is uniform over the support, and with uniform ``ω`` the
+    uniform and ``ω``-weighted means coincide.
+    """
     b, m, k = 1, 8, 3
     ext = SupportModeExtractor(n_modes=k, mode_query_dim=8, use_context_correction=False)
     with torch.no_grad():
@@ -337,9 +311,8 @@ def test_recovers_uniform_mode_when_query_orthogonal_to_supports() -> None:
 
 
 def test_lambda_omega_zero_yields_attention_independent_of_omega() -> None:
-    """With ``lambda_omega = 0`` (the strengthened-model default), the
-    mode-to-support attention α is a pure function of the Q-K product:
-    changing ω must not change α. The current default behavior."""
+    """With ``lambda_omega = 0`` (the default) the attention ``α`` depends only on the
+    Q-K product, so changing ``ω`` leaves ``α`` unchanged."""
     b, m, k = 1, 6, 3
     ext = SupportModeExtractor(
         n_modes=k, mode_query_dim=8, use_context_correction=False, lambda_omega=0.0
@@ -363,8 +336,8 @@ def test_lambda_omega_zero_yields_attention_independent_of_omega() -> None:
 
 
 def test_lambda_omega_one_yields_attention_dependent_on_omega() -> None:
-    """With ``lambda_omega = 1.0`` the attention IS biased by log ω_j
-    (the original behavior). Verify α changes when ω shifts."""
+    """With ``lambda_omega = 1`` the attention is biased by ``log ω_j``, so ``α``
+    changes when ``ω`` shifts."""
     b, m, k = 1, 6, 3
     ext = SupportModeExtractor(
         n_modes=k, mode_query_dim=8, use_context_correction=False, lambda_omega=1.0
@@ -390,9 +363,8 @@ def test_lambda_omega_rejects_out_of_range() -> None:
 
 
 def test_n_query_dim_used_in_sqrt_scaling() -> None:
-    """Scaling by ``sqrt(d)`` should make the Q-K logits well-behaved
-    independent of ``d``. Verify by checking that for the same
-    queries/supports, doubling d doesn't blow up the softmax."""
+    """The attention stays a normalized distribution over support for small and
+    large query dimension ``d`` (Q-K logits are scaled by ``sqrt(d)``)."""
     b, m = 1, 8
     support_xy = torch.randn(b, m, 2)
     log_w = _normalized_log_weights(b, m)

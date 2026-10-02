@@ -1,4 +1,4 @@
-"""Tests for Phase-4 regularizers."""
+"""Tests for the relevance-weight regularizers in :mod:`shotcloud.legacy_pivot.regularizers`."""
 
 from __future__ import annotations
 

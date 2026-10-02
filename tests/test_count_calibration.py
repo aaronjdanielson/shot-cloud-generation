@@ -74,7 +74,7 @@ def test_compute_count_calibration_handles_bad_shapes() -> None:
 
 
 def test_train_count_only_reduces_nll() -> None:
-    """Count-only training does not increase the NLL and keeps μ̄ calibrated."""
+    """Count-only training does not raise the train NLL (beyond 0.05) and keeps μ̄ calibrated."""
     x_raw, k_obs = _make_synthetic_per_game(n_games=128, k_mean=10.0)
     val_x, val_k = _make_synthetic_per_game(n_games=32, k_mean=10.0, seed=1)
     count_head = NegBinCountHead(init_mean=k_obs.float().mean().item())

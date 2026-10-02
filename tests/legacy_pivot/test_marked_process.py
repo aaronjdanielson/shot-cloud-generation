@@ -1,4 +1,4 @@
-"""End-to-end tests for :class:`shotcloud.models.ShotCloudProcess`.
+"""End-to-end tests for :class:`shotcloud.legacy_pivot.marked_process.ShotCloudProcess`.
 
 The headline test is :func:`test_zero_init_sampling_recovers_q0_empirically`,
 which confirms the entire stack — KDE → product → tilt decoder → softmax
@@ -113,7 +113,7 @@ def test_sampled_taus_lie_in_game_window(process: ShotCloudProcess) -> None:
 
 
 def test_sampled_xy_lie_inside_court_bounds(process: ShotCloudProcess) -> None:
-    """Critical invariant from plan §5.2: dequantized samples stay in court."""
+    """Dequantized samples stay inside the court bounds."""
     g = process.grid
     rng = np.random.default_rng(0)
     for _ in range(20):

@@ -138,7 +138,8 @@ def build_role_profiles(
         origin (the convention enforced by
         :func:`shotcloud.data.load_shots`).
     player_col, x_col, y_col : str, optional
-        Column names. Defaults match :func:`load_shots` output.
+        Column names. Defaults match the
+        :func:`~shotcloud.data.loaders.load_shots` output.
     min_shots : int, default 1
         Players with fewer than this many shots are omitted from the
         result. The default (1) admits any player with at least one

@@ -1,4 +1,4 @@
-"""Unit tests for the spatial-Hawkes prior-shot-KDE featurizer."""
+"""Tests for :mod:`shotcloud.data.prior_shot_kde`, the causal within-game prior-shot KDE feature."""
 
 from __future__ import annotations
 
@@ -19,7 +19,11 @@ from shotcloud.data.prior_shot_kde import (
 def _make_shots(
     rows: list[tuple[str, str, float, float, float]],
 ) -> pd.DataFrame:
-    """Build a tiny shot df from (player_id, game_id, x, y, t_elapsed_sec)."""
+    """Build a shot frame from ``(player_id, game_id, x, y, t_elapsed_sec)`` tuples.
+
+    Elapsed seconds go in the ``time_remaining_sec`` column, which is how the
+    featurizer orders shots within a game.
+    """
     return pd.DataFrame(
         rows,
         columns=["player_id", "game_id", "x", "y", "time_remaining_sec"],

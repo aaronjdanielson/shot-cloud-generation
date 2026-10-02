@@ -1,21 +1,8 @@
-"""Tests for :class:`shotcloud.models.NegBinCountHead` (paper §5).
+"""Tests for :class:`shotcloud.models.NegBinCountHead`, the negative-binomial count factor.
 
-Load-bearing invariants:
-
-1. **Shape contract.** Forward returns ``(μ, κ)`` both shape ``(B,)``,
-   both positive (post-softplus). ``log_prob(K, x_n)`` returns ``(B,)``.
-2. **Numerical sanity.** Log-likelihood is finite for typical
-   non-negative integer counts at default init.
-3. **Distribution agreement.** Internal conversion to torch's
-   ``(total_count, probs)`` matches an explicit
-   :class:`torch.distributions.NegativeBinomial` constructed from
-   the same ``(μ, κ)``.
-4. **Gradient flow.** The MLP weights and ``log_kappa`` both
-   receive nonzero gradients from the log-likelihood.
-5. **No `player_idx` parameter.** Architectural — the count head is
-   context-only, mirroring the residual decoder.
-6. **Construction validation.** Invalid ``context_dim``,
-   ``hidden_dim`` raise.
+Covers output shapes and positivity of ``(μ, κ)``, agreement with an explicit
+:class:`torch.distributions.NegativeBinomial`, gradient flow, numerical stability at tiny
+``μ``, the context-only signature, and input validation.
 """
 
 from __future__ import annotations
@@ -61,8 +48,8 @@ def test_log_prob_shape_and_finite() -> None:
 
 
 def test_log_prob_matches_explicit_negative_binomial() -> None:
-    """Internal (μ, κ) → (total_count, probs) conversion produces
-    the same log-likelihood as constructing NegativeBinomial directly."""
+    """The internal (μ, κ) → (total_count, probs) conversion matches a directly
+    constructed ``NegativeBinomial``."""
     head = NegBinCountHead()
     x_n = torch.randn(4, CONTEXT_DIM)
     K = torch.tensor([3, 7, 12, 20], dtype=torch.long)
@@ -98,18 +85,11 @@ def test_gradient_flows_to_mu_net_and_log_kappa() -> None:
 
 
 def test_kappa_is_contiguous() -> None:
-    """Load-bearing on MPS: ``softplus(log_kappa).expand_as(mu)`` returns a
-    stride-0 broadcast view of a scalar, and the MPS backend of
-    ``torch.distributions.NegativeBinomial.log_prob`` produces ±Inf for
-    nearly all batch entries when ``total_count`` has stride 0 (PyTorch
-    MPS bug; CPU and CUDA are unaffected). The ``.contiguous()`` call
-    inside :meth:`NegBinCountHead.forward` materializes a real (B,)
-    tensor and works around the bug.
+    """``forward`` returns a contiguous ``kappa`` equal to ``softplus(log_kappa)``.
 
-    This regression test pins the contract: ``kappa`` returned from
-    ``forward`` must be contiguous so downstream consumers (NegBin,
-    further reductions) see a normal-strided tensor regardless of
-    device.
+    ``softplus(log_kappa).expand_as(mu)`` alone is a stride-0 view, and the MPS backend
+    of ``NegativeBinomial.log_prob`` returns ±Inf when ``total_count`` has stride 0
+    (CPU and CUDA are unaffected), so the head materializes a real (B,) tensor.
     """
     head = NegBinCountHead()
     x_n = torch.randn(8, CONTEXT_DIM)
@@ -123,13 +103,11 @@ def test_kappa_is_contiguous() -> None:
 
 
 def test_log_prob_finite_grad_when_mu_is_tiny() -> None:
-    """Stability check: when the predicted mean μ is near zero, the
-    NegBin log_prob has a ``value * log(probs)`` term whose gradient
-    ``value / probs`` diverges, and ``d(probs)/d(kappa) ≈ 0`` in the
-    small-μ limit produces a classic ``inf * 0 = NaN`` backward.
-    The clamp inside :meth:`NegBinCountHead.log_prob` must prevent
-    this — a regression test for the failure surfaced by the first
-    real-data ``train_gibbs`` run (2026-05-14).
+    """Log-prob and gradients stay finite when ``μ`` is near zero.
+
+    In that limit the ``value * log(probs)`` term has a divergent gradient while
+    ``d(probs)/d(kappa) ≈ 0``, giving ``inf * 0 = NaN`` without the clamp in
+    :meth:`NegBinCountHead.log_prob`.
     """
     head = NegBinCountHead(init_log_kappa=0.0)
     # Force fc2 to drive log_mu very negative so softplus(log_mu) is
@@ -153,7 +131,7 @@ def test_log_prob_finite_grad_when_mu_is_tiny() -> None:
 
 
 def test_no_player_idx_in_signature() -> None:
-    """Architectural check: the count head is context-only by design."""
+    """``forward`` takes only ``x_n``: the count head is context-only."""
     sig = inspect.signature(NegBinCountHead.forward)
     params = set(sig.parameters.keys())
     assert "player_idx" not in params
@@ -161,8 +139,7 @@ def test_no_player_idx_in_signature() -> None:
 
 
 def test_constant_input_gives_constant_mu() -> None:
-    """All-equal x_n rows must produce equal μ — sanity check on
-    determinism + statelessness."""
+    """Identical ``x_n`` rows produce identical ``μ`` and ``κ``."""
     head = NegBinCountHead()
     head.eval()
     x_n = torch.zeros(8, CONTEXT_DIM)

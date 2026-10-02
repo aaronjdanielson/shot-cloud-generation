@@ -14,7 +14,7 @@ tensors consumed by :func:`~shotcloud.training.train_gibbs`:
 * ``tau_bin`` -- game-minute bin in ``[0, 48)`` with overtime folded into
   the final bin, the target of
   :class:`~shotcloud.models.TimingSoftmaxHead`;
-* ``x_n_raw`` -- the raw pregame context vector of length ``CONTEXT_DIM``,
+* ``x_n_raw`` -- the raw context vector of length ``CONTEXT_DIM``,
   mapped to ``x_n`` by :class:`~shotcloud.models.ContextMLP` inside the
   trainer;
 * ``game_idx`` -- index into the per-game table;
@@ -27,10 +27,10 @@ tensors consumed by :func:`~shotcloud.training.train_gibbs`:
   same-game shots and its length, for an optional within-game recurrent
   encoder.
 
-A parallel :attr:`GibbsShotDataset.per_game` table holds the pregame
-context and observed shot count ``K_obs`` of every player-game, so the
-negative-binomial count loss is evaluated once per game rather than once
-per shot.
+A parallel :attr:`GibbsShotDataset.per_game` table holds one context
+vector (that of the game's first shot in dataset order) and the observed
+shot count ``K_obs`` of every player-game, so the negative-binomial count
+loss is evaluated once per game rather than once per shot.
 
 The dataset owns no models; it only computes indices and features. All
 features use information available before the shot: snapshot data from
@@ -161,7 +161,8 @@ class GibbsShotDataset(Dataset[_BatchTuple]):
     Attributes
     ----------
     per_game : PerGameTable
-        Pregame context and observed shot count per player-game.
+        Per-game context (the first shot's ``x_n_raw``) and observed
+        shot count per player-game.
     outcome_feature_dim : int
         Width of ``prior_outcome``, for sizing the residual encoder's
         outcome branch.
@@ -326,9 +327,9 @@ class GibbsShotDataset(Dataset[_BatchTuple]):
         n_games = int(game_id_np.max()) + 1
         k_obs_np = np.bincount(game_id_np, minlength=n_games).astype(np.int64)
 
-        # Per-game pregame context: the context of the game's first shot.
-        # The count head consumes only this pregame representative (the
-        # count loss is per game). The first occurrence of each game is
+        # Per-game context: the context of the game's first shot in
+        # dataset order. The count head consumes only this representative
+        # (the count loss is per game). The first occurrence of each game is
         # where the stably sorted key changes.
         order = np.argsort(game_id_np, kind="stable")
         sorted_games = game_id_np[order]

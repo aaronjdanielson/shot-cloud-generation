@@ -1,35 +1,31 @@
-"""No-leakage invariant tests for the 5 mainline modules (paper §3.1).
+"""No-leakage tests for the mainline support-logit, gate, and count modules.
 
-Added 2026-06-10 per audit fix H2. The leakage guardrail tests in
-``test_models_continuous_mixture_spatial.py`` and
-``test_mode_routed_spatial.py`` already cover ``CausalZoneBias`` and
-``ModeRouter`` — but both are REJECTED stress-test variants. The five
-MAINLINE / load-bearing modules that actually appear in O1 had no
-perturbation guard:
+The paper's no-leakage guardrail requires that no attention logit, gate,
+residual, or kernel modifier depend on the observed location ``y_n`` except
+through the normalized density evaluation itself. This file checks that
+contract for the modules of the mainline configuration:
 
-- :class:`shotcloud.models.PoolingGate` (gate λ, paper §2.x)
+- :class:`shotcloud.models.pooling_gate.PoolingGate` (pooling gate λ)
 - :class:`shotcloud.models.zone_defense_reweighting.ZoneReweightingDefense`
-  (D-lite-zone defense, paper §3.2)
-- :class:`shotcloud.models.ContextResidualEncoder` (residual u_θ, paper §2.x)
+  (zone-level opponent reweighting)
+- :class:`shotcloud.models.ContextResidualEncoder` (residual input u_θ)
 - :class:`shotcloud.models.zone_source_bandwidth.ZoneSourceBandwidth`
-  (per-source bandwidth σ_m, paper §2.x)
-- :class:`shotcloud.models.NegBinCountHead` (count factor, paper §5.2)
+  (per-source bandwidth σ_m)
+- :class:`shotcloud.models.NegBinCountHead` (count factor)
 
-This file adds two layers of defense:
+Two kinds of test are used:
 
-1. **Signature-level guards** (5 tests): any future PR that adds
-   ``shot_xy`` / ``y_n`` / observed-shot-location parameters to a
-   mainline forward signature fires here immediately.
-2. **Wrapper-level perturbation tests** (4 tests): with each component
-   wired into the ``ContinuousMixtureSpatial`` wrapper, perturbing
-   ``shot_xy`` must leave the component's output field bit-identical.
-   The count head is covered transitively via the residual encoder
-   (its μ output feeds the residual's usage channel).
+1. **Signature guards** (all five modules): ``forward`` accepts no parameter
+   named like an observed shot location (``shot_xy``, ``y_n``, ...).
+2. **Perturbation tests** (all but the count head): with the module wired into
+   :class:`~shotcloud.models.continuous_mixture_spatial.ContinuousMixtureSpatial`
+   and its parameters randomized, perturbing ``shot_xy`` leaves the module's
+   output field bit-identical. A positive control confirms the same
+   perturbation does change ``log_lik``.
 
-Paper §3.1 invariant:
-
-    *No attention logit, gate, residual, or kernel modifier may depend
-    on y_n except through the normalized density evaluation itself.*
+Guards for the alternative ``CausalZoneBias`` and ``ModeRouter`` modules live
+in ``test_models_continuous_mixture_spatial.py`` and
+``test_mode_routed_spatial.py``.
 """
 
 from __future__ import annotations
@@ -55,7 +51,7 @@ from test_models_continuous_mixture_spatial import (  # type: ignore[import-not-
 )
 
 # ---------------------------------------------------------------------------
-# Signature-level guards — Part 1
+# Signature-level guards
 # ---------------------------------------------------------------------------
 
 #: Forbidden parameter names. A mainline module that consumes any of these
@@ -78,30 +74,27 @@ def test_pooling_gate_forward_signature_excludes_yn() -> None:
 
 
 def test_zone_reweighting_defense_forward_signature_excludes_yn() -> None:
-    """ZoneReweightingDefense.forward(query_xy, def_features) — query_xy
-    is the SUPPORT shots' coordinates, not the observed shot y_n."""
+    """``ZoneReweightingDefense.forward`` takes support-shot ``query_xy``, never ``y_n``."""
     _assert_no_yn_in_signature(ZoneReweightingDefense, "ZoneReweightingDefense")
 
 
 def test_context_residual_encoder_forward_signature_excludes_yn() -> None:
-    """ContextResidualEncoder.forward(x_n, h_n, usage, outcome) — all
-    causal."""
+    """``ContextResidualEncoder.forward`` takes only causal ``(x_n, h_n, usage, outcome)``."""
     _assert_no_yn_in_signature(ContextResidualEncoder, "ContextResidualEncoder")
 
 
 def test_zone_source_bandwidth_forward_signature_excludes_yn() -> None:
-    """ZoneSourceBandwidth.forward(support_xy, own_mask) — support_xy
-    is the SUPPORT shots' coordinates, not y_n."""
+    """``ZoneSourceBandwidth.forward`` takes support-shot ``support_xy``, never ``y_n``."""
     _assert_no_yn_in_signature(ZoneSourceBandwidth, "ZoneSourceBandwidth")
 
 
 def test_neg_bin_count_head_forward_signature_excludes_yn() -> None:
-    """NegBinCountHead.forward(x_n) — pure context."""
+    """``NegBinCountHead.forward`` takes context ``x_n`` only."""
     _assert_no_yn_in_signature(NegBinCountHead, "NegBinCountHead")
 
 
 # ---------------------------------------------------------------------------
-# Wrapper-level perturbation tests — Part 2
+# Wrapper-level perturbation tests
 # ---------------------------------------------------------------------------
 #
 # Pattern: wire each component into ContinuousMixtureSpatial, set its
@@ -111,18 +104,18 @@ def test_neg_bin_count_head_forward_signature_excludes_yn() -> None:
 
 
 def _randomize(module: torch.nn.Module, scale: float = 0.3) -> None:
-    """Randomize all module parameters to non-trivial non-zero values so a
-    hypothetical y_n leak is actually exercised."""
+    """Set every parameter to random non-zero values so any ``y_n`` dependence would show."""
     with torch.no_grad():
         for p in module.parameters():
             p.copy_(torch.randn_like(p) * scale)
 
 
 def test_pooling_gate_lambda_invariant_to_shot_xy() -> None:
-    """PoolingGate's output ``λ`` (exposed as ``out.gate_lambda``) is a
-    function of (log1p_H_hat, x_n, own_support_count, own_available,
-    h_n, pooled_available). None of those carry y_n. If a future
-    refactor accidentally routes ``shot_xy`` into the gate, this fires."""
+    """The pooling gate ``out.gate_lambda`` is unchanged when ``shot_xy`` is perturbed.
+
+    λ is a function of ``(log1p_h_hat, x_n, own_support_count, own_available,
+    h_n, pooled_available)``, none of which carries ``y_n``.
+    """
     from shotcloud.models.continuous_mixture_spatial import ContinuousMixtureSpatial
 
     setup = _build_setup()
@@ -146,10 +139,11 @@ def test_pooling_gate_lambda_invariant_to_shot_xy() -> None:
 
 
 def test_zone_reweighting_defense_logits_invariant_to_shot_xy() -> None:
-    """``ZoneReweightingDefense`` produces ``out.defense_logits`` from the
-    SUPPORT-shot locations + opponent's centered-zone defense features.
-    Neither depends on y_n. Perturbing the wrapper's ``shot_xy`` must
-    leave ``defense_logits`` bit-identical."""
+    """``out.defense_logits`` is unchanged when ``shot_xy`` is perturbed.
+
+    The logits depend only on support-shot locations and the opponent's
+    centered-zone defense features.
+    """
     from shotcloud.models.continuous_mixture_spatial import ContinuousMixtureSpatial
 
     setup = _build_zone_lite_setup(beta_init=1e-3)
@@ -173,13 +167,12 @@ def test_zone_reweighting_defense_logits_invariant_to_shot_xy() -> None:
 
 
 def test_context_residual_encoder_residual_logits_invariant_to_shot_xy() -> None:
-    """``ContextResidualEncoder`` produces ``u_θ(x_n, h_n, usage, outcome)``
-    which combines with ``location_embedding(support_xy)`` to form
-    ``residual_logits`` (B, M). Perturbing y_n must leave both ``u_θ``
-    AND ``residual_logits`` bit-identical. This also TRANSITIVELY covers
-    ``NegBinCountHead``: when the residual's ``usage_dim`` consumes the
-    detached ``K̂``, any y_n leak in the count head would surface as a
-    delta in residual_logits."""
+    """``out.residual_logits`` is unchanged when ``shot_xy`` is perturbed.
+
+    The residual logits ``(B, M)`` combine ``u_θ`` from the context encoder
+    with ``location_embedding(support_xy)``, so they depend on support-shot
+    locations only.
+    """
     from shotcloud.models.continuous_mixture_spatial import ContinuousMixtureSpatial
 
     setup = _build_setup()
@@ -207,10 +200,10 @@ def test_context_residual_encoder_residual_logits_invariant_to_shot_xy() -> None
 
 
 def test_zone_source_bandwidth_sigma_per_shot_invariant_to_shot_xy() -> None:
-    """``ZoneSourceBandwidth`` produces ``out.sigma_per_shot`` (B, M)
-    from ``support_xy`` and ``own_mask``. Neither depends on y_n.
-    Perturbing the wrapper's ``shot_xy`` must leave ``sigma_per_shot``
-    bit-identical."""
+    """``out.sigma_per_shot`` ``(B, M)`` is unchanged when ``shot_xy`` is perturbed.
+
+    The bandwidths depend only on ``support_xy`` and ``own_mask``.
+    """
     from shotcloud.models.continuous_mixture_spatial import ContinuousMixtureSpatial
 
     setup = _build_setup()
@@ -236,16 +229,13 @@ def test_zone_source_bandwidth_sigma_per_shot_invariant_to_shot_xy() -> None:
 # Sanity: the perturbation actually changes downstream log_lik
 # ---------------------------------------------------------------------------
 #
-# This is the positive control. The shot_xy perturbation must change
-# ``log_lik`` (because the kernel evaluation at the observed shot has
-# moved) — otherwise the perturbation is meaningless and any "invariant"
-# test would be vacuously true.
+# Positive control: the shot_xy perturbation must change ``log_lik``
+# (the kernel is evaluated at the moved observation); otherwise every
+# invariance test above would hold vacuously.
 
 
 def test_perturbation_changes_log_lik() -> None:
-    """Positive control: shot_xy perturbation must change log_lik (the
-    kernel is evaluated at y_n, and moving y_n by 25+ ft must change the
-    density). Guards the test pattern itself."""
+    """Moving ``shot_xy`` by roughly 40 ft changes ``log_lik``, so the perturbation is effective."""
     from shotcloud.models.continuous_mixture_spatial import ContinuousMixtureSpatial
 
     setup = _build_setup()

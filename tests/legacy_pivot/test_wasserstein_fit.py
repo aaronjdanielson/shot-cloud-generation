@@ -1,4 +1,4 @@
-"""Tests for :mod:`shotcloud.wasserstein_fit`."""
+"""Tests for :mod:`shotcloud.legacy_pivot.wasserstein_fit`."""
 
 from __future__ import annotations
 
@@ -642,7 +642,7 @@ def test_barycenter_gradient_flows_to_rho() -> None:
 
 
 # ---------------------------------------------------------------------------
-# fit_v2_rho_given_A: the headline V2 prototype
+# fit_v2_rho_given_A: frozen-A barycentric mixture fit
 # ---------------------------------------------------------------------------
 
 
@@ -738,19 +738,13 @@ def test_v2_returns_input_archetypes_unchanged() -> None:
 
 
 def test_v2_recovers_true_rho_better_than_v1_on_barycenter_data() -> None:
-    """The headline V2 success criterion: when Q is generated as the
-    *true* Wasserstein barycenter of A with known ρ_true, **V2
-    recovers ρ_true closely while V1 lands on a different ρ** (because
-    V1's linear ``ρ A`` is a different geometric object from the
-    barycenter even when both use the same atoms).
+    """On barycenter-generated Q, V2 recovers ρ_true while V1 does not.
 
-    Compares mean per-row L1 between recovered and true ρ. The
-    interesting empirical fact this test pins: V1's recovered ρ
-    is *not* the diffuse-toward-uniform pattern we see on real NBA
-    data — on synthetic-from-barycenter data V1 actually finds a
-    *different* ρ that minimizes its (mismatched) reconstruction
-    objective. V2 has the right reconstruction object and recovers
-    ρ_true.
+    When Q is the true Wasserstein barycenter of A with known ρ_true, V2
+    (barycentric reconstruction) recovers ρ_true closely. V1's linear
+    ``ρ A`` is a different geometric object from the barycenter, so its
+    loss-optimal ρ differs from ρ_true even with the same atoms. Compares
+    mean per-row L1 between recovered and true ρ.
     """
     np.random.seed(0)
     ny, nx = 12, 12

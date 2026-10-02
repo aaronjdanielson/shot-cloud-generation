@@ -1,8 +1,8 @@
-"""Tests for :class:`shotcloud.models.AdaptiveDefensiveField`.
+"""Tests for :class:`shotcloud.legacy_pivot.adaptive_defensive.AdaptiveDefensiveField`.
 
 The defensive field is the per-opponent analog of
-:class:`AdaptiveOffensivePrior` (paper §3.4). These tests check the
-load-bearing invariants:
+:class:`~shotcloud.legacy_pivot.adaptive_prior.AdaptiveOffensivePrior`.
+These tests check the load-bearing invariants:
 
 1. Forward returns valid log-probabilities (the field is a simplex
    per row when the row has causal history).
@@ -79,8 +79,7 @@ def _build_setup(
     ctx = enc.transform(df)
 
     # AdaptiveKDE is grouping-agnostic — pass opponent codes as `player_id`
-    # to obtain per-opponent causal histories. This is the canonical
-    # defensive-fit pattern (paper §3.4 implementation note).
+    # to obtain per-opponent causal histories.
     def_kde = AdaptiveKDE(grid=g, bandwidth=bandwidth, max_history=max_history)
     def_kde.fit(
         x=df["x"].to_numpy(),
@@ -174,17 +173,10 @@ def test_causal_mask_drops_post_anchor_history() -> None:
     assert bool(has_history.all())
     # On the rows that have history, pi is a valid simplex.
     assert torch.allclose(pi.sum(dim=-1), torch.ones(B), atol=1e-5)
-    # Concretely: the first opponent's shot dates start at 2024-01-01
-    # and step by one day; only shots dated <2024-02-01 (i.e. the first
-    # ~31 shots out of 60) contribute. Confirm by inspecting the
-    # effective mask directly.
+    # Each opponent's 60 shots start within the first ten days of January
+    # and step by one day, so only those dated before 2024-02-01 (21-31 of
+    # 60) survive the mask. Confirm by inspecting the effective mask directly.
     eff_mask, _, _ = field._causal_history_mask(opp_idx, snapshot_idx)
-    # Each opponent has exactly 60 shots; the offset between opponents
-    # is 60 days, so for opp 0 (dates 2024-01-01 .. 2024-03-01) some
-    # are pre-anchor; for opp 1 (dates 2024-03-01..) none are; for opp
-    # 2 none are. So the row-2 has eff_mask all zero in this corner
-    # case — we don't assert which rows specifically but check the
-    # row-0 mask is non-empty and rows 1, 2 may be empty.
     assert eff_mask[0].sum().item() > 0
 
 

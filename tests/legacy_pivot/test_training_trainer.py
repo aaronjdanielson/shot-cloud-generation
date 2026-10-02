@@ -1,4 +1,4 @@
-"""Tests for :func:`shotcloud.training.train_decoder`.
+"""Tests for :func:`shotcloud.legacy_pivot.trainer.train_decoder`.
 
 The headline test (``test_trainer_recovers_known_tilt_on_synthetic_data``)
 is the load-bearing one: build a synthetic dataset whose true generating
@@ -412,7 +412,7 @@ def test_learnable_weights_run_smoke() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Learnable temperature (Phase 1)
+# Learnable temperature
 # ---------------------------------------------------------------------------
 
 
@@ -437,7 +437,7 @@ def _build_hier_base(seed: int = 0) -> tuple[HierarchicalKDEBase, CourtGrid]:
 
 
 def test_temperature_with_hierarchical_base_smoke() -> None:
-    """Phase-1 happy path: hierarchical base + temperature trains end-to-end."""
+    """Hierarchical base + temperature trains end-to-end."""
     torch.manual_seed(0)
     base, grid = _build_hier_base()
     rng = np.random.default_rng(0)
@@ -575,7 +575,7 @@ def test_temperature_best_val_rollback() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 — defensive product factor
+# Defensive product factor
 # ---------------------------------------------------------------------------
 
 
@@ -650,7 +650,7 @@ def test_defensive_requires_dataset_to_have_defense() -> None:
 
 
 def test_defensive_composes_with_temperature() -> None:
-    """Phase 1 (temperature) + Phase 2 (defensive scale) must train together."""
+    """Temperature and defensive scale train together."""
     torch.manual_seed(0)
     base, def_kde, grid, df = _build_defensive_setup()
     ds = ShotCellDataset(df, base, grid, defensive_kde=def_kde)
@@ -720,7 +720,7 @@ def _build_defensive_setup_with_context(
 
 
 def test_context_temperature_smoke() -> None:
-    """Phase-3 happy path: context-conditioned τ trains end-to-end."""
+    """Context-conditioned τ trains end-to-end."""
     from shotcloud.data import CONTEXT_DIM
 
     torch.manual_seed(0)
@@ -836,7 +836,7 @@ def test_defensive_best_val_rollback() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 4 — adaptive prior
+# Adaptive prior
 # ---------------------------------------------------------------------------
 
 

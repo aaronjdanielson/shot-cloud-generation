@@ -1,4 +1,4 @@
-"""Tests for ``shotcloud.models.pooling_gate``."""
+"""Tests for :class:`shotcloud.models.pooling_gate.PoolingGate`, the own/pooled gate ``λ``."""
 
 from __future__ import annotations
 
@@ -19,8 +19,7 @@ def _inputs(b: int, h_hat: torch.Tensor, history_dim: int = 0):
 
 
 def test_zero_init_g_theta_matches_history_schedule() -> None:
-    """With g_θ zero-init, λ equals the closed-form (b_0, b_H)
-    history schedule exactly."""
+    """With ``g_θ`` zero-initialized, ``λ`` equals the closed-form history schedule."""
     gate = PoolingGate()
     h_hat = torch.tensor([0.0, 25.0, 100.0, 300.0, 1000.0])
     log1p_h, x_n, own_count, own_avail, _ = _inputs(5, h_hat)
@@ -32,8 +31,8 @@ def test_zero_init_g_theta_matches_history_schedule() -> None:
 
 
 def test_lambda_monotone_increasing_in_history() -> None:
-    """λ is non-decreasing in the own-history count for any value of
-    the slope parameter (softplus keeps the slope ≥ 0)."""
+    """``λ`` is non-decreasing in the own-history count for any raw slope ``b_h``
+    (softplus keeps the effective slope non-negative)."""
     torch.manual_seed(0)
     gate = PoolingGate()
     # Perturb b_h to a few values, including negative.
@@ -49,8 +48,7 @@ def test_lambda_monotone_increasing_in_history() -> None:
 
 
 def test_default_schedule_in_target_band() -> None:
-    """The default init lands in the intended band: low at cold-start,
-    rising past 0.5 around H=100."""
+    """The default schedule is low at cold start and near 0.5 around ``H = 100``."""
     gate = PoolingGate()
     assert gate.history_schedule(0.0) < 0.15
     assert 0.25 < gate.history_schedule(25.0) < 0.40
@@ -103,9 +101,8 @@ def test_gradient_flows_to_all_params() -> None:
     lam.sum().backward()
     assert gate.b0.grad is not None and gate.b0.grad.abs() > 0
     assert gate.b_h.grad is not None and gate.b_h.grad.abs() > 0
-    # First g_θ layer receives gradient (chain through the zero-init
-    # output layer is zero at init, but the output layer's own weight
-    # gets gradient from the GELU activations).
+    # The zero-initialized output layer blocks gradient to earlier g_θ layers at
+    # initialization, but its own weight receives gradient from the hidden activations.
     out_layer = gate.g_theta[-1]
     assert out_layer.weight.grad is not None and out_layer.weight.grad.abs().sum() > 0
 

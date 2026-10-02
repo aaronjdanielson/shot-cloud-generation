@@ -1,4 +1,5 @@
-"""Tests for ``shotcloud.simulation.sampler``."""
+"""Tests for :func:`shotcloud.simulation.sampler.sample_locations`, the continuous-mixture
+location sampler."""
 
 from __future__ import annotations
 
@@ -33,8 +34,7 @@ def test_output_shape_and_inside_court() -> None:
 
 
 def test_concentrated_omega_samples_near_chosen_support() -> None:
-    """When ω is concentrated on a single support shot, samples
-    cluster around it within ~3σ."""
+    """With ``ω`` concentrated on one support shot, the sample mean is near that shot."""
     torch.manual_seed(0)
     b, m, n = 1, 5, 200
     support_xy = torch.tensor([[[-15.0, 5.0], [0.0, 25.0], [15.0, 5.0], [0.0, 8.0], [10.0, 15.0]]])
@@ -52,9 +52,11 @@ def test_concentrated_omega_samples_near_chosen_support() -> None:
 
 
 def test_clip_fallback_keeps_samples_inside_court_even_for_edge_centers() -> None:
-    """A support shot at the court boundary + a fat σ could in
-    principle put samples outside on every attempt. The clip
-    fallback guarantees the return is always inside the court."""
+    """Samples stay inside the court for a support shot on the sideline with a wide σ.
+
+    When rejection sampling exhausts ``max_attempts``, remaining draws are clipped to
+    the court.
+    """
     torch.manual_seed(0)
     b, m, n = 1, 1, 100
     # Center exactly on the right sideline; huge σ → most draws are off-court.
@@ -83,10 +85,11 @@ def test_deterministic_with_generator() -> None:
 
 
 def test_cold_start_row_samples_without_error() -> None:
-    """A row with all log_omega == -inf would otherwise crash
-    multinomial. The sampler patches it with a uniform-on-slot-0
-    fallback so the call is safe; the caller is expected to filter
-    cold rows from downstream aggregation."""
+    """A cold-start row (all ``log_omega = -inf``) samples without error.
+
+    The sampler draws such rows from slot 0 so ``multinomial`` stays well defined;
+    callers exclude cold rows from downstream aggregation.
+    """
     b, m, n = 2, 4, 3
     support_xy = torch.tensor([[[0.0, 0.0], [1.0, 1.0], [2.0, 2.0], [3.0, 3.0]]] * b)
     log_w = torch.zeros(b, m)

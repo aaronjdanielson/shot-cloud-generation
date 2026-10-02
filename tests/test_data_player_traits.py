@@ -1,14 +1,10 @@
-"""Tests for :mod:`shotcloud.data.player_traits`.
+"""Tests for :mod:`shotcloud.data.player_traits`, the per-(player, snapshot) trait builder.
 
-Verifies the 26-dim per-(player, snapshot) trait builder for the
-collaborative-KDE pivot. Coverage focuses on the load-bearing
-invariants:
-
-* causal time-filtering (snapshot t_m sees only data with date < t_m)
-* missingness mechanic (Block B exactly zero when m_play = 0)
-* shape contract (n_players, n_snapshots, TRAIT_DIM=26)
-* deterministic and reproducible
-* z-score behavior for biographical block (NaN imputed to 0)
+Covers causal time filtering (snapshot t_m sees only data dated before t_m),
+the missingness mechanic (Block B is exactly zero when m_play = 0), the
+``(n_players, n_snapshots, TRAIT_DIM)`` shape contract, determinism, and
+z-scoring of the biographical block: statistics from the players active
+before the anchor, with NaN imputed to 0.
 """
 
 from __future__ import annotations
@@ -73,7 +69,7 @@ def _synth_bio(player_ids: list[int]) -> pd.DataFrame:
 
 
 def _synth_game_logs(player_id_to_n_games: dict[int, int]) -> pd.DataFrame:
-    """Build a synthetic game_logs frame with player_id, game_date, minutes, fga, fta, tov."""
+    """Build a synthetic game-logs frame with the columns the trait builder reads."""
     rng = np.random.default_rng(1)
     base_date = pd.Timestamp("2024-01-01")
     rows = []
@@ -140,9 +136,7 @@ def test_output_shape_matches_inputs() -> None:
 
 
 def test_causality_only_uses_pre_anchor_data() -> None:
-    """A player whose first game is AFTER the snapshot anchor should be
-    cold-start at that anchor (Block B all zero, m_play = 0), even if
-    they have games later in the dataset."""
+    """A player whose first game follows the anchor is cold-start: Block B zero, m_play = 0."""
     # Player 1: games all in Feb. Player 2: games all in May.
     base = pd.Timestamp("2024-01-01")
     gl = pd.DataFrame(
@@ -356,7 +350,7 @@ def test_builder_is_deterministic() -> None:
 
 
 def test_z_score_imputes_missing_bio_to_zero() -> None:
-    """A player with NaN height/weight/age should get 0 in those slots."""
+    """NaN height, weight, and age z-score to 0."""
     shots = _synth_shots({1: 50, 2: 50})
     gl = _synth_game_logs({1: 30, 2: 30})
     # Player 2 has NaN height/weight/birthdate.
@@ -407,15 +401,115 @@ def test_z_score_imputes_missing_bio_to_zero() -> None:
     )
 
 
+def _bio_rows(heights: dict[int, float]) -> pd.DataFrame:
+    """Bio frame with the given heights and a shared weight, birthdate, and position."""
+    return pd.DataFrame(
+        [
+            {
+                "player_id": pid,
+                "display_name": f"Player {pid}",
+                "birthdate": pd.Timestamp("1995-01-01"),
+                "height_inches": height,
+                "weight_lbs": 200,
+                "position_raw": "Guard",
+                "position_group": "SG",
+                "status": "ok",
+            }
+            for pid, height in heights.items()
+        ]
+    )
+
+
+def _games(player_id: int, first_day: str, n_games: int = 5) -> list[dict[str, object]]:
+    """Game-log rows for one player on consecutive days from ``first_day``."""
+    return [
+        {
+            "player_id": player_id,
+            "game_date": pd.Timestamp(first_day) + pd.Timedelta(days=i),
+            "minutes": 30,
+            "fga": 12,
+            "fta": 3,
+            "tov": 2,
+        }
+        for i in range(n_games)
+    ]
+
+
+def _single_anchor_store(anchor: str) -> object:
+    shots = _synth_shots({1: 50, 2: 50})
+    return build_snapshot_store_from_shots(
+        shots,
+        [np.datetime64(anchor, "D")],
+        role_profile_fn=lambda sub: build_role_profiles(sub, min_shots=1),
+    )
+
+
+def test_bio_z_scores_use_only_players_active_before_anchor() -> None:
+    """Height is standardized by the mean and std of players with games before the anchor."""
+    store = _single_anchor_store("2024-03-15")
+    # Players 1 and 2 play before the anchor; player 3 debuts after it.
+    gl = pd.DataFrame(
+        [*_games(1, "2024-01-01"), *_games(2, "2024-01-01"), *_games(3, "2024-05-01")]
+    )
+    bio = _bio_rows({1: 72.0, 2: 76.0, 3: 80.0})
+
+    table = build_player_traits_table(
+        snapshot_store=store, vocab_ids=[1, 2, 3], bio_df=bio, game_logs_df=gl
+    )
+    # Reference population {72, 76}: mean 74, std 2. The later debut is
+    # standardized with those statistics and does not enter them.
+    np.testing.assert_allclose(table.traits[:, 0, 0], [-1.0, 1.0, 3.0], atol=1e-6)
+
+
+def test_bio_z_scores_unchanged_by_adding_a_later_debut() -> None:
+    """Adding a player who debuts after the anchor leaves the others' Block A unchanged."""
+    store = _single_anchor_store("2024-03-15")
+    gl_before = pd.DataFrame([*_games(1, "2024-01-01"), *_games(2, "2024-01-01")])
+    gl_after = pd.concat([gl_before, pd.DataFrame(_games(3, "2024-05-01"))], ignore_index=True)
+
+    without = build_player_traits_table(
+        snapshot_store=store,
+        vocab_ids=[1, 2],
+        bio_df=_bio_rows({1: 72.0, 2: 76.0}),
+        game_logs_df=gl_before,
+    )
+    with_debut = build_player_traits_table(
+        snapshot_store=store,
+        vocab_ids=[1, 2, 3],
+        bio_df=_bio_rows({1: 72.0, 2: 76.0, 3: 90.0}),
+        game_logs_df=gl_after,
+    )
+    np.testing.assert_array_equal(
+        with_debut.traits[:2, 0, :BLOCK_A_END], without.traits[:, 0, :BLOCK_A_END]
+    )
+
+
+def test_bio_reference_population_is_limited_to_the_window() -> None:
+    """A player whose games all precede the reference window is not in the statistics."""
+    store = _single_anchor_store("2024-03-15")
+    # Player 3's games end more than 30 days before the anchor.
+    gl = pd.DataFrame(
+        [*_games(1, "2024-03-01"), *_games(2, "2024-03-01"), *_games(3, "2024-01-01")]
+    )
+    bio = _bio_rows({1: 72.0, 2: 76.0, 3: 80.0})
+
+    table = build_player_traits_table(
+        snapshot_store=store,
+        vocab_ids=[1, 2, 3],
+        bio_df=bio,
+        game_logs_df=gl,
+        reference_window_days=30.0,
+    )
+    np.testing.assert_allclose(table.traits[:, 0, 0], [-1.0, 1.0, 3.0], atol=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # Vocab-bundle alignment
 # ---------------------------------------------------------------------------
 
 
 def test_vocab_player_not_in_bundle_has_zero_block_b() -> None:
-    """A vocab player who has no shots before any anchor (so not in
-    bundle.player_ids) gets zero Block B and m_play=0, just like a
-    cold-start player. This tests the bundle-lookup fallback path."""
+    """A vocabulary player absent from ``bundle.player_ids`` gets Block B = 0 and m_play = 0."""
     # Player 5 has zero shots — not in bundle at all.
     shots = _synth_shots({1: 50, 2: 50})  # only players 1 and 2 have shots
     bio = _synth_bio([1, 2, 5])  # bio for 5 still

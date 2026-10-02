@@ -1,7 +1,4 @@
-"""Tests for ``shotcloud.utils.determinism.set_global_determinism``.
-
-Added 2026-06-10 per audit fix H5.
-"""
+"""Tests for :func:`shotcloud.utils.determinism.set_global_determinism`."""
 
 from __future__ import annotations
 
@@ -44,8 +41,7 @@ def test_torch_cpu_seed_is_reproducible() -> None:
 
 
 def test_idempotent_same_seed_same_state() -> None:
-    """Calling twice with the same seed produces the same RNG sequence
-    on the second call as on the first."""
+    """Repeated calls with the same seed leave the same RNG state."""
     set_global_determinism(99)
     set_global_determinism(99)  # second call same seed
     a = torch.randn(50)
@@ -55,7 +51,7 @@ def test_idempotent_same_seed_same_state() -> None:
 
 
 def test_different_seeds_give_different_sequences() -> None:
-    """Sanity: the seed actually matters."""
+    """Different seeds give different sequences."""
     set_global_determinism(0)
     a = torch.randn(20)
     set_global_determinism(1)
@@ -64,11 +60,10 @@ def test_different_seeds_give_different_sequences() -> None:
 
 
 def test_cuda_flags_set_when_cuda_available() -> None:
-    """When CUDA is available (skip otherwise), cudnn flags are set and
-    CUBLAS_WORKSPACE_CONFIG is exported. Skipped on the CPU/MPS test
-    runners we use; the assertion-on-skip pattern keeps it honest."""
+    """With CUDA available, the cuDNN flags and ``CUBLAS_WORKSPACE_CONFIG`` are set;
+    without CUDA, ``device="cuda"`` is accepted without error."""
     if not torch.cuda.is_available():
-        # Test machine has no CUDA — verify the helper does NOT raise.
+        # Without CUDA, only check that the call does not raise.
         set_global_determinism(0, device="cuda")
         return
     set_global_determinism(0, device="cuda")
@@ -78,9 +73,8 @@ def test_cuda_flags_set_when_cuda_available() -> None:
 
 
 def test_use_deterministic_algorithms_is_flipped() -> None:
-    """``torch.use_deterministic_algorithms(True, warn_only=True)`` is
-    set so any future code that uses a non-deterministic op gets a
-    visible warning rather than silent non-reproducibility."""
+    """Deterministic algorithms are enabled (with ``warn_only=True`` by default), so a
+    non-deterministic op produces a warning instead of silently varying."""
     set_global_determinism(0)
     # PyTorch reads back the flag via torch.are_deterministic_algorithms_enabled.
     assert torch.are_deterministic_algorithms_enabled() is True

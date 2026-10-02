@@ -60,13 +60,15 @@ class RetrievalCacheConfig:
     Two caches with the same ``config_hash`` are guaranteed to have
     identical contents *given the same shots DataFrame and traits
     tensor*. The caller is responsible for keeping the shots fingerprint
-    in sync with the actual data file (see :func:`shots_fingerprint`);
-    the trait tensor is assumed deterministic given the same snapshot
-    store and biographical data.
+    in sync with the actual data file (see :func:`shots_fingerprint`) and
+    for setting ``traits_hash`` (see :func:`traits_fingerprint`), since
+    pooled candidates are ranked by trait similarity. An empty
+    ``traits_hash`` leaves the trait values out of the cache key.
     """
 
     shots_fingerprint: str
     anchor_dates: tuple[int, ...]
+    traits_hash: str = ""
     own_support_max: int = DEFAULT_OWN_SUPPORT_MAX
     pooled_support_max: int = DEFAULT_POOLED_SUPPORT_MAX
     pooled_recency_window_days: int = DEFAULT_POOLED_RECENCY_WINDOW_DAYS
@@ -109,6 +111,8 @@ class RetrievalCacheConfig:
             "similarity_kind": self.similarity_kind,
             "seed": self.seed,
         }
+        if self.traits_hash:
+            payload["traits_hash"] = self.traits_hash
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
@@ -298,7 +302,9 @@ def build_retrieval_cache(
         ``config.anchor_dates``.
     traits : Tensor of shape ``(P, S, T)``
         Per-snapshot causal player-trait vectors; pooled candidates are
-        ranked by cosine similarity in this space.
+        ranked by cosine similarity in this space. When
+        ``config.traits_hash`` is set it must equal
+        ``traits_fingerprint(traits)``.
     config : RetrievalCacheConfig
         Retrieval settings; their hash names the cache file.
     cache_dir : Path or None
@@ -318,8 +324,9 @@ def build_retrieval_cache(
     Raises
     ------
     ValueError
-        If ``anchor_dates`` disagrees with ``config.anchor_dates`` or
-        ``traits`` has the wrong shape.
+        If ``anchor_dates`` disagrees with ``config.anchor_dates``,
+        ``traits`` has the wrong shape, or ``config.traits_hash`` is set
+        and does not match ``traits``.
     """
     if anchor_dates.ndim != 1:
         raise ValueError(f"anchor_dates must be 1D; got shape {anchor_dates.shape}")
@@ -338,6 +345,12 @@ def build_retrieval_cache(
     if traits.shape[0] != n_players:
         raise ValueError(
             f"traits.shape[0]={traits.shape[0]} must equal len(player_vocab)={n_players}"
+        )
+
+    if config.traits_hash and config.traits_hash != traits_fingerprint(traits):
+        raise ValueError(
+            "config.traits_hash does not match traits "
+            "(the hash depends on it; mismatch would corrupt the cache key)"
         )
 
     if cache_dir is not None and not rebuild:
@@ -373,6 +386,17 @@ def build_retrieval_cache(
     return cache
 
 
+def traits_fingerprint(traits: Tensor | np.ndarray) -> str:
+    """Return a 16-character hex SHA-256 of the trait values for the cache key.
+
+    Used as :attr:`RetrievalCacheConfig.traits_hash`, so a cache built from
+    one trait table is never reused with another.
+    """
+    values = traits.detach().cpu().numpy() if isinstance(traits, Tensor) else traits
+    arr = np.ascontiguousarray(values, dtype=np.float32)
+    return hashlib.sha256(arr.tobytes()).hexdigest()[:16]
+
+
 def shots_fingerprint(shots_path: Path) -> str:
     """Return a cheap fingerprint of the shots file for the cache key.
 
@@ -399,4 +423,5 @@ __all__ = [
     "RetrievalCacheConfig",
     "build_retrieval_cache",
     "shots_fingerprint",
+    "traits_fingerprint",
 ]

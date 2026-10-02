@@ -1,4 +1,5 @@
-"""Tests for the torch-vectorized zone_from_xy."""
+"""Tests for :func:`shotcloud.data.zones.zone_from_xy_torch`, the torch-vectorized zone
+assignment."""
 
 from __future__ import annotations
 
@@ -19,8 +20,8 @@ def test_shape_mismatch_raises() -> None:
 
 
 def test_matches_numpy_on_grid() -> None:
-    """The torch version must produce identical labels to
-    ``zone_from_xy_vectorized`` on a regular grid spanning the court."""
+    """The torch version matches ``zone_from_xy_vectorized`` on a regular grid spanning
+    the court."""
     xs = np.linspace(-26.0, 26.0, 60, dtype=np.float64)
     ys = np.linspace(-6.0, 48.0, 60, dtype=np.float64)
     gx, gy = np.meshgrid(xs, ys, indexing="xy")
@@ -30,7 +31,7 @@ def test_matches_numpy_on_grid() -> None:
 
 
 def test_matches_scalar_on_random_points() -> None:
-    """1000 random points should give the same zone in both forms."""
+    """The torch version matches the scalar ``zone_from_xy`` on 1000 random points."""
     rng = np.random.default_rng(0)
     xs = rng.uniform(-27.0, 27.0, size=1000)
     ys = rng.uniform(-7.0, 49.0, size=1000)
@@ -40,8 +41,8 @@ def test_matches_scalar_on_random_points() -> None:
 
 
 def test_zone_specific_landmarks() -> None:
-    """Hand-picked points within each zone (avoiding the boundaries
-    that the B1 centroid choices sit on) must assign correctly."""
+    """Hand-picked points well inside each zone (away from zone boundaries) get the
+    expected zone."""
     points = torch.tensor(
         [
             (0.0, 1.0),  # RA

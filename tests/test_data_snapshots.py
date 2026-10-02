@@ -1,13 +1,11 @@
-"""Tests for the SnapshotStore + SnapshotBundle (Causal Snapshot Principle).
+"""Tests for :class:`~shotcloud.data.SnapshotStore` and :class:`~shotcloud.data.SnapshotBundle`.
 
-The headline test :func:`test_snapshot_store_strict_causality` is the
-operational form of paper Proposition 1 (Temporal Validity): for any
-prediction time t, every object returned by :func:`get_snapshot(t)`
-was built using data strictly before t. A passing assertion closes
-the entire Class-A leakage taxonomy.
-
-See [docs/architecture.md](../docs/architecture.md) and the
-collaboration-binding doctrine in [CLAUDE.md](../CLAUDE.md).
+The central test, :func:`test_snapshot_store_strict_causality`, is the
+operational form of the paper's *Temporal validity* proposition: for every
+anchor ``t_i``, every shot indexed by the bundle is dated strictly before
+``t_i``, so any object returned by ``get_snapshot(t)`` is built only from data
+before ``t``. The remaining tests cover bundle validation, anchor lookup
+semantics, and the builder's per-anchor callbacks.
 """
 
 from __future__ import annotations
@@ -27,11 +25,11 @@ from shotcloud.data import (
 
 
 def _synthetic_shots(seed: int = 0, n_per_day: int = 3) -> pd.DataFrame:
-    """Tiny synthetic shot table spanning 2018-01-01 .. 2020-12-31.
+    """Build a small weekly shot table spanning 2018 through 2020.
 
-    Three players (1,2,3) shoot vs three opponents (BOS, LAL, GSW),
-    one row per (date, slot). Made flag is uniformly random. The frame
-    is intentionally small so causality assertions are exhaustive.
+    Three players (1, 2, 3) shoot against three opponents (BOS, LAL, GSW),
+    ``n_per_day`` rows per week, with Bernoulli(0.45) makes. The frame is
+    small enough for causality assertions to check every row.
     """
     rng = np.random.default_rng(seed)
     rows = []
@@ -246,10 +244,7 @@ def test_builder_raises_when_no_anchor_has_prior_shots() -> None:
 
 
 def test_snapshot_store_strict_causality() -> None:
-    """Headline test: for any anchor t_i, every shot indexed in the bundle
-    has date strictly less than t_i. This is the operational form of
-    paper Proposition 1 (Temporal Validity).
-    """
+    """Every shot indexed by a bundle at anchor ``t_i`` is dated strictly before ``t_i``."""
     shots = _synthetic_shots()
     anchors = [
         np.datetime64("2018-06-01"),
@@ -294,7 +289,7 @@ def test_assert_causal_catches_leakage() -> None:
 
 
 def test_builder_player_history_indices_are_per_player_only() -> None:
-    """Sanity: a player's history pool contains only that player's shots."""
+    """A player's history pool contains only that player's shots."""
     shots = _synthetic_shots()
     anchors = [np.datetime64("2019-06-01"), np.datetime64("2020-06-01")]
     store = build_snapshot_store_from_shots(shots, anchors)
@@ -306,7 +301,7 @@ def test_builder_player_history_indices_are_per_player_only() -> None:
 
 
 def test_builder_defensive_history_indices_are_per_opp_only() -> None:
-    """Sanity: an opponent's allowed-shot pool contains only shots vs that opp."""
+    """An opponent's allowed-shot pool contains only shots against that opponent."""
     shots = _synthetic_shots()
     anchors = [np.datetime64("2019-06-01"), np.datetime64("2020-06-01")]
     store = build_snapshot_store_from_shots(shots, anchors)
@@ -361,8 +356,7 @@ def test_builder_invokes_archetype_fit_fn() -> None:
 
 
 def test_builder_passes_anchor_date_to_archetype_fit_fn() -> None:
-    """archetype_fit_fn receives the corresponding anchor date so callers can
-    drive per-anchor checkpointing."""
+    """``archetype_fit_fn`` receives each bundle's anchor date, in chronological order."""
     K, n_cells = 4, 50
     seen: list[np.datetime64] = []
 
@@ -380,7 +374,7 @@ def test_builder_passes_anchor_date_to_archetype_fit_fn() -> None:
 
 
 def test_builder_opp_efficiency_bins_use_only_filtered_made_rate() -> None:
-    """Opp-strength bins for a given anchor are a function of past shots only."""
+    """Opponent-efficiency bins at an anchor depend only on shots before that anchor."""
     shots = _synthetic_shots()
     anchors = [np.datetime64("2019-01-01"), np.datetime64("2020-01-01")]
     store = build_snapshot_store_from_shots(shots, anchors)

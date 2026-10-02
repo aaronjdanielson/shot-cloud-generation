@@ -1,19 +1,17 @@
-"""Tests for the inline cloud-metric helpers in ``scripts/evaluate_shot_clouds``.
+"""Tests for the cloud-metric helpers in ``scripts/evaluate_shot_clouds.py``.
 
-Added 2026-06-10 per audit fix M2. The helpers ``_zone_proportions``,
-``_rim_distances``, ``_metrics_for_bootstrap``, and
-``_self_bootstrap_metrics`` are inline in the eval entry-point and
-produce Table 5's model + self-bootstrap-floor numbers. A bug here
-silently changes the central paper claim.
+``_zone_proportions``, ``_rim_distances``, ``_metrics_for_bootstrap``, and
+``_self_bootstrap_metrics`` compute the per-game cloud metrics and the
+self-bootstrap noise floor reported for every model. The tests check:
 
-Coverage:
-- ``_zone_proportions``: 8-bin output sums to 1; OOB dropped before
-  normalization; all-OOB returns NaN.
-- ``_rim_distances``: ‖y‖ Euclidean from origin.
-- ``_metrics_for_bootstrap``: 6 keys present; energy distance ≈ 0 for
-  identical clouds; zone_l1 ∈ [0, 2]; scaling property on rim metrics.
-- ``_self_bootstrap_metrics``: returns 6 averaged metrics; deterministic
-  with seeded RNG; aggregate energy ≈ 0 when observed is large.
+- ``_zone_proportions``: the 8-zone output sums to 1, out-of-court shots are
+  dropped before normalization, and an all-out-of-court cloud returns NaN.
+- ``_rim_distances``: Euclidean distance from the basket at the origin.
+- ``_metrics_for_bootstrap``: all six metric keys are present and finite,
+  identical clouds score zero (energy distance slightly negative), zone L1
+  lies in [0, 2], and the mean-distance error is non-negative.
+- ``_self_bootstrap_metrics``: one averaged value per metric, deterministic
+  under a seeded RNG, and a small floor on large observed clouds.
 """
 
 from __future__ import annotations

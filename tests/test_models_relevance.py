@@ -1,4 +1,6 @@
-"""Tests for the Phase-4 :class:`shotcloud.models.RelevanceScore`."""
+"""Tests for the structured :class:`shotcloud.models.RelevanceScore` and its MLP
+alternative :class:`shotcloud.models.RelevanceMLP`.
+"""
 
 from __future__ import annotations
 
@@ -22,7 +24,7 @@ def _make_canonical_x(
 
 
 def test_default_init_gives_zero_logits() -> None:
-    """All five params init at 0 → logits = 0 → softmax = uniform."""
+    """All five parameters start at 0, so logits are zero and the softmax is uniform."""
     m = RelevanceScore()
     z_j = torch.randn(2, 5, CONTEXT_DIM)
     x_n = torch.randn(2, CONTEXT_DIM)
@@ -49,7 +51,7 @@ def test_period_match_responds_to_beta_q() -> None:
 
 
 def test_time_similarity_responds_to_beta_m() -> None:
-    """With β_m > 0, time-near-target shots get higher logits."""
+    """With β_m > 0, shots closer in time to the target get higher logits."""
     m = RelevanceScore(init_beta_m=5.0)
     z_j = torch.stack(
         [
@@ -183,7 +185,7 @@ def test_beta_max_caps_effective_value() -> None:
 
 
 def test_beta_max_bound_acts_in_logits() -> None:
-    """The bound is what enters the logits — verify by overshooting raw θ."""
+    """The bounded β, not the raw θ, enters the logits."""
     z_j = torch.zeros(1, 2, CONTEXT_DIM)
     z_j[0, 0, FEATURE_LAYOUT["period_onehot"].start] = 1.0  # shot 0 matches period 1
     x_n = _make_canonical_x(period=1, time_in_period=0.0, recency=0.0, opp_bucket=0).unsqueeze(0)
@@ -200,7 +202,7 @@ def test_beta_max_bound_acts_in_logits() -> None:
 
 
 def test_beta_max_invalid_raises() -> None:
-    """Invalid beta_max values are caught at init."""
+    """Invalid ``beta_max`` values raise at construction."""
     with pytest.raises(ValueError, match="beta_max must be positive or None"):
         RelevanceScore(beta_max=0.0)
     with pytest.raises(ValueError, match="beta_max must be positive or None"):
@@ -208,7 +210,7 @@ def test_beta_max_invalid_raises() -> None:
 
 
 def test_beta_max_init_at_boundary_raises() -> None:
-    """init |β| ≥ β_max would saturate the tanh inverse."""
+    """An initial ``|β| ≥ β_max`` raises, since the tanh inverse would diverge."""
     with pytest.raises(ValueError, match="strictly within"):
         RelevanceScore(init_beta_q=2.0, beta_max=2.0)
     with pytest.raises(ValueError, match="strictly within"):
@@ -216,7 +218,7 @@ def test_beta_max_init_at_boundary_raises() -> None:
 
 
 def test_beta_max_gradient_flows() -> None:
-    """Gradient through tanh wrap reaches the underlying θ parameter."""
+    """Gradient through the tanh bound reaches the underlying θ parameters."""
     m = RelevanceScore(beta_max=2.0)
     z_j = torch.randn(2, 5, CONTEXT_DIM, requires_grad=False)
     x_n = torch.randn(2, CONTEXT_DIM, requires_grad=False)
@@ -232,7 +234,7 @@ def test_beta_max_gradient_flows() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RelevanceMLP — drop-in replacement (2026-05-15 architectural pivot)
+# RelevanceMLP
 # ---------------------------------------------------------------------------
 
 
@@ -240,11 +242,8 @@ from shotcloud import RelevanceMLP  # noqa: E402
 
 
 def test_mlp_default_init_gives_uniform_softmax() -> None:
-    """Zero-init output layer → logits all zero → softmax uniform.
-
-    This preserves the AdaptiveOffensivePrior warm-up contract: at
-    init, π is uniform → q_self is a uniform-weighted KDE over the
-    player's history, matching the RelevanceScore() default.
+    """The zero-initialized output layer gives zero logits and a uniform softmax,
+    matching the ``RelevanceScore()`` default.
     """
     m = RelevanceMLP(context_dim=CONTEXT_DIM, hidden_dim=16)
     z_j = torch.randn(3, 7, CONTEXT_DIM)
@@ -258,7 +257,7 @@ def test_mlp_default_init_gives_uniform_softmax() -> None:
 
 
 def test_mlp_with_trained_output_layer_produces_nonuniform_logits() -> None:
-    """Sanity check: when fc2 is nonzero, the MLP actually discriminates."""
+    """With a nonzero ``fc2`` the logits vary across history shots."""
     m = RelevanceMLP(context_dim=CONTEXT_DIM, hidden_dim=16)
     torch.nn.init.normal_(m.fc2.weight, std=0.5)
     torch.nn.init.zeros_(m.fc2.bias)
@@ -272,7 +271,7 @@ def test_mlp_with_trained_output_layer_produces_nonuniform_logits() -> None:
 
 
 def test_mlp_mask_zeros_padded_positions() -> None:
-    """Padded positions get -inf logits → 0 softmax weight."""
+    """Padded positions get -inf logits and zero softmax weight."""
     m = RelevanceMLP(context_dim=CONTEXT_DIM, hidden_dim=8)
     # Force fc2 nonzero so the unmasked logits aren't already all zero.
     torch.nn.init.normal_(m.fc2.weight, std=0.5)
@@ -297,7 +296,7 @@ def test_mlp_mask_zeros_padded_positions() -> None:
 
 
 def test_mlp_consumes_games_ago_when_supplied() -> None:
-    """When games_ago changes, logits change too — feature actually feeds in."""
+    """Changing ``games_ago`` changes the logits."""
     m = RelevanceMLP(context_dim=CONTEXT_DIM, hidden_dim=16)
     # Make fc2 nonzero so the MLP can react.
     torch.nn.init.normal_(m.fc2.weight, std=0.5)
@@ -312,10 +311,10 @@ def test_mlp_consumes_games_ago_when_supplied() -> None:
 
 
 def test_mlp_gradient_flows_to_all_params() -> None:
-    """Backward through the MLP touches both fc1 and fc2 params."""
+    """Backward through the MLP reaches both ``fc1`` and ``fc2``."""
     m = RelevanceMLP(context_dim=CONTEXT_DIM, hidden_dim=16)
-    # fc2 starts at zero so the loss landscape is initially flat in fc1 —
-    # perturb fc2 to get a meaningful gradient through both layers.
+    # fc2 starts at zero, which blocks gradient to fc1; perturb it so both layers
+    # receive gradient.
     torch.nn.init.normal_(m.fc2.weight, std=0.5)
     z_j = torch.randn(2, 5, CONTEXT_DIM)
     x_n = torch.randn(2, CONTEXT_DIM)
@@ -348,8 +347,8 @@ def test_mlp_params_as_floats_returns_layer_norms() -> None:
 
 
 def test_mlp_drop_in_replaces_structured_in_adaptive_offensive_prior() -> None:
-    """The MLP is duck-type compatible with AdaptiveOffensivePrior's
-    expectations: same forward/softmax shape, same callable contract."""
+    """``RelevanceMLP`` can replace ``RelevanceScore`` inside the grid-cell
+    ``AdaptiveOffensivePrior`` (same forward and softmax contract)."""
     import numpy as np
     import pandas as pd
 
@@ -409,7 +408,7 @@ def test_mlp_drop_in_replaces_structured_in_adaptive_offensive_prior() -> None:
     assert log_q.shape == (B, g.n_cells)
     assert pi.shape == (B, prior.max_history)
     assert omega.shape == (B,)
-    # log_q normalizes to ones in exp space.
+    # exp(log_q) sums to 1 over the grid cells.
     import numpy as _np
 
     _np.testing.assert_allclose(torch.exp(log_q).sum(dim=-1).detach(), torch.ones(B), atol=1e-4)

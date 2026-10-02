@@ -168,7 +168,8 @@ def fit_density_grid(
         ``epsilon / n_cells`` for strict positivity.
     effective_n : float
         ``weights.sum()`` — the (recency-weighted) sample size. Used by
-        the shrinkage formula in :class:`HierarchicalKDE`.
+        the shrinkage formula in
+        :class:`~shotcloud.kde.hierarchical.HierarchicalKDE`.
     """
     g = grid
     effective_n = float(weights.sum())

@@ -1,11 +1,11 @@
-"""Tests for the Tier-2 anisotropic kernel modules.
+"""Tests for the per-zone anisotropic kernels in :mod:`shotcloud.models.anisotropic_kernel`.
 
-Scope:
+``RadialTangentZoneKernel`` (RT) and ``FullCovarianceZoneKernel`` (FC) are
+alternatives to the isotropic support kernel. Scope:
 
-* Isotropic-collapse invariant (load-bearing): both kernels at
-  ``σ_r = σ_t = σ_init`` (resp. ``σ_x = σ_y = σ_init, ρ = 0``) reduce
-  bit-exactly (float32 noise) to the fixed-σ isotropic Gaussian
-  ``-log(2π) − log(σ²) − ½ ‖δ‖²/σ²``.
+* Isotropic-collapse invariant: both kernels at ``σ_r = σ_t = σ_init``
+  (resp. ``σ_x = σ_y = σ_init, ρ = 0``) reduce, to float32 precision, to the
+  fixed-σ isotropic Gaussian ``-log(2π) − log(σ²) − ½ ‖δ‖²/σ²``.
 * Parameter counts: RT = 2 × N_ZONES; FC = 3 × N_ZONES.
 * Bounded σ / ρ stay in range under extreme raw logits.
 * Per-zone divergence: tweaking one zone's σ shifts only that zone's
@@ -15,9 +15,9 @@ Scope:
 * Gradient flow to every parameter.
 * State-dict round-trip preserves learned values.
 * Input shape validation.
-* The RT kernel's r̂_m / t̂_m frame is correctly basket-centered:
-  a shot directly outward from a support shot toward the basket sees
-  only σ_r; a shot perpendicular sees only σ_t.
+* The RT kernel's r̂_m / t̂_m frame is basket-centered: in the quadratic
+  form, a displacement along the basket-radial direction sees only σ_r and a
+  perpendicular displacement sees only σ_t.
 """
 
 from __future__ import annotations
@@ -80,13 +80,7 @@ def test_fc_kernel_param_count() -> None:
 
 
 def test_rt_at_init_matches_isotropic_kernel() -> None:
-    """**Load-bearing invariant for Tier-2 Option 1.**
-
-    At ``σ_r = σ_t = σ_init = 1.5``, the radial-tangential kernel must
-    reduce bit-exactly (to float32 precision) to the fixed-σ=1.5
-    isotropic Gaussian, regardless of shot position. This is the
-    "anisotropic-collapses-to-isotropic-at-init" identity.
-    """
+    """At init (``σ_r = σ_t = 1.5``) the RT kernel equals the isotropic σ=1.5 Gaussian."""
     rt = RadialTangentZoneKernel(sigma_min=1.0, sigma_max=2.5, sigma_init=1.5)
     support, shot = _random_batch(B=4, M=11)
     out = rt(support_xy=support, shot_xy=shot)
@@ -95,12 +89,7 @@ def test_rt_at_init_matches_isotropic_kernel() -> None:
 
 
 def test_fc_at_init_matches_isotropic_kernel() -> None:
-    """**Load-bearing invariant for Tier-2 Option 3.**
-
-    At ``σ_x = σ_y = σ_init = 1.5, ρ = 0``, the bounded-correlation
-    kernel must reduce bit-exactly to the fixed-σ=1.5 isotropic
-    Gaussian.
-    """
+    """At init (``σ_x = σ_y = 1.5, ρ = 0``) the FC kernel equals the isotropic σ=1.5 Gaussian."""
     fc = FullCovarianceZoneKernel(
         sigma_min=1.0, sigma_max=2.5, sigma_init=1.5, rho_max=0.8, rho_init=0.0
     )
@@ -423,5 +412,5 @@ def test_fc_matches_closed_form_bivariate_gaussian_density() -> None:
 
 
 def _zone_sigma_at_init_sanity() -> None:
-    """Helper used by the float64 check; suppress unused-import lint."""
+    """Reference ``numpy`` so linters do not flag the import as unused."""
     _ = np.zeros(1)

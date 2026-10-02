@@ -1,4 +1,4 @@
-"""Tests for ``nll_per_shot`` / ``base_measure_nll_per_shot`` against a real ShotCloudProcess.
+"""Tests for ``nll_per_shot`` / ``base_measure_nll_per_shot`` on a fitted ShotCloudProcess.
 
 These tests exercise the full evaluation stack end-to-end: fit a KDE, build
 a process, sample observations, compute spatial NLL.

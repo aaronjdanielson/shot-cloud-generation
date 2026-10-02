@@ -39,7 +39,7 @@ def _canonical_synthetic(n: int = 50) -> pd.DataFrame:
 
 
 def _nba_stats_synthetic(n: int = 50) -> pd.DataFrame:
-    """Synthetic NBA Stats CSV: tenths-of-feet, uppercase columns, etc."""
+    """Build a synthetic NBA Stats frame with uppercase columns and tenths-of-feet coordinates."""
     rng = np.random.default_rng(1)
     return pd.DataFrame(
         {
@@ -106,7 +106,7 @@ def test_unrecognized_format_raises(tmp_path: Path) -> None:
 
 
 def test_explicit_format_override(tmp_path: Path) -> None:
-    """If format='canonical' is passed, columns must already be canonical."""
+    """With ``format="canonical"``, columns must already be canonical."""
     df_in = _canonical_synthetic(10)
     path = _write_csv(df_in, tmp_path)
     df_out = load_shots(path, format="canonical", drop_backcourt=False)
@@ -171,7 +171,7 @@ def test_position_map_attaches_position_column(tmp_path: Path) -> None:
 
 
 def test_opponent_derived_from_game_pair(tmp_path: Path) -> None:
-    """opponent column is derived as the *other* TEAM_ID in the same game."""
+    """The ``opponent`` column is the other ``TEAM_ID`` in the same game."""
     rng = np.random.default_rng(0)
     n_per_team = 20
     rows = []
@@ -223,7 +223,7 @@ def test_opponent_is_na_for_singleton_team_game(tmp_path: Path) -> None:
 
 
 def test_opponent_passthrough_when_already_present(tmp_path: Path) -> None:
-    """If the input frame already has an opponent column, the loader leaves it alone."""
+    """An existing ``opponent`` column is passed through unchanged."""
     df_in = _canonical_synthetic(8)
     df_in["opponent"] = "PRESET"
     path = _write_csv(df_in, tmp_path)
@@ -242,12 +242,10 @@ def _nba_stats_synthetic_for_dates(
     use_integer_game_date: bool = False,
     include_lowercase_game_date: bool = False,
 ) -> pd.DataFrame:
-    """Synthetic NBA-Stats-format frame for date-parsing tests.
+    """Build an NBA-Stats-format frame for the date-parsing tests.
 
-    Distinct from :func:`_nba_stats_synthetic` (which builds a richer
-    fixture for the rename / scale tests above) — this one exercises
-    only the date-column code path and lets the test parameterize the
-    GAME_DATE format.
+    Unlike :func:`_nba_stats_synthetic`, this fixture exercises only the
+    date columns and lets the caller choose the ``GAME_DATE`` format.
     """
     rows = []
     for i in range(n):
@@ -284,7 +282,7 @@ def test_date_integer_yyyymmdd_parses_correctly(tmp_path: Path) -> None:
 
 
 def test_date_string_iso_still_parses(tmp_path: Path) -> None:
-    """Backward compat: GAME_DATE as ISO string parses correctly."""
+    """``GAME_DATE`` as an ISO string parses correctly."""
     df_in = _nba_stats_synthetic_for_dates(n=5, use_integer_game_date=False)
     path = _write_csv(df_in, tmp_path)
     df_out = load_shots(path, drop_backcourt=False)
@@ -292,8 +290,7 @@ def test_date_string_iso_still_parses(tmp_path: Path) -> None:
 
 
 def test_loader_prefers_lowercase_game_date_over_integer_uppercase(tmp_path: Path) -> None:
-    """When both ``GAME_DATE`` (int) and ``game_date`` (string) are present,
-    the loader uses the string form (which parses unambiguously)."""
+    """When both integer ``GAME_DATE`` and string ``game_date`` are present, the string wins."""
     df_in = _nba_stats_synthetic_for_dates(
         n=5, use_integer_game_date=True, include_lowercase_game_date=True
     )
@@ -328,7 +325,7 @@ def test_missing_file_raises(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(not SHOT_FLOW_CSV.exists(), reason="shot_flow CSV not available")
 def test_load_real_shot_flow_csv_sample() -> None:
-    """Read the first 5,000 rows of the real NBA dataset and validate shape."""
+    """The first 5,000 rows of the real NBA dataset load with the canonical schema."""
     df = load_shots(SHOT_FLOW_CSV, nrows=5_000)
 
     assert {"x", "y", "player_id", "date"}.issubset(df.columns)
@@ -342,11 +339,10 @@ def test_load_real_shot_flow_csv_sample() -> None:
 
 
 def test_home_away_derived_from_team_id_and_htm(tmp_path: Path) -> None:
-    """``home_away`` is 1 when the row's TEAM_ID maps to HTM, 0 otherwise.
+    """``home_away`` is 1 when the row's ``TEAM_ID`` maps to ``HTM`` and 0 otherwise.
 
-    Build a synthetic two-team game: 1610612738 (BOS) at 1610612747 (LAL).
-    BOS is the visitor, LAL is the home team → HTM='LAL', VTM='BOS'.
-    Half the rows are BOS shots (home_away=0), half LAL shots (home_away=1).
+    The synthetic game is BOS (1610612738, visitor) at LAL (1610612747, home);
+    half the rows are BOS shots and half LAL shots.
     """
     n = 20
     df_in = _nba_stats_synthetic(n)

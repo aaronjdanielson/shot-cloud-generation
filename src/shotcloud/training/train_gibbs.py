@@ -993,9 +993,9 @@ def _collect_modules_for_spatial(
             modules["mode_router"] = spatial.mode_router
     else:
         # CollaborativeModeMixtureSpatial: the residual location embedding
-        # is the residual tilt's ψ; the mode extractor owns a separate
-        # support embedding for its query-key product, plus the mode
-        # queries and context-bias MLP.
+        # is the residual tilt's ψ; the mode extractor holds its own
+        # parameters (the context-bias MLP, plus a separate support
+        # embedding and mode queries for the learned-query extractor).
         if spatial.residual_location_embedding is not None:
             modules["residual_location_embedding"] = spatial.residual_location_embedding
         modules["mode_extractor"] = spatial.mode_extractor
@@ -1058,7 +1058,7 @@ def _epoch(
         timing_head.eval()
         context_mlp.eval()
 
-    # Per-game shot counts and per-game pregame context, moved once.
+    # Per-game shot counts and per-game context, moved to the device once.
     shots_per_game = (
         torch.bincount(dataset.game_idx, minlength=dataset.n_games)
         .to(device=device, dtype=torch.float32)
@@ -1376,8 +1376,8 @@ def _epoch(
 
             # The count NLL is per game: evaluate it once per distinct game
             # in the batch, so each game contributes one term per update
-            # regardless of K_g. The per-game context is the game's
-            # pregame context, run through the same f_ctx.
+            # regardless of K_g. The per-game context (the first shot's
+            # x_n_raw, see PerGameTable) runs through the same f_ctx.
             unique_games, inverse_to_unique = torch.unique(game_idx, return_inverse=True)
             game_x_raw_unique = per_game_x_raw[unique_games]
             game_x_n_unique = context_mlp(game_x_raw_unique)

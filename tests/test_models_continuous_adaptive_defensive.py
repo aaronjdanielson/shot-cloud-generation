@@ -1,6 +1,7 @@
-"""Tests for ``shotcloud.models.continuous_adaptive_defensive`` (PR-D1a).
+"""Tests for :mod:`shotcloud.models.continuous_adaptive_defensive`.
 
-The required invariants from the build approval (2026-05-25):
+The continuous defensive field is an alternative to zone-level opponent
+reweighting. The numbered tests check:
 
 1. Forward returns shape ``(B, M_off)``.
 2. Cold-start rows (``def_mask.all(False)`` along ``M_def``) produce
@@ -16,8 +17,9 @@ The required invariants from the build approval (2026-05-25):
    and confirming the forward succeeds (negative test: failure
    would be an OOM, not a NaN).
 
-All tests use small synthetic sizes (``B=3, M_off=11, M_def=13``)
-so they run in seconds.
+The ``gather_defense_inputs`` adapter is tested separately. Apart from the
+large-``M_off`` test, inputs default to small synthetic sizes
+(``B=3, M_off=11, M_def=13``) so the tests run in seconds.
 """
 
 from __future__ import annotations
@@ -105,7 +107,7 @@ def _make_inputs(
 
 
 # ---------------------------------------------------------------------------
-# Required invariants
+# Core invariants (numbered as in the module docstring)
 # ---------------------------------------------------------------------------
 
 
@@ -119,10 +121,7 @@ def test_1_forward_returns_correct_shape() -> None:
 
 
 def test_2_cold_start_rows_produce_zero_field_no_nan() -> None:
-    """Rows whose def_mask is all False contribute exactly D_Δ = 0
-    everywhere. Verified by constructing a batch with one cold-start
-    row and one normal row; the cold-start row's output must be the
-    zero vector."""
+    """Rows whose ``def_mask`` is all False get ``D_Δ = 0`` exactly, while other rows do not."""
     field = _make_field()
     inputs = _make_inputs(b=3, cold_start_rows=(1,))
     out = field(**inputs)
@@ -137,8 +136,7 @@ def test_2_cold_start_rows_produce_zero_field_no_nan() -> None:
 
 
 def test_2b_all_rows_cold_start_returns_all_zero() -> None:
-    """Pathological case: every row is cold-start. Output is the zero
-    matrix with no NaN propagation."""
+    """When every row is cold-start, the output is the zero matrix with no NaN."""
     field = _make_field()
     inputs = _make_inputs(b=3, cold_start_rows=(0, 1, 2))
     out = field(**inputs)
@@ -147,8 +145,7 @@ def test_2b_all_rows_cold_start_returns_all_zero() -> None:
 
 
 def test_3_beta_zero_gives_exact_zero_field() -> None:
-    """With β_D = 0 (unit-test override), the output is identically
-    zero — the load-bearing no-op invariant."""
+    """With ``β_D = 0`` the output is identically zero."""
     field = _make_field(beta_init=0.0)
     inputs = _make_inputs()
     out = field(**inputs)
@@ -156,10 +153,7 @@ def test_3_beta_zero_gives_exact_zero_field() -> None:
 
 
 def test_4_beta_warm_init_gives_small_nonzero_perturbation() -> None:
-    """At the training-default β_D = 1e-3, the output is small but
-    nonzero — the warm-init invariant. Bound: max |D_Δ| < 0.1
-    (well below the support-logit scale where downstream impact
-    becomes meaningful)."""
+    """At the default warm init ``β_D = 1e-3``, the output is non-zero with ``max |D_Δ| < 0.1``."""
     field = _make_field(beta_init=1e-3)
     inputs = _make_inputs()
     out = field(**inputs)
@@ -169,10 +163,7 @@ def test_4_beta_warm_init_gives_small_nonzero_perturbation() -> None:
 
 
 def test_5_chunked_equals_unchunked() -> None:
-    """The chunked forward must produce the same output as a single-
-    chunk forward (within float tolerance). Tested by running the
-    same inputs through two modules with different chunk sizes and
-    asserting equality."""
+    """Chunked and single-chunk forwards agree to float tolerance."""
     inputs = _make_inputs(m_off=20)
     # Two fields identical except for chunk size.
     field_small = _make_field(query_chunk_size=3)
@@ -228,10 +219,10 @@ def test_6_gradients_flow_to_all_learnable_params() -> None:
 
 
 def test_6b_beta_zero_blocks_inner_attention_gradient() -> None:
-    """With β_D = 0 (hard zero), the inner attention parameters
-    (``q_Δ``, ``k_Δ``, ``λ_age``) receive zero gradient — the
-    motivating failure mode for the warm-init decision recorded in
-    docs/defense_integration_proposal.md §5."""
+    """With ``β_D = 0``, the inner attention (``q_Δ``, ``k_Δ``, ``λ_age``) gets zero gradient.
+
+    This is why ``β_D`` is initialized to a small non-zero value.
+    """
     field = _make_field(beta_init=0.0)
     inputs = _make_inputs()
     out = field(**inputs)
@@ -255,13 +246,12 @@ def test_6b_beta_zero_blocks_inner_attention_gradient() -> None:
 
 
 def test_7_chunked_path_runs_at_large_m_off() -> None:
-    """Negative test: the chunked path scales to large ``M_off``
-    (1500 ≈ the production retrieval support size) without OOMing
-    on synthetic CPU sizes. A naive full ``(B, M_off, M_def)``
-    tensor at ``B=4, M_off=1500, M_def=1000`` = 6 GB in fp32 — this
-    test would crash if the chunking were wrong. With
-    ``query_chunk_size=128`` peak per-chunk allocation is
-    ``B·128·M_def`` = ~4 MB."""
+    """The chunked path runs at a retrieval-scale support size (``M_off = 1500``).
+
+    Peak per-chunk allocation is ``B·query_chunk_size·M_def`` rather than a
+    full ``(B, M_off, M_def)`` tensor, so the test fails with an out-of-memory
+    error if chunking is broken.
+    """
     field = _make_field(query_chunk_size=128)
     inputs = _make_inputs(b=4, m_off=1500, m_def=1000)
     out = field(**inputs)
@@ -332,7 +322,7 @@ def test_constructor_rejects_negative_within_game_dim() -> None:
 
 
 # ---------------------------------------------------------------------------
-# PR-D1b: gather_defense_inputs adapter
+# gather_defense_inputs adapter
 # ---------------------------------------------------------------------------
 
 
@@ -486,9 +476,10 @@ def test_gather_age_days_are_anchor_minus_shot_date() -> None:
 
 
 def test_gather_then_field_forward_runs_end_to_end() -> None:
-    """The gather + field forward composition runs end-to-end on
-    synthetic data without NaNs. This is the unit-level surrogate
-    for the real-data smoke in scripts/smoke_defensive_field.py."""
+    """Gathering inputs and running the field forward end to end gives finite outputs.
+
+    This is the unit-level counterpart of ``scripts/smoke_defensive_field.py``.
+    """
     from shotcloud.models.continuous_adaptive_defensive import gather_defense_inputs
 
     cache, feats = _synthetic_cache_and_features(d_def=5)

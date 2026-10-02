@@ -1,6 +1,7 @@
-"""Tests for ``shotcloud.features.defense_features`` (PR-D0.5).
+"""Tests for :mod:`shotcloud.features.defense_features`.
 
-The nine acceptance criteria from the build approval (2026-05-25):
+The numbered tests check the following properties of the per-opponent
+defensive features:
 
 1. Causal: feature at snapshot ``t`` uses only rows with
    ``date < t``.
@@ -129,7 +130,7 @@ def _default_config(anchor_dates: np.ndarray, **overrides: object) -> DefenseFea
 
 
 # ---------------------------------------------------------------------------
-# Acceptance criteria
+# Core properties (numbered as in the module docstring)
 # ---------------------------------------------------------------------------
 
 

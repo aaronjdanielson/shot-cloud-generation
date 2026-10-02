@@ -3,8 +3,8 @@
 A small, interpretable model of a player's on-court fraction in each
 2-minute bin of a game, given the player, game date, starter status and
 position. It can supply an optional on-court presence feature to the
-timing head. Its structure parallels the
-AC-KDE pooling gate, an own/pooled mixture under a history-driven gate:
+timing head. Its structure parallels the AC-KDE pooling gate, an
+own/pooled mixture under a history-driven gate:
 
 .. math::
 

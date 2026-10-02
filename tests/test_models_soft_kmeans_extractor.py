@@ -1,18 +1,9 @@
-"""Tests for ``shotcloud.models.soft_kmeans_extractor``.
+"""Tests for :class:`shotcloud.models.soft_kmeans_extractor.SoftKMeansModeExtractor`.
 
-Load-bearing invariants of the support-driven mode extractor:
-
-1. Convex-hull: mode centers always lie in the support convex hull
-   (cluster-derived, can't escape support).
-2. Cluster recovery: two well-separated support clusters with K=2
-   produce one mode per cluster (the cluster-derived design should
-   do this RELIABLY, unlike the learned-query path which needed
-   manually-aligned queries with 100× scaling).
-3. ω concentration → mode mass: shifting ω toward a cluster
-   increases that cluster's mode mass.
-4. FPS init correctness: returns K distinct in-support seeds.
-5. Mask handling: invalid + cold-start rows.
-6. Gradient flow: through ω back to upstream support attention.
+Covers weighted farthest-point seeding, mode centers inside the support convex hull,
+recovery of two well-separated clusters without query tuning, mode mass tracking the
+support attention ``ω``, normalized responsibilities, masked and cold-start rows, and
+gradient flow back to ``ω``.
 """
 
 from __future__ import annotations
@@ -53,10 +44,8 @@ def test_default_constants_match_spec() -> None:
 
 
 def test_weighted_fps_returns_k_seeds_with_correct_shape() -> None:
-    """Seed 0 is the weighted mean (NOT a support point); seeds
-    1..K-1 are support points picked by greedy FPS. Distinctness:
-    no two seeds collide (assumes M ≫ K with no exact duplicates,
-    which holds here)."""
+    """Seed 0 is the weighted mean; seeds 1..K-1 are distinct support points chosen by
+    greedy FPS (the random support has no duplicate points)."""
     torch.manual_seed(0)
     b, m, k = 2, 12, 4
     support_xy = torch.randn(b, m, 2) * 10
@@ -77,10 +66,8 @@ def test_weighted_fps_returns_k_seeds_with_correct_shape() -> None:
 
 
 def test_weighted_fps_first_seed_is_omega_weighted_mean() -> None:
-    """Seed 0 = (Σ_j ω_j s_j) / (Σ_j ω_j), the support cloud's center
-    of mass. v2 of the soft-k-means extractor (2026-05-18 normalized
-    form) — earlier versions used argmax(ω), which could land on a
-    single outlier shot."""
+    """Seed 0 is ``(Σ_j ω_j s_j) / (Σ_j ω_j)``, the support's center of mass, rather
+    than a single high-weight shot."""
     k = 3
     support_xy = torch.tensor(
         [[[0, 0], [10, 0], [0, 10], [10, 10], [-10, -10]]], dtype=torch.float32
@@ -95,10 +82,8 @@ def test_weighted_fps_first_seed_is_omega_weighted_mean() -> None:
 
 
 def test_weighted_fps_skips_masked_supports_for_seeds_one_onward() -> None:
-    """Masked-out supports must never be picked as one of the
-    FPS-from-support seeds (1..K-1) even if they would otherwise
-    score high. Seed 0 is the weighted mean and is independent of
-    the FPS step."""
+    """Masked supports are never chosen as seeds 1..K-1, even when they are far from
+    the other seeds."""
     k = 3
     support_xy = torch.tensor(
         [[[0, 0], [10, 0], [0, 10], [10, 10], [-10, -10]]], dtype=torch.float32
@@ -135,10 +120,8 @@ def test_forward_output_shapes() -> None:
 
 
 def test_mode_centers_in_convex_hull() -> None:
-    """Mean-shift centers are weighted averages of support coords →
-    always in the convex hull. Stricter test: centers should be near
-    HIGH-DENSITY regions, but the hull invariant is the structural
-    guarantee."""
+    """Mean-shift centers are weighted averages of support coordinates, so they lie in
+    the support's bounding box (a consequence of convex-hull membership)."""
     b, m, k = 2, 30, 4
     ext = SoftKMeansModeExtractor(n_modes=k, n_iterations=2)
     support_xy = torch.randn(b, m, 2) * 10
@@ -157,11 +140,8 @@ def test_mode_centers_in_convex_hull() -> None:
 
 
 def test_cluster_recovery_with_two_well_separated_clusters() -> None:
-    """The whole point of switching to soft k-means: with no manual
-    query injection, two well-separated support clusters with K=2
-    should produce one mode per cluster. (The learned-query path
-    needed 100× query scaling to do this; soft k-means does it for
-    free via FPS init + mean-shift refinement.)"""
+    """With K = 2 and no query tuning, two well-separated support clusters each get
+    one mode (FPS seeding plus mean-shift refinement)."""
     b, k = 1, 2
     cluster_a = torch.tensor([[-10.0, 5.0], [-9.5, 4.7], [-10.3, 5.4], [-9.8, 5.1]])
     cluster_b = torch.tensor([[10.0, 25.0], [10.2, 24.6], [9.7, 25.3], [10.4, 25.1]])
@@ -174,8 +154,7 @@ def test_cluster_recovery_with_two_well_separated_clusters() -> None:
     with torch.no_grad():
         out = ext(support_xy, log_w, mask, context)
     centers = torch.tensor([[-10.0, 5.0], [10.0, 25.0]])
-    # For each mode, find the nearest cluster center; both modes
-    # should land near a cluster center (< 2 ft).
+    # Each mode lies within 2 ft of its nearest cluster center.
     dists = torch.cdist(out.mode_mu[0], centers)
     nearest = dists.argmin(dim=-1)  # (K,)
     nearest_dists = dists.min(dim=-1).values
@@ -187,8 +166,7 @@ def test_cluster_recovery_with_two_well_separated_clusters() -> None:
 
 
 def test_concentrating_omega_on_a_cluster_raises_its_mode_mass() -> None:
-    """When ω concentrates on cluster A, the mode near A should have
-    higher mass than the mode near B."""
+    """Shifting ``ω`` toward a cluster raises the mass of the mode nearest it."""
     b, k = 1, 2
     cluster_a = torch.tensor([[-10.0, 5.0]] * 4)
     cluster_b = torch.tensor([[10.0, 25.0]] * 4)
@@ -234,7 +212,7 @@ def test_gradient_flow_to_omega_and_context_bias() -> None:
     loss.backward()
     # ω (upstream support attention) receives gradient.
     assert log_w.grad is not None and log_w.grad.abs().sum() > 0
-    # Mode-bias output layer (zero-init) receives gradient via chain.
+    # The zero-initialized mode-bias output layer still receives gradient.
     bias_out = ext.mode_bias[-1]  # type: ignore[index]
     assert bias_out.weight.grad is not None
     assert bias_out.weight.grad.abs().sum() > 0
@@ -270,10 +248,8 @@ def test_use_context_correction_false_yields_logits_equal_log_mass() -> None:
 
 
 def test_n_iterations_zero_returns_fps_init_centers_unchanged() -> None:
-    """With n_iterations=0, the centers are the FPS seeds themselves
-    (no mean-shift refinement). Useful for ablation. Note: seed 0 is
-    the weighted mean (not necessarily a support coord); seeds
-    1..K-1 are support coords."""
+    """With ``n_iterations=0`` the centers are the FPS seeds: the weighted mean followed
+    by support points."""
     b, k = 1, 3
     support_xy = torch.tensor(
         [[[-10.0, 5.0], [10.0, 25.0], [0.0, 0.0], [5.0, 15.0]]], dtype=torch.float32
@@ -297,10 +273,8 @@ def test_n_iterations_zero_returns_fps_init_centers_unchanged() -> None:
 
 
 def test_responsibilities_normalize_over_modes() -> None:
-    """Σ_k r_{k,j} = 1 for every valid support point. This is the
-    v2 (2026-05-18) defining invariant — it makes the responsibility
-    a proper soft cluster assignment and decouples cluster geometry
-    from ω."""
+    """``Σ_k r_{k,j} = 1`` for every valid support point, so responsibilities are a soft
+    cluster assignment independent of ``ω``."""
     torch.manual_seed(0)
     b, m, k = 3, 16, 4
     ext = SoftKMeansModeExtractor(n_modes=k, n_iterations=2, use_context_correction=False)
@@ -315,9 +289,7 @@ def test_responsibilities_normalize_over_modes() -> None:
 
 
 def test_default_mode_sigma_is_three_feet() -> None:
-    """The default per-mode density bandwidth was bumped 2.0 → 3.0
-    on 2026-05-18 after the H2/H3 figures showed σ=2 undercovered
-    the empirical cluster spread."""
+    """The default per-mode density bandwidth is 3 ft."""
     from shotcloud.models.mode_extractor import DEFAULT_MODE_SIGMA_FT
 
     assert DEFAULT_MODE_SIGMA_FT == 3.0

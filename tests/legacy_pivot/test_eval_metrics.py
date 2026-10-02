@@ -1,4 +1,4 @@
-"""Tests for :mod:`shotcloud.evaluation.metrics` (zone distributions + KL)."""
+"""Tests for :mod:`shotcloud.legacy_pivot.eval_metrics` (zone distributions + KL)."""
 
 from __future__ import annotations
 

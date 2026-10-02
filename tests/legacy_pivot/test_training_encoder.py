@@ -21,7 +21,7 @@ def test_random_init_is_nonzero() -> None:
 
 
 def test_default_init_is_random_not_zero() -> None:
-    """Default ``zero_init=False``: the dead-zero saddle is the gotcha."""
+    """Default ``zero_init=False`` gives random embeddings, avoiding the dead-zero saddle."""
     enc = PlayerEmbeddingEncoder(n_players=10, rank=4)
     assert enc.zero_init is False
     assert (enc.embedding.weight != 0).any()

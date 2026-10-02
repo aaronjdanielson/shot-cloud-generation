@@ -39,7 +39,7 @@ class ContextResidualEncoder(nn.Module):
     GELU MLP of width ``hidden_dim``:
 
     * a base branch on :math:`[x_n, h_n]`, where :math:`x_n` is the learned
-      pre-game context and the optional :math:`h_n` summarizes the player's
+      context and the optional :math:`h_n` summarizes the player's
       earlier shots in the same game
       (:func:`shotcloud.data.within_game_history.compute_within_game_features`);
     * an optional usage branch on :math:`[x_n, u_{p,t}]`, where

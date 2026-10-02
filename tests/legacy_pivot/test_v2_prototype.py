@@ -1,4 +1,4 @@
-"""Smoke + verdict tests for :mod:`scripts.v2_prototype`."""
+"""Smoke and verdict tests for ``scripts/legacy_pivot/v2_prototype.py``."""
 
 from __future__ import annotations
 
@@ -113,8 +113,7 @@ def _synthetic_dataset(tmp_path: Path) -> tuple[Path, Path]:
 def test_verdict_cell_1_strong_case_for_v2() -> None:
     """delta_h substantially negative + V2 loss comparable/lower → cell 1.
 
-    Strong case for full V2: ρ becomes sharper AND reconstruction stays
-    fine. Justifies building joint (A, ρ) optimization.
+    V2 ρ is sharper and reconstruction stays comparable.
     """
     h_v1 = np.full(50, 0.95, dtype=np.float64)
     h_v2_seeds = [np.full(50, 0.30, dtype=np.float64)]
@@ -128,9 +127,8 @@ def test_verdict_cell_1_strong_case_for_v2() -> None:
 def test_verdict_cell_2_atoms_not_barycentric_optimal() -> None:
     """delta_h substantially negative BUT V2 loss much higher → cell 2.
 
-    V2 sharpens ρ but reconstruction is much worse — the V1 atoms
-    aren't barycentric-optimal. The right move is joint (A, ρ) V2,
-    not frozen-A V2.
+    V2 sharpens ρ but reconstruction is much worse, indicating that the
+    V1 atoms are not barycentric-optimal.
     """
     h_v1 = np.full(50, 0.95, dtype=np.float64)
     h_v2_seeds = [np.full(50, 0.30, dtype=np.float64)]
@@ -143,7 +141,8 @@ def test_verdict_cell_2_atoms_not_barycentric_optimal() -> None:
 def test_verdict_cell_3_diffuse_rho_intrinsic() -> None:
     """delta_h ≈ 0 + V2 loss comparable → cell 3.
 
-    Diffuse ρ is intrinsic to data geometry; V2 alone won't fix.
+    Diffuse ρ is intrinsic to the data geometry rather than an artifact
+    of the V1 surrogate.
     """
     h_v1 = np.full(50, 0.50, dtype=np.float64)
     h_v2_seeds = [np.full(50, 0.51, dtype=np.float64)]
@@ -154,15 +153,11 @@ def test_verdict_cell_3_diffuse_rho_intrinsic() -> None:
 
 
 def test_verdict_cell_4_low_dim_manifold() -> None:
-    """delta_h positive → cell 4: low-dimensional manifold finding.
+    """delta_h positive → cell 4 (low-dimensional manifold).
 
-    V2 entropy is HIGHER than V1's — combined with cross-seed
-    stability and low-effective-rank evidence (proven separately
-    in the K=4 / K=8 stability runs), this means the data lies on
-    a low-dimensional manifold and archetypes are basis directions,
-    not components players mix. Loss axis doesn't qualify this cell
-    because the entropy direction alone rules out the V1-bottleneck
-    hypothesis.
+    V2 entropy higher than V1's selects this cell regardless of the loss
+    axis: the entropy direction alone rules out the V1 surrogate as the
+    source of diffuse ρ.
     """
     h_v1 = np.full(50, 0.30, dtype=np.float64)
     h_v2_seeds = [np.full(50, 0.50, dtype=np.float64)]
@@ -170,7 +165,7 @@ def test_verdict_cell_4_low_dim_manifold() -> None:
     assert verdict["cell"] == "4_low_dim_manifold"
     assert verdict["delta_h_norm"] > 0.05
     assert "manifold" in verdict["conclusion"]
-    # Should NOT contain dismissive language — this is a positive finding.
+    # The cell-4 conclusion carries no "Rethink" recommendation.
     assert "Rethink" not in verdict["conclusion"]
 
 

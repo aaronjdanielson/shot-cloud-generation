@@ -1,18 +1,20 @@
-"""Tests for ``shotcloud.training.spatial_losses``.
+"""Tests for :mod:`shotcloud.training.spatial_losses`.
 
-Covers the math-preservation invariants of the continuous-coordinate
-spatial loss + its diagnostics:
+For the grid-based continuous-coordinate loss:
 
-A. **Exact limit.** ``τ → 0`` with the observed shot lying on a cell
-   center should reduce continuous NLL to exact-cell NLL.
-B. **Distance monotonicity.** Holding the predicted distribution
-   fixed (all mass on one cell), the loss strictly increases as the
-   observed coordinate moves away from that cell.
-C. **Kernel normalization.** When ``normalize_kernel=True`` the per-
-   shot observation kernel sums to 1 over cells.
-D. **Gradient flow.** ``log_probs`` and ``shot_xy`` both receive
-   nonzero gradient from the continuous loss.
-E. **Batch + device.** Runs on CPU end-to-end with realistic shapes.
+A. **Exact limit.** As ``τ → 0`` with shots on cell centers, the continuous NLL
+   reduces to the exact-cell NLL.
+B. **Distance monotonicity.** With all predicted mass on one cell, the loss strictly
+   increases as the observed coordinate moves away from it.
+C. **Kernel normalization.** With ``normalize_kernel=True`` each shot's observation
+   kernel sums to 1 over cells.
+D. **Gradient flow.** ``log_probs`` and ``shot_xy`` receive nonzero gradient.
+E. **Shapes.** Realistic batch shapes run on CPU; malformed inputs raise.
+
+Also covered: ``expected_distance_ft``, ``exact_cell_nll``, the continuous-mixture
+and mode-mixture log-likelihoods (closed-form values, masking, per-shot σ,
+precomputed kernels), and the half-court normalizer that makes the mixture a proper
+density on the court.
 """
 
 from __future__ import annotations
@@ -60,30 +62,24 @@ def _onehot_log_probs(target_cell: int, n_cells: int) -> torch.Tensor:
 
 
 def test_continuous_nll_collapses_to_exact_cell_nll_as_tau_tends_to_zero() -> None:
-    """For each shot that lands on a cell center, ``τ → 0`` makes the
-    Gaussian observation kernel an indicator of that cell; the
-    continuous loss should match exact-cell NLL within float tolerance.
+    """For shots on cell centers, ``τ → 0`` turns the observation kernel into an
+    indicator of the cell, and the continuous loss matches the exact-cell NLL.
     """
     grid = CourtGrid(xlim=(-25.0, 25.0), ylim=(-5.0, 47.0), nx=16, ny=14)
     centers = _grid_centers(grid)
     n_cells = grid.n_cells
 
-    # Build a realistic batch by picking 4 cells and placing shots at
-    # those exact cell centers.
+    # Place four shots exactly on randomly chosen cell centers.
     rng = np.random.default_rng(0)
     target_cells = torch.from_numpy(rng.choice(n_cells, size=4, replace=False).astype(np.int64))
     shot_xy = centers[target_cells]
 
-    # Predicted log-probs: a soft distribution (uniform), so exact-cell
-    # NLL = log(n_cells). The continuous NLL with vanishing τ should
-    # match exactly because each shot sits on a cell center.
+    # With uniform predicted log-probs the exact-cell NLL is log(n_cells).
     log_probs = torch.full((4, n_cells), -np.log(n_cells), dtype=torch.float32)
     exact = exact_cell_nll(log_probs, target_cells)
-    # Use unnormalized kernel here: log K_τ → -inf away from x_c except
-    # at the cell-center match, where it stays 0. After logsumexp it
-    # gives exactly the predicted log-prob at the observed cell. The
-    # normalized variant gives the same answer (normalization sums to 0
-    # in log-space because only one cell has non-vanishing kernel mass).
+    # The unnormalized log K_τ is 0 at the matching cell and → -inf elsewhere, so the
+    # logsumexp returns the predicted log-prob of the observed cell. The normalized
+    # kernel gives the same value, since only one cell has non-vanishing mass.
     cont = continuous_coordinate_nll(log_probs, shot_xy, centers, tau=1e-4, normalize_kernel=False)
     torch.testing.assert_close(cont, exact, atol=1e-3, rtol=1e-3)
 
@@ -94,9 +90,8 @@ def test_continuous_nll_collapses_to_exact_cell_nll_as_tau_tends_to_zero() -> No
 
 
 def test_continuous_nll_increases_monotonically_with_distance_to_predicted_mass() -> None:
-    """Hold the predicted distribution at a near-delta on cell c*.
-    As ``shot_xy`` moves away from x_{c*} along a straight line, the
-    continuous NLL must strictly increase.
+    """With a near-delta prediction on cell ``c*``, the continuous NLL strictly
+    increases as ``shot_xy`` moves away from ``x_{c*}`` along a line.
     """
     grid = CourtGrid(xlim=(-25.0, 25.0), ylim=(-5.0, 47.0), nx=20, ny=18)
     centers = _grid_centers(grid)
@@ -124,11 +119,11 @@ def test_continuous_nll_increases_monotonically_with_distance_to_predicted_mass(
 
 
 def test_normalized_observation_kernel_rows_sum_to_one() -> None:
-    """For any observed coordinate, the normalized log_obs_kernel
-    should produce a proper probability distribution over cells.
-    Verify indirectly by computing the loss with uniform log_probs:
-    the result equals ``log n_cells`` exactly when the kernel rows
-    are normalized (the kernel-only term contributes 0 to the logsumexp).
+    """The normalized observation kernel is a distribution over cells for any observed
+    coordinate.
+
+    Checked indirectly: with uniform ``log_probs`` the loss equals ``log n_cells``
+    exactly when the kernel rows sum to 1.
     """
     grid = CourtGrid(xlim=(-25.0, 25.0), ylim=(-5.0, 47.0), nx=12, ny=10)
     centers = _grid_centers(grid)
@@ -148,9 +143,8 @@ def test_normalized_observation_kernel_rows_sum_to_one() -> None:
 
 
 def test_unnormalized_kernel_loss_differs_from_normalized_loss_for_off_center_shots() -> None:
-    """Pure sanity that the ``normalize_kernel`` flag actually does
-    something: at a non-trivial τ, normalized vs unnormalized
-    losses must disagree for shots placed away from any cell center."""
+    """At a non-trivial ``τ``, the normalized and unnormalized losses differ for shots
+    away from cell centers."""
     grid = CourtGrid(xlim=(-25.0, 25.0), ylim=(-5.0, 47.0), nx=16, ny=14)
     centers = _grid_centers(grid)
     n_cells = grid.n_cells
@@ -229,10 +223,8 @@ def test_rejects_invalid_inputs() -> None:
 
 
 def test_expected_distance_zero_when_all_mass_at_observed_coordinate() -> None:
-    """If predicted mass is concentrated on the cell whose center is
-    closest to the observed shot, the expected distance equals the
-    shot-to-nearest-center distance (which is 0 when the shot is
-    exactly on a cell center)."""
+    """With (nearly) all predicted mass on the observed shot's cell center, the expected
+    distance is approximately 0."""
     grid = CourtGrid(xlim=(-25.0, 25.0), ylim=(-5.0, 47.0), nx=16, ny=14)
     centers = _grid_centers(grid)
     n_cells = grid.n_cells
@@ -246,8 +238,8 @@ def test_expected_distance_zero_when_all_mass_at_observed_coordinate() -> None:
 
 
 def test_expected_distance_grows_with_observation_displacement() -> None:
-    """If the predicted distribution is fixed at a cell, moving the
-    observation away from that cell should increase E[||x_c - y||]."""
+    """With the prediction fixed at a cell, moving the observation away from it increases
+    ``E[||x_c - y||]``."""
     grid = CourtGrid(xlim=(-25.0, 25.0), ylim=(-5.0, 47.0), nx=14, ny=12)
     centers = _grid_centers(grid)
     n_cells = grid.n_cells
@@ -281,7 +273,7 @@ def test_exact_cell_nll_matches_gather() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Cell-free continuous-mixture NLL
+# Continuous-mixture NLL
 # ---------------------------------------------------------------------------
 
 
@@ -321,10 +313,8 @@ def test_mixture_nll_finite_and_differentiable_on_random_input() -> None:
 
 
 def test_mixture_one_component_at_observed_yields_log_2pi_sigma2() -> None:
-    """With a single support point coincident with the observed shot,
-    the closed-form Gaussian density at the mean is ``1 / (2π σ²)``,
-    so NLL = ``log(2π σ²)`` exactly. This is the load-bearing
-    numerical correctness check for the kernel normalization."""
+    """With one support point at the observed shot, the density is ``1 / (2π σ²)``, so
+    the NLL is exactly ``log(2π σ²)`` (checks the kernel normalization)."""
     continuous_mixture_loglik, _ = _import_mixture()
     b = 3
     shot_xy = torch.tensor([[0.0, 5.0], [-3.0, 10.0], [12.0, 22.0]], dtype=torch.float32)
@@ -337,9 +327,8 @@ def test_mixture_one_component_at_observed_yields_log_2pi_sigma2() -> None:
 
 
 def test_mixture_distance_monotonicity_single_support() -> None:
-    """With a single support point at the origin, moving the observed
-    coordinate away from the origin must monotonically decrease the
-    log-likelihood (i.e. increase the NLL)."""
+    """With one support point at the origin, the log-likelihood decreases as the
+    observed coordinate moves away from it."""
     continuous_mixture_loglik, _ = _import_mixture()
     sigma = torch.tensor([1.5], dtype=torch.float32)
     support_xy = torch.zeros(1, 1, 2, dtype=torch.float32)
@@ -354,9 +343,8 @@ def test_mixture_distance_monotonicity_single_support() -> None:
 
 
 def test_mixture_benefit_when_weight_concentrates_on_correct_component() -> None:
-    """Two support points, observed shot near support 1. As the weight
-    shifts from support 0 to support 1, the log-likelihood increases.
-    Verifies the mixture machinery uses the weights correctly."""
+    """With the observed shot near support 1, shifting weight from support 0 to support
+    1 increases the log-likelihood."""
     continuous_mixture_loglik, _ = _import_mixture()
     support_xy = torch.tensor([[[10.0, 10.0], [0.0, 0.0]]], dtype=torch.float32)  # (1, 2, 2)
     shot_xy = torch.tensor([[0.2, 0.1]], dtype=torch.float32)  # near support 1
@@ -374,10 +362,8 @@ def test_mixture_benefit_when_weight_concentrates_on_correct_component() -> None
 
 
 def test_mixture_mask_zeroes_out_invalid_support() -> None:
-    """A masked-out support point should be invisible to the
-    likelihood even when placed exactly at the observed shot. This is
-    how cold-start rows (no causal analogue history) and padded slots
-    are handled."""
+    """A masked support point does not contribute, even at the observed shot; padded
+    slots and cold-start rows rely on this."""
     continuous_mixture_loglik, _ = _import_mixture()
     # support[0] = obs (would dominate if unmasked); support[1] far away.
     shot_xy = torch.tensor([[0.0, 5.0]], dtype=torch.float32)
@@ -392,23 +378,18 @@ def test_mixture_mask_zeroes_out_invalid_support() -> None:
     loglik_far = continuous_mixture_loglik(
         log_weights, support_xy, shot_xy, sigma, support_mask=mask_far
     ).item()
-    # When the near support is masked out, only the far support remains
-    # → likelihood is much lower.
+    # With the near support masked, only the far support remains and the likelihood
+    # is much lower.
     assert loglik_far < loglik_all - 5.0
 
 
 def test_mixture_all_masked_row_does_not_nan_poison_sigma_gradient() -> None:
-    """Regression test for the 2026-05-17 cold-start gradient NaN.
+    """Cold-start rows in a batch leave the σ gradient finite.
 
-    ``logsumexp(all -inf)`` returns NaN, which makes the backward
-    pass through ``logsumexp`` produce ``exp(... - NaN) = NaN`` for
-    that row. Multiplied by the ``torch.where`` mask
-    (``0 · NaN = NaN``) the NaN poisons shared σ / weight gradients.
-
-    The fix is a defensive in-place patch of one dummy log-weight per
-    cold-start row before the logsumexp — verified here by mixing
-    cold-start and valid rows in one batch and asserting σ's grad
-    is finite.
+    ``logsumexp`` over an all ``-inf`` row has a NaN backward, and ``0 · NaN = NaN``
+    under the ``torch.where`` mask would spread it to the shared σ and weight
+    gradients. The loglik patches one dummy log-weight per cold-start row before the
+    ``logsumexp`` to prevent this.
     """
     continuous_mixture_loglik, _ = _import_mixture()
     b, m = 4, 5
@@ -426,11 +407,9 @@ def test_mixture_all_masked_row_does_not_nan_poison_sigma_gradient() -> None:
         ]
     )
     loglik = continuous_mixture_loglik(log_weights, support_xy, shot_xy, sigma, support_mask=mask)
-    # Valid rows: finite. Cold-start rows: -inf. Mean over batch is -inf,
-    # but the loss is per-row before the floor is applied externally.
-    # We just need to verify the backward through the valid rows
-    # populates σ.grad finitely on those rows and zero (not NaN) on
-    # cold-start rows.
+    # Valid rows are finite and cold-start rows are -inf (the caller applies the
+    # floor). Backward through the valid rows must give a finite σ.grad, with zeros
+    # rather than NaN on cold-start rows.
     valid_loglik = loglik[torch.isfinite(loglik)]
     assert valid_loglik.numel() == 2
     valid_loglik.sum().backward()
@@ -439,9 +418,8 @@ def test_mixture_all_masked_row_does_not_nan_poison_sigma_gradient() -> None:
 
 
 def test_mixture_all_masked_row_yields_neg_inf() -> None:
-    """Rows with no valid support get log_lik = -inf. The trainer is
-    expected to apply a floor / fallback; the helper itself stays
-    pure and returns the mathematically correct value."""
+    """Rows with no valid support get ``log_lik = -inf``; applying a floor is left to
+    the caller."""
     continuous_mixture_loglik, _ = _import_mixture()
     support_xy = torch.zeros(1, 3, 2, dtype=torch.float32)
     log_weights = torch.zeros(1, 3, dtype=torch.float32)
@@ -453,10 +431,8 @@ def test_mixture_all_masked_row_yields_neg_inf() -> None:
 
 
 def test_mixture_weights_are_log_probs_passthrough() -> None:
-    """When ``weights_are_log_probs=True`` the function trusts the
-    caller's normalization. Verify by passing already-normalized
-    log-probs and checking the result matches the default path on
-    the same unnormalized logits."""
+    """With ``weights_are_log_probs=True`` normalized log-probs are used as given and
+    match the default path on the corresponding unnormalized logits."""
     continuous_mixture_loglik, _ = _import_mixture()
     rng = np.random.default_rng(0)
     b, m = 4, 10
@@ -477,8 +453,8 @@ def test_mixture_weights_are_log_probs_passthrough() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mode-mixture NLL — per-row K-mode Gaussian mixture for the
-# mode-extraction cell-free path.
+# Mode-mixture NLL: per-row K-mode Gaussian mixture used by the mode-mixture
+# spatial decoder.
 # ---------------------------------------------------------------------------
 
 
@@ -518,8 +494,8 @@ def test_mode_mixture_distance_monotonicity_single_mode() -> None:
 
 
 def test_mode_mixture_weight_shift_toward_nearby_mode_increases_loglik() -> None:
-    """Two modes; one near observed, one far. Increasing the logit on
-    the near mode strictly increases the log-likelihood."""
+    """With one mode near the observed shot and one far, raising the near mode's logit
+    strictly increases the log-likelihood."""
     mode_mixture_loglik, _ = _import_mode_mix()
     mode_mu = torch.tensor([[[10.0, 10.0], [0.0, 0.0]]], dtype=torch.float32)
     shot_xy = torch.tensor([[0.2, 0.1]], dtype=torch.float32)
@@ -609,10 +585,8 @@ def test_mixture_rejects_shape_mismatches() -> None:
 
 
 def test_mixture_loglik_accepts_per_shot_sigma_and_matches_broadcast() -> None:
-    """The (B, M) σ path (Tier-1a source/zone bandwidth) computes the
-    same value as the (B,) σ path when the per-shot σ is uniform —
-    the load-bearing back-compat invariant for the spatial loglik
-    extension. With non-uniform per-shot σ the loglik differs."""
+    """A ``(B, M)`` per-shot σ that is constant within each row matches the ``(B,)``
+    path; a non-uniform per-shot σ changes the result."""
     continuous_mixture_loglik, _ = _import_mixture()
     torch.manual_seed(0)
     log_weights = torch.randn(3, 4, requires_grad=True)
@@ -625,7 +599,7 @@ def test_mixture_loglik_accepts_per_shot_sigma_and_matches_broadcast() -> None:
         log_weights, support_xy, shot_xy, sigma_per_shot_uniform
     )
     torch.testing.assert_close(out_row, out_per_shot, atol=1e-6, rtol=1e-6)
-    # Now perturb a single (B, M) cell and confirm the result moves.
+    # Perturbing a single (B, M) entry changes the result.
     sigma_perturbed = sigma_per_shot_uniform.clone()
     sigma_perturbed[0, 0] = 2.5
     out_perturbed = continuous_mixture_loglik(log_weights, support_xy, shot_xy, sigma_perturbed)
@@ -647,15 +621,13 @@ def test_mixture_loglik_rejects_bad_per_shot_sigma_shape() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Tier-2 anisotropic: precomputed log_kernel path
+# Precomputed log_kernel path (anisotropic kernels)
 # --------------------------------------------------------------------------- #
 
 
 def test_mixture_loglik_accepts_precomputed_log_kernel_and_matches_sigma_path() -> None:
-    """**Tier-2 invariant.** When the caller passes ``log_kernel``
-    matching what the sigma path would compute, the two paths must
-    agree numerically. This validates the structural equivalence and
-    keeps the existing sigma path bit-exact."""
+    """A precomputed ``log_kernel`` equal to the isotropic Gaussian kernel reproduces
+    the σ path."""
     continuous_mixture_loglik, _ = _import_mixture()
     import math
 
@@ -664,8 +636,7 @@ def test_mixture_loglik_accepts_precomputed_log_kernel_and_matches_sigma_path() 
     support_xy = torch.randn(4, 6, 2)
     shot_xy = torch.randn(4, 2)
     sigma = torch.tensor([1.5, 1.2, 1.8, 2.0]).unsqueeze(-1).expand(4, 6).contiguous()
-    # Compute log_kernel by hand at the same sigma so the two paths
-    # must agree.
+    # The isotropic Gaussian log-kernel at the same σ.
     diff = shot_xy.unsqueeze(1) - support_xy
     dist2 = (diff * diff).sum(dim=-1)
     sigma2 = sigma.pow(2)
@@ -676,7 +647,7 @@ def test_mixture_loglik_accepts_precomputed_log_kernel_and_matches_sigma_path() 
 
 
 def test_mixture_loglik_rejects_both_sigma_and_log_kernel() -> None:
-    """Mutually-exclusive: passing both must raise."""
+    """Passing both ``sigma`` and ``log_kernel`` raises."""
     continuous_mixture_loglik, _ = _import_mixture()
     log_weights = torch.zeros(2, 3)
     support_xy = torch.zeros(2, 3, 2)
@@ -706,14 +677,12 @@ def test_mixture_loglik_rejects_bad_log_kernel_shape() -> None:
 
 
 # ---------------------------------------------------------------------------
-# F. Half-court boundary correction (AOAS audit item A1, 2026-06-13).
+# F. Half-court boundary correction
 #
-# The pre-A1 build evaluated the per-shot Gaussian on R^2 without a
-# court normalizer; the audit caught that the resulting f_Theta is not
-# a proper density on the court C and is not directly comparable
-# across architectures that allocate sigma differently. These tests
-# pin down the new analytic erf-based normalizer and its passthrough
-# into the mixture loglik.
+# A Gaussian kernel on R^2 leaks mass off the court, so without a normalizer the
+# mixture is not a proper density on the court and is not comparable across models
+# that allocate σ differently. These tests cover the analytic erf-based normalizer
+# Z_m and its use in the mixture log-likelihoods.
 # ---------------------------------------------------------------------------
 
 
@@ -742,13 +711,8 @@ def test_half_court_normalizer_deep_interior_log_z_near_zero() -> None:
 
 
 def test_half_court_normalizer_at_rim_loses_baseline_mass() -> None:
-    """A Gaussian centered exactly at the basket (y=0) with the baseline at y=-5
-    leaks measurable mass for sigma comparable to the baseline distance.
-
-    For (0, 0) with sigma = 3 ft on the rectangle x in [-25, 25] and
-    y in [-5, 47], the y-marginal integrates erf((-0)/sigma√2) to
-    erf((47)/sigma√2) minus erf((-5)/sigma√2) — a noticeable shortfall
-    on the baseline side.
+    """A Gaussian at the basket (y = 0), with the baseline at y = -5, loses measurable
+    mass behind the baseline when σ = 3 ft.
     """
     bounds, half_court = _import_normalizer()
     support_xy = torch.tensor([[[0.0, 0.0]]])
@@ -772,9 +736,7 @@ def test_half_court_normalizer_huge_sigma_log_z_very_negative() -> None:
 
 
 def test_half_court_normalizer_factorizes_into_axis_marginals() -> None:
-    """Cross-check the analytic factorization against the closed-form
-    expression in :func:`half_court_log_normalizer`'s docstring.
-    """
+    """``Z`` equals the product of the x and y erf marginals."""
     import math as _m
 
     bounds, half_court = _import_normalizer()
@@ -813,9 +775,8 @@ def test_half_court_normalizer_clamp_floor_avoids_neg_inf() -> None:
 
 
 def test_mixture_loglik_court_bounds_none_is_bit_identical_to_v1() -> None:
-    """When ``court_bounds=None`` the loglik matches the v1 (un-normalized)
-    formulation bit-for-bit, so every existing trained checkpoint and
-    cached eval result is preserved."""
+    """``court_bounds=None`` (the default) gives the unnormalized mixture loglik bit for
+    bit, so results computed without the normalizer are reproducible."""
     continuous_mixture_loglik, _ = _import_mixture()
     torch.manual_seed(0)
     log_weights = torch.randn(4, 6)
@@ -830,10 +791,9 @@ def test_mixture_loglik_court_bounds_none_is_bit_identical_to_v1() -> None:
 
 
 def test_mixture_loglik_court_bounds_subtracts_log_z_pointwise() -> None:
-    """The opt-in court-bounded loglik equals the v1 loglik minus the
-    expected per-row weighted average of log Z_m (in the small-σ regime
-    where Z_m is well-approximated by 1 over the deep interior, the
-    difference matches the closed form)."""
+    """The court-bounded loglik divides each kernel by its on-court mass ``Z_m``, so it
+    exceeds the unbounded loglik by an amount between ``-max log Z`` and
+    ``-min log Z``."""
     continuous_mixture_loglik, _ = _import_mixture()
     bounds, half_court = _import_normalizer()
     # One support shot deep interior, one near the rim.
@@ -845,35 +805,28 @@ def test_mixture_loglik_court_bounds_subtracts_log_z_pointwise() -> None:
     log_lik_c = continuous_mixture_loglik(
         log_weights, support_xy, shot_xy, sigma, court_bounds=bounds
     )
-    # Reconstruct: per-support log K minus log Z, then logsumexp with log w.
+    # Per-support log Z.
     log_z = half_court(support_xy, sigma, bounds).squeeze(0)  # (M,)
-    # The c-version subtracts log Z from each kernel value, so log_lik_c is
-    # logsumexp(log_w + log_K - log_Z); the v1 is logsumexp(log_w + log_K).
-    # When log_Z is uniform across m the offset is exactly -log_Z; here
-    # log_Z varies between the two slots, so we check the difference is
-    # strictly bracketed between -max(log_Z) and -min(log_Z) (in our
-    # convention max(log_Z) ≈ 0 for the interior shot and a slightly
-    # negative value for the rim shot, so the difference is small and
-    # positive).
+    # log_lik_c = logsumexp(log_w + log_K - log_Z) and log_lik_v1 =
+    # logsumexp(log_w + log_K). A constant log_Z would give an offset of exactly
+    # -log_Z; here it differs between the slots, so the difference lies between
+    # -max(log_Z) and -min(log_Z).
     diff = (log_lik_c - log_lik_v1).item()
     log_z_min = log_z.min().item()
     log_z_max = log_z.max().item()
     assert -log_z_max - 1e-6 <= diff <= -log_z_min + 1e-6, (
         f"expected diff in [-log_z_max, -log_z_min] = [{-log_z_max}, {-log_z_min}], got {diff}"
     )
-    # Sanity: deep-interior Gaussian has log_z ≈ 0, near-baseline kernel
-    # loses some mass, so log_z is slightly negative for that slot and
-    # the court-bounded loglik is strictly larger (per-shot likelihood
-    # is upweighted when we account for off-court leakage).
+    # The interior kernel has log_z ≈ 0 and the rim kernel loses mass behind the
+    # baseline (log_z < 0), so the court-bounded loglik is strictly larger.
     assert log_z_max == pytest.approx(0.0, abs=1e-5)
     assert log_z_min < 0.0
     assert diff > 0.0
 
 
 def test_mixture_loglik_rejects_court_bounds_with_log_kernel() -> None:
-    """``court_bounds`` is for the isotropic path; combining with the
-    precomputed ``log_kernel`` is rejected with a clear error pointing
-    at ``log_court_normalizer`` instead."""
+    """``court_bounds`` with a precomputed ``log_kernel`` raises, pointing to
+    ``log_court_normalizer``."""
     continuous_mixture_loglik, _ = _import_mixture()
     bounds, _ = _import_normalizer()
     log_weights = torch.zeros(2, 3)
@@ -931,17 +884,13 @@ def test_mixture_loglik_log_court_normalizer_subtracts_pointwise() -> None:
 
 
 def test_mode_mixture_loglik_court_bounds_passthrough() -> None:
-    """``mode_mixture_loglik`` accepts the same ``court_bounds`` opt-in
-    and produces a numerically distinct result for a mode that loses
-    measurable mass off-court."""
+    """``mode_mixture_loglik`` accepts ``court_bounds``; for a single mode losing mass
+    off court, the bounded loglik exceeds the unbounded one by ``-log Z``."""
     from shotcloud.training.spatial_losses import mode_mixture_loglik
 
     bounds, half_court = _import_normalizer()
-    # Single mode at the rim (y=0 with the baseline at y=-5) — a 3-ft
-    # Gaussian here loses roughly 5-10% of its mass off the baseline.
-    # The observed shot is right at the mode so the kernel is at its
-    # peak; the difference between the bounded and unbounded loglik is
-    # therefore -log Z (the only term that changes).
+    # A single 3-ft mode at the rim (baseline at y = -5) loses roughly 5-10% of its
+    # mass behind the baseline. With one mode, only the -log Z term changes.
     mode_logits = torch.tensor([[0.0]])
     mode_mu = torch.tensor([[[0.0, 0.0]]])
     shot_xy = torch.tensor([[0.0, 0.0]])

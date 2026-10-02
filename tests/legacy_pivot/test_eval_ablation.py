@@ -1,4 +1,4 @@
-"""Tests for :func:`shotcloud.evaluation.run_ablation`."""
+"""Tests for :func:`shotcloud.legacy_pivot.eval_ablation.run_ablation`."""
 
 from __future__ import annotations
 
@@ -471,11 +471,7 @@ def test_no_in_court_test_shots_raises() -> None:
 
 @pytest.mark.skipif(not SHOT_FLOW_CSV.exists(), reason="shot_flow CSV not available")
 def test_runs_on_real_shot_flow_data() -> None:
-    """Smoke test: load a slice of real NBA data, fractional split, run.
-
-    This is the closest thing to a paper-shaped artifact our test suite
-    produces.
-    """
+    """Smoke test: load a slice of real NBA data, fractional split, run."""
     df = load_shots(SHOT_FLOW_CSV, nrows=20_000)
     if "season" in df.columns:
         df = df.drop(columns=["season"])

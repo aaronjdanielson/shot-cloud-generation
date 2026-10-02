@@ -1,15 +1,14 @@
-"""Tests for the fast-validation-ladder infrastructure.
+"""Tests for the fast-validation training utilities.
 
 Covers:
 
-* :meth:`GibbsShotDataset.subset` — deterministic sampling, per-game
-  table re-derivation, length, batch-tuple shape.
-* :func:`train_gibbs` lambda weights — setting ``lambda_timing=0``
-  and ``lambda_count=0`` makes the trained total equal the spatial
-  loss alone.
-* :class:`GibbsTrainHistory` — the new ``_alpha_entropy``,
-  ``_beta_entropy``, ``_frac_sub_uniform`` series populate on the
-  collaborative path and are ``NaN`` / finite as expected.
+* :meth:`GibbsShotDataset.subset`: deterministic sampling, the rebuilt per-game table,
+  length, and batch-tuple shape.
+* :func:`train_gibbs` loss weights: with ``lambda_timing=0`` and ``lambda_count=0``
+  the timing and count heads receive no gradient and do not move.
+* :class:`GibbsTrainHistory`: the ``*_alpha_entropy``, ``*_beta_entropy`` and
+  ``*_frac_sub_uniform`` series are finite on the collaborative path, and the
+  entropies are ``NaN`` for offensive priors without α/β.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ from shotcloud.models.collaborative_kde import CollaborativeKDE
 from shotcloud.training import GibbsShotDataset, PlayerVocab, train_gibbs
 
 # ---------------------------------------------------------------------------
-# Tiny synthetic setup, reused across tests.
+# Small synthetic setup shared across tests
 # ---------------------------------------------------------------------------
 
 
@@ -66,7 +65,7 @@ def _build_setup(
             )
     shots = pd.DataFrame(rows)
 
-    # Anchor early so most shots fall in-window for the causal mask.
+    # An early anchor leaves most shots after it, so they enter the dataset.
     anchors = [np.datetime64("2024-01-05", "D")]
     n_archetypes = 3
     store = build_snapshot_store_from_shots(
@@ -91,7 +90,7 @@ def _build_setup(
     vocab = PlayerVocab.from_ids(akde.players)
 
     if use_collab:
-        # Bio + game logs (minimal — overlay matching the shot frame).
+        # Minimal bio and game-log tables matching the shot frame.
         bio_rows = [
             {
                 "player_id": int(pid),
@@ -191,8 +190,8 @@ def test_subset_batch_tuple_has_same_twelve_fields() -> None:
     train_set: GibbsShotDataset = setup["train_set"]  # type: ignore[assignment]
     sub = train_set.subset(20)
     item = sub[0]
-    # 12 fields: original 9 + prior_seq + prior_lengths (G1 GRU, paper §10)
-    # + prior_outcome (Phase 2 of the 2026-06-07 audit).
+    # 12 fields, including the within-game prior-shot sequence and its lengths and the
+    # prior-outcome features.
     assert len(item) == 12
     assert sub.shot_xy.shape == (20, 2)
     from shotcloud.data.prior_outcomes import PRIOR_OUTCOME_DIM
@@ -209,15 +208,14 @@ def test_subset_batch_tuple_has_same_twelve_fields() -> None:
 
 
 def test_subset_per_game_table_matches_resampled_rows() -> None:
-    """After subsetting, ``per_game.k_obs.sum()`` must equal the
-    sampled shot count and ``per_game.x_n_raw`` must align with the
-    surviving games."""
+    """After subsetting, ``per_game.k_obs`` sums to the sampled shot count and
+    ``per_game.x_n_raw`` has one row per surviving game."""
     setup = _build_setup(shots_per_player=20)
     train_set: GibbsShotDataset = setup["train_set"]  # type: ignore[assignment]
     sub = train_set.subset(30, seed=0)
     assert int(sub.per_game.k_obs.sum()) == 30
     assert sub.per_game.x_n_raw.shape[0] == sub.n_games
-    # Game ids should be contiguous [0..n_games).
+    # Game ids are contiguous in [0, n_games).
     assert int(sub.game_idx.min()) == 0
     assert int(sub.game_idx.max()) == sub.n_games - 1
 
@@ -237,11 +235,8 @@ def test_subset_rejects_zero_or_negative() -> None:
 
 
 def test_lambda_zero_timing_and_count_freezes_those_heads() -> None:
-    """With ``lambda_timing=0`` and ``lambda_count=0`` (fast-ladder
-    spatial-only mode), the timing-head and count-head parameters
-    receive zero gradient and therefore should not move across an
-    epoch of training. This is what `--lambda-timing 0 --lambda-count 0`
-    is for: optimize the spatial path in isolation."""
+    """With ``lambda_timing=0`` and ``lambda_count=0`` the timing and count heads receive
+    zero gradient and do not move, so only the spatial path is optimized."""
     setup = _build_setup()
     timing_before = [p.detach().clone() for p in setup["timing_head"].parameters()]  # type: ignore[attr-defined]
     count_before = [p.detach().clone() for p in setup["count_head"].parameters()]  # type: ignore[attr-defined]
@@ -254,7 +249,7 @@ def test_lambda_zero_timing_and_count_freezes_those_heads() -> None:
         grid=setup["grid"],  # type: ignore[arg-type]
         n_epochs=2,
         batch_size=32,
-        learning_rate=1e-2,  # large enough to make a visible move if any grad leaks
+        learning_rate=1e-2,  # large enough that any leaked gradient moves the weights
         lambda_timing=0.0,
         lambda_count=0.0,
         spatial_loss="continuous",
@@ -291,18 +286,17 @@ def test_collaborative_path_populates_alpha_beta_entropy_and_sub_uniform() -> No
     h_alpha = history.train_alpha_entropy[0]
     h_beta = history.train_beta_entropy[0]
     sub_u = history.train_frac_sub_uniform[0]
-    # α / β entropy: finite and nonnegative. Upper bound = log(L) for α
-    # and log(R) for β; we accept anything in [0, log(R_max)].
+    # The α and β entropies are bounded by log(L) and log(R); the check uses the
+    # looser [0, log(100)].
     assert np.isfinite(h_alpha) and 0.0 <= h_alpha <= float(np.log(100))
     assert np.isfinite(h_beta) and 0.0 <= h_beta <= float(np.log(100))
-    # sub_uniform: a proper fraction.
+    # frac_sub_uniform is a fraction.
     assert 0.0 <= sub_u <= 1.0
 
 
 def test_legacy_offensive_prior_leaves_alpha_beta_as_nan() -> None:
-    """Non-collaborative offensive priors (AdaptiveOffensivePrior)
-    have no α/β — H(α), H(β) should be NaN to signal "not applicable",
-    while frac_sub_uniform is still well-defined."""
+    """For an offensive prior without α/β (the grid ``AdaptiveOffensivePrior``),
+    ``H(α)`` and ``H(β)`` are NaN while ``frac_sub_uniform`` is still a fraction."""
     setup = _build_setup(use_collab=False)
     history = train_gibbs(
         offensive_prior=setup["offensive_prior"],  # type: ignore[arg-type]

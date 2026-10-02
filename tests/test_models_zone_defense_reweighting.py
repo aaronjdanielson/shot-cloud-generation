@@ -1,10 +1,9 @@
-"""Tests for the D-lite zone-reweighting defense module (PR-D-lite-0).
+"""Tests for :class:`~shotcloud.models.zone_defense_reweighting.ZoneReweightingDefense`.
 
-Scope: unit behavior of :class:`ZoneReweightingDefense` and the
-torch-native :func:`zone_from_xy_torch`. Equivalence with the wrapper
-``ContinuousMixtureSpatial`` is covered separately in
-``tests/test_models_continuous_mixture_spatial.py`` (β_D=0 collapses
-to the no-defense likelihood).
+Covers the zone-level opponent reweighting with and without per-zone ``γ_z``, and the
+torch-native :func:`~shotcloud.models.zone_defense_reweighting.zone_from_xy_torch`.
+Integration with ``ContinuousMixtureSpatial`` (``β_D = 0`` reproduces the no-defense
+likelihood) is tested in ``tests/test_models_continuous_mixture_spatial.py``.
 """
 
 from __future__ import annotations
@@ -24,16 +23,15 @@ from shotcloud.models.zone_defense_reweighting import (
 
 
 def _random_features(B: int, *, seed: int = 0) -> torch.Tensor:
-    """Build a (B, DEFENSE_FEATURE_DIM) tensor with nonzero centered-zone
-    block so D-lite is exercised."""
+    """Build a (B, DEFENSE_FEATURE_DIM) tensor with a nonzero centered-zone block."""
     rng = np.random.default_rng(seed)
     feats = rng.standard_normal((B, DEFENSE_FEATURE_DIM)).astype(np.float32) * 0.1
     return torch.from_numpy(feats)
 
 
 def test_zone_from_xy_torch_matches_numpy_implementation() -> None:
-    """``zone_from_xy_torch`` must agree with the canonical numpy
-    ``zone_from_xy_vectorized`` on a court-grid sweep."""
+    """``zone_from_xy_torch`` agrees with ``zone_from_xy_vectorized`` on a court-grid
+    sweep."""
     xs = np.linspace(-26.0, 26.0, 41)
     ys = np.linspace(-6.0, 48.0, 41)
     xx, yy = np.meshgrid(xs, ys, indexing="xy")
@@ -54,7 +52,7 @@ def test_forward_shape_and_dtype() -> None:
 
 
 def test_beta_zero_collapses_to_exact_zero() -> None:
-    """β_D = 0 → D-lite contribution is identically zero for any input."""
+    """At ``β_D = 0`` the contribution is identically zero for any input."""
     field = ZoneReweightingDefense(n_opponents=30, beta_init=0.0)
     xy = torch.tensor([[[0.0, 5.0], [22.5, 4.0], [-23.0, 3.0]]])
     feats = _random_features(1)
@@ -63,8 +61,7 @@ def test_beta_zero_collapses_to_exact_zero() -> None:
 
 
 def test_support_shots_in_same_zone_get_same_score() -> None:
-    """Two support shots in the same zone for the same opponent must
-    receive identical D-lite contributions."""
+    """Support shots in the same zone for the same opponent get identical scores."""
     field = ZoneReweightingDefense(n_opponents=30, beta_init=1.0)
     # Two rim points (zone 0) and two TopKey3 points (zone 7).
     xy = torch.tensor([[[0.0, 2.0], [1.0, 3.0], [0.0, 24.0], [3.0, 24.0]]])
@@ -77,7 +74,8 @@ def test_support_shots_in_same_zone_get_same_score() -> None:
 
 
 def test_changing_opp_features_changes_scores() -> None:
-    """Same xy + β_D, different per-row features → different D-lite."""
+    """Rows with the same ``xy`` and ``β_D`` but different features get different
+    scores."""
     field = ZoneReweightingDefense(n_opponents=30, beta_init=1.0)
     xy = torch.tensor([[[15.0, 10.0]], [[15.0, 10.0]]])  # one midrange point
     feats_a = _random_features(1, seed=0)
@@ -89,8 +87,8 @@ def test_changing_opp_features_changes_scores() -> None:
 
 
 def test_cold_start_features_yield_zero() -> None:
-    """An all-zero ``def_features`` row (cold-start opponent at snapshot)
-    must produce exactly zero D-lite scores regardless of β_D."""
+    """An all-zero ``def_features`` row (cold-start opponent) gives zero scores at any
+    ``β_D``."""
     field = ZoneReweightingDefense(n_opponents=30, beta_init=2.5)
     xy = torch.tensor([[[10.0, 10.0], [-20.0, 5.0]]])
     feats = torch.zeros(1, DEFENSE_FEATURE_DIM)
@@ -99,8 +97,8 @@ def test_cold_start_features_yield_zero() -> None:
 
 
 def test_out_of_court_xy_is_zeroed() -> None:
-    """Out-of-court support shots (zone == -1) must contribute exactly
-    zero, even if β_D ≠ 0 and the centered-zone vector is nonzero."""
+    """Out-of-court support shots (zone ``-1``) contribute exactly zero, even with
+    ``β_D ≠ 0`` and a nonzero centered-zone vector."""
     field = ZoneReweightingDefense(n_opponents=30, beta_init=1.0)
     # First point is in court (rim), second is behind the baseline.
     xy = torch.tensor([[[0.0, 2.0], [0.0, -10.0]]])
@@ -111,12 +109,12 @@ def test_out_of_court_xy_is_zeroed() -> None:
 
 
 def test_gradient_flows_to_beta_d() -> None:
-    """L = sum(D) must produce a nonzero gradient on ``beta_D``."""
+    """``L = sum(D)`` gives a nonzero gradient on ``beta_D``."""
     field = ZoneReweightingDefense(n_opponents=30, beta_init=0.1)
     xy = torch.tensor([[[0.0, 2.0], [22.5, 4.0]]])
     feats = _random_features(1)
-    # Use same-sign values on the queried zones (0=rim, 4=corner3R) so
-    # the sum-gradient on β_D doesn't cancel to zero.
+    # Same-sign values on the queried zones (0 = rim, 4 = right corner 3) keep the
+    # summed gradient on β_D from cancelling.
     feats[0, _ZONE_CENTERED_SLICE] = torch.tensor([0.2, -0.05, 0.0, 0.1, 0.15, 0.05, -0.05, 0.0])
     out = field(query_xy=xy, def_features=feats)
     loss = out.sum()
@@ -126,14 +124,14 @@ def test_gradient_flows_to_beta_d() -> None:
 
 
 def test_n_opponents_stored() -> None:
-    """``_n_opponents`` is preserved for downstream diagnostics
-    (matches the D-field attribute name)."""
+    """``_n_opponents`` is stored for diagnostics, under the same name as in the
+    continuous adaptive defensive field."""
     field = ZoneReweightingDefense(n_opponents=42, beta_init=1e-3)
     assert field._n_opponents == 42
 
 
 def test_score_equals_beta_times_centered_zone() -> None:
-    """The closed-form check: D_m = β_D * centered_zones[zone(s_m)]."""
+    """``D_m = β_D · centered_zones[zone(s_m)]``."""
     field = ZoneReweightingDefense(n_opponents=30, beta_init=0.0)
     with torch.no_grad():
         field.beta_D.copy_(torch.tensor(2.0))
@@ -150,29 +148,27 @@ def test_score_equals_beta_times_centered_zone() -> None:
 
 
 def test_zone_count_matches_features() -> None:
-    """The 8-zone centered block in features must have N_ZONES entries —
-    sanity check that D-lite's gather over the slice matches the
-    feature layout exactly."""
+    """The centered-zone feature block has ``N_ZONES`` entries, matching the zone
+    gather."""
     sl = _ZONE_CENTERED_SLICE
     assert (sl.stop - sl.start) == N_ZONES
 
 
 # ---------------------------------------------------------------------------
-# D-lite-zone (per-zone γ_z multiplier)
+# Per-zone γ_z multiplier
 # ---------------------------------------------------------------------------
 
 
 def test_per_zone_gamma_disabled_by_default() -> None:
-    """``per_zone_gamma=False`` (default) → no ``gamma_z`` parameter."""
+    """By default (``per_zone_gamma=False``) there is no ``gamma_z`` parameter."""
     field = ZoneReweightingDefense(n_opponents=30)
     assert field.gamma_z is None
     assert not field.per_zone_gamma
 
 
 def test_per_zone_gamma_creates_unit_init_parameter() -> None:
-    """``per_zone_gamma=True`` registers a learnable ``gamma_z`` of
-    shape (N_ZONES,), initialized to all-ones so that at step 0
-    D-lite-zone is bit-equal to D-lite-0."""
+    """``per_zone_gamma=True`` registers a learnable ``gamma_z`` of shape (N_ZONES,)
+    initialized to ones, so the per-zone variant starts equal to the scalar one."""
     field = ZoneReweightingDefense(n_opponents=30, per_zone_gamma=True)
     assert field.gamma_z is not None
     assert field.gamma_z.shape == (N_ZONES,)
@@ -181,8 +177,8 @@ def test_per_zone_gamma_creates_unit_init_parameter() -> None:
 
 
 def test_per_zone_gamma_at_init_equals_d_lite_zero() -> None:
-    """At init (γ_z = 1.0), D-lite-zone produces *exactly* the same
-    scores as D-lite-0 with the same β_D init."""
+    """At initialization (``γ_z = 1``) the per-zone variant matches the scalar
+    variant with the same ``β_D``."""
     beta = 0.7
     field_0 = ZoneReweightingDefense(n_opponents=30, beta_init=beta, per_zone_gamma=False)
     field_gamma = ZoneReweightingDefense(n_opponents=30, beta_init=beta, per_zone_gamma=True)
@@ -195,9 +191,7 @@ def test_per_zone_gamma_at_init_equals_d_lite_zero() -> None:
 
 
 def test_per_zone_gamma_changes_scores_when_gamma_diverges() -> None:
-    """After γ_z deviates from 1.0, D-lite-zone scores differ from
-    D-lite-0 zone-by-zone — confirms γ_z modulates per-zone
-    independently."""
+    """Once ``γ_z`` moves off 1, each zone's score scales by its own ``γ_z``."""
     field = ZoneReweightingDefense(n_opponents=30, beta_init=1.0, per_zone_gamma=True)
     assert field.gamma_z is not None
     with torch.no_grad():
@@ -218,7 +212,8 @@ def test_per_zone_gamma_changes_scores_when_gamma_diverges() -> None:
 
 
 def test_per_zone_gamma_gradient_flows_to_both_beta_and_gamma() -> None:
-    """L = sum(D) produces nonzero gradients on both β_D and γ_z."""
+    """``L = sum(D)`` gives nonzero gradients on ``β_D`` and on ``γ_z`` for the queried
+    zones only."""
     field = ZoneReweightingDefense(n_opponents=30, beta_init=0.5, per_zone_gamma=True)
     # Rim, LC3, ATB3.
     xy = torch.tensor([[[0.0, 2.0], [-23.5, 5.0], [0.0, 25.0]]])
@@ -238,8 +233,8 @@ def test_per_zone_gamma_gradient_flows_to_both_beta_and_gamma() -> None:
 
 
 def test_per_zone_gamma_state_dict_roundtrip() -> None:
-    """``per_zone_gamma=True`` state_dict carries both β_D and γ_z; a
-    fresh module with the same flag loads them correctly."""
+    """With ``per_zone_gamma=True`` the state dict carries ``β_D`` and ``γ_z`` and loads
+    into a fresh module with the same flag."""
     src = ZoneReweightingDefense(n_opponents=30, beta_init=0.1, per_zone_gamma=True)
     assert src.gamma_z is not None
     with torch.no_grad():

@@ -1,4 +1,4 @@
-"""Tests for :class:`shotcloud.kde.DefensiveKDE` (Phase 2)."""
+"""Tests for :class:`shotcloud.legacy_pivot.defensive_kde.DefensiveKDE`."""
 
 from __future__ import annotations
 

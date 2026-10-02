@@ -1,4 +1,4 @@
-"""Tests for the density-surface scoring rules.
+"""Tests for the density-surface scoring rules in :mod:`shotcloud.evaluation.density_surfaces`.
 
 Scope:
 
@@ -15,8 +15,8 @@ Scope:
     * isotropic scalar / per-shot σ produce diagonal Σ.
     * radial-tangent collapses to ``σ² I`` when ``σ_r = σ_t``.
     * full-cov collapses to ``σ² I`` when ``σ_x = σ_y, ρ = 0``.
-* Zone Brier returns 0 when predicted = observed; CE matches the
-  analytical entropy.
+* Zone Brier is about 0 when the predicted zone distribution matches the
+  observed one and about 2 under a complete two-zone mismatch.
 * HDR coverage on a unimodal Gaussian: when the model IS the truth,
   empirical coverage matches α within Monte-Carlo noise.
 """
@@ -351,5 +351,5 @@ def test_hdr_coverage_matches_alpha_when_model_is_truth() -> None:
 
 
 def _ensure_numpy_is_imported() -> None:
-    """Used by some tests; suppress unused-import lint."""
+    """Reference ``numpy`` so linters do not flag the import as unused."""
     assert np.array([1, 2]).sum() == 3

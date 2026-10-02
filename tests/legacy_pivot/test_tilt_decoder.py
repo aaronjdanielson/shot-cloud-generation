@@ -1,9 +1,8 @@
-"""Tests for :class:`shotcloud.models.LowRankTiltDecoder`.
+"""Tests for :class:`shotcloud.legacy_pivot.tilt_decoder.LowRankTiltDecoder`.
 
-The headline test is :func:`test_zero_init_reproduces_base_measure_exactly`
-— the load-bearing invariant from
-[plan.md §5.2](../docs/plan.md#52-key-api-contracts) and
-[core_model_description.md §2](../core_model_description.md).
+The headline test is :func:`test_zero_init_reproduces_base_measure_exactly`,
+which checks the load-bearing zero-init invariant: at ``V = 0`` the decoder
+returns the base measure ``q_0`` exactly.
 """
 
 from __future__ import annotations
@@ -83,9 +82,8 @@ def test_v_has_expected_shape() -> None:
 def test_zero_init_reproduces_base_measure_exactly() -> None:
     """At zero-init, softmax(forward(log_q0, u)) must equal q_0 for any u.
 
-    This is the load-bearing correctness property documented in
-    plan.md §5.2 and core_model_description.md §2. It lets training start
-    from the KDE-product prior with no random distortion.
+    This load-bearing property lets training start from the KDE-product
+    prior with no random distortion.
     """
     n_cells, rank, batch = 50, 4, 8
     decoder = LowRankTiltDecoder(n_cells=n_cells, rank=rank, zero_init=True)
@@ -245,12 +243,12 @@ def test_zero_init_step_zero_log_likelihood_equals_kde_log_likelihood() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Top-level import
+# Import path
 # ---------------------------------------------------------------------------
 
 
 def test_top_level_import_works() -> None:
-    """The class is importable as ``from shotcloud import LowRankTiltDecoder``."""
+    """The class is importable from :mod:`shotcloud.legacy_pivot.tilt_decoder`."""
     from shotcloud.legacy_pivot.tilt_decoder import LowRankTiltDecoder as TopLevel
 
     assert TopLevel is LowRankTiltDecoder

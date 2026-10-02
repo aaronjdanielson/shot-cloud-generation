@@ -1,4 +1,5 @@
-"""Tests for the G1 within-game shot GRU (paper §10)."""
+"""Tests for :class:`shotcloud.models.within_game_gru.WithinGameGRU` and the within-game
+prior-shot sequence featurizer."""
 
 from __future__ import annotations
 
@@ -66,8 +67,8 @@ def test_compute_within_game_sequence_truncates_to_max_prior() -> None:
 
 
 def test_within_game_gru_zero_init_returns_zero_for_any_input() -> None:
-    """The output projection is zero-init, so the GRU contributes 0 at
-    step 0 regardless of inputs. Load-bearing invariant: G1 ≡ B2 at init."""
+    """The zero-initialized output projection makes the GRU output 0 for any input, so
+    adding the GRU leaves the model unchanged at initialization."""
     gru = WithinGameGRU(hidden_dim=16, out_dim=8)
     torch.manual_seed(0)
     prior_seq = torch.randn(4, MAX_PRIOR_SHOTS, WITHIN_GAME_SEQ_DIM)
@@ -78,11 +79,10 @@ def test_within_game_gru_zero_init_returns_zero_for_any_input() -> None:
 
 
 def test_within_game_gru_zero_length_rows_bypass_the_gru() -> None:
-    """Rows with prior_lengths==0 must not enter pack_padded_sequence
-    (which rejects zero lengths). They produce the zero output directly."""
+    """Rows with ``prior_lengths == 0`` skip ``pack_padded_sequence`` (which rejects
+    zero lengths) and output zero."""
     gru = WithinGameGRU(hidden_dim=8, out_dim=4)
-    # Manually set the projection weight nonzero so we'd detect anything
-    # leaking through the GRU path. Zero-length rows must still emit 0.
+    # A nonzero projection would expose any leakage through the GRU path.
     with torch.no_grad():
         gru.proj.weight.normal_(std=0.1)
     prior_seq = torch.randn(3, MAX_PRIOR_SHOTS, WITHIN_GAME_SEQ_DIM)
@@ -92,17 +92,16 @@ def test_within_game_gru_zero_length_rows_bypass_the_gru() -> None:
 
 
 def test_within_game_gru_nonzero_after_unzeroing_projection() -> None:
-    """Confirm the GRU pipeline runs end-to-end when the projection is
-    no longer zero (so we know the zero output above is genuine and not
-    a misimplementation that silently drops everything)."""
+    """With a nonzero projection the GRU output is nonzero, so the zero outputs above
+    come from the initialization and not from a dropped path."""
     gru = WithinGameGRU(hidden_dim=8, out_dim=4)
     with torch.no_grad():
-        gru.proj.weight.normal_(std=1.0)  # bigger than zero-init
+        gru.proj.weight.normal_(std=1.0)
     prior_seq = torch.randn(3, MAX_PRIOR_SHOTS, WITHIN_GAME_SEQ_DIM)
     prior_lengths = torch.tensor([3, 1, 7], dtype=torch.int64)
     out = gru(prior_seq, prior_lengths)
     assert out.shape == (3, 4)
-    # The unprojected GRU state for nonzero rows must be nonzero.
+    # Rows with prior shots produce a nonzero output.
     assert torch.any(out != 0.0)
 
 
@@ -124,7 +123,7 @@ def test_within_game_gru_constructor_rejects_nonpositive_dims() -> None:
 
 
 def test_within_game_gru_proj_weight_is_zero_at_init() -> None:
-    """The load-bearing init: ``proj.weight == 0`` so G1 ≡ B2 at init."""
+    """``proj.weight`` is zero at initialization and the projection has no bias."""
     gru = WithinGameGRU(hidden_dim=16, out_dim=8)
     assert torch.all(gru.proj.weight == 0.0)
     assert gru.proj.bias is None  # bias=False in the projection

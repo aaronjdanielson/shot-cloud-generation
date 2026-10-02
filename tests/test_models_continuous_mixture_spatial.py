@@ -1159,8 +1159,8 @@ def test_matchup_wrapper_requires_paired_field_and_features() -> None:
 
 
 def test_matchup_beta_zero_matches_no_matchup_path() -> None:
-    """At ``β_match = 0`` the wrapper's output must equal the no-
-    matchup baseline bit-by-bit (within float32 rounding)."""
+    """At ``β_match = 0`` the log-lik equals the no-matchup baseline (within float32
+    rounding) and ``matchup_logits`` are zero."""
     setup = _build_matchup_setup(beta_init=0.0)
     spatial_off = ContinuousMixtureSpatial(offensive_prior=setup["collab"])  # type: ignore[arg-type]
     spatial_on = ContinuousMixtureSpatial(
@@ -1178,9 +1178,8 @@ def test_matchup_beta_zero_matches_no_matchup_path() -> None:
 
 
 def test_matchup_warm_init_changes_loglik_and_exposes_diagnostics() -> None:
-    """β_match > 0 + a player+opponent with nonzero Δ̂ → the wrapper
-    output differs from the β=0 baseline and the diagnostic fields
-    are populated."""
+    """With ``β_match > 0`` and a player-opponent cell with nonzero Δ̂, the log-lik
+    differs from the ``β_match = 0`` baseline and the diagnostics are populated."""
     setup_off = _build_matchup_setup(beta_init=0.0)
     setup_on = _build_matchup_setup(beta_init=1.0)
     spatial_off = ContinuousMixtureSpatial(
@@ -1201,9 +1200,7 @@ def test_matchup_warm_init_changes_loglik_and_exposes_diagnostics() -> None:
     with torch.no_grad():
         out_off = spatial_off(**batch)
         out_on = spatial_on(**batch)
-    # Warm cell → matchup must contribute non-zero in at least the
-    # TopKey3-shot column. Verify by checking the loglik shifted and
-    # the diagnostic fields populated.
+    # The warm cell contributes a nonzero matchup term, which shifts the log-lik.
     assert not torch.allclose(out_off.log_lik, out_on.log_lik)
     assert out_on.matchup_logits is not None
     assert out_on.matchup_logits.shape[0] == 3
@@ -1212,8 +1209,8 @@ def test_matchup_warm_init_changes_loglik_and_exposes_diagnostics() -> None:
 
 
 def test_matchup_cold_cell_yields_zero_contribution() -> None:
-    """A row routed to a cold-start cell (Δ̂=0, N^eff=0) gets exactly
-    zero matchup contribution and the loglik matches no-matchup."""
+    """Rows routed to a cold-start cell (Δ̂ = 0, N^eff = 0) get exactly zero matchup
+    contribution, and the log-lik matches the no-matchup baseline."""
     setup = _build_matchup_setup(beta_init=2.0)
     # Pick player_idx that the fixture left at all-zero Δ̂. n_players ≥ 2
     # in _build_setup; the fixture only warmed player 0, so player 1 is
@@ -1764,11 +1761,9 @@ def test_khat_only_at_init_matches_no_residual_baseline() -> None:
     with torch.no_grad():
         out_no_res = spatial_no_res(**batch)
         out_khat = spatial_khat(**batch)
-    # K̂-only encoder produces a small-but-nonzero base residual (from
-    # the standard small-init fc2), but the usage_fc2 zero-init makes
-    # the K̂ contribution exactly zero at step 0 — and the
-    # location_embedding zero-init makes the residual logits zero,
-    # so the wrapper log_lik matches.
+    # The base residual branch is small but nonzero; the zero-initialized usage_fc2
+    # removes the K̂ contribution and the zero-initialized location embedding makes the
+    # residual logits vanish, so the log-lik matches.
     torch.testing.assert_close(out_khat.log_lik, out_no_res.log_lik, atol=2e-5, rtol=0)
 
 
@@ -2119,7 +2114,7 @@ def test_stratified_epsilon_lt_one_perturbs_log_lik() -> None:
 
 
 def test_stratified_epsilon_invalid_raises() -> None:
-    """Reject epsilon outside (0, 1] at construction time."""
+    """``stratified_epsilon`` outside (0, 1] raises at construction."""
     import pytest
 
     setup = _build_setup()
@@ -2155,8 +2150,8 @@ def test_causal_zone_bias_disabled_is_bit_identical() -> None:
 
 
 def test_causal_zone_bias_zero_init_is_bit_identical() -> None:
-    """Zero-init B → ``π_q @ B = 0`` for any ``π_q`` → edge bias is
-    identically zero → log-lik bit-identical to no-bias decoder."""
+    """``B`` is zero-initialized, so ``π_q @ B = 0`` for any ``π_q``, the edge bias
+    vanishes, and the log-lik is bit-identical to the no-bias decoder."""
     from shotcloud.models.continuous_mixture_spatial import CausalZoneBias
 
     torch.manual_seed(0)

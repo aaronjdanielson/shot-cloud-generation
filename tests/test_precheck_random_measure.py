@@ -1,16 +1,11 @@
-"""Synthetic-data tests for the random-measure pre-check.
+"""Synthetic-data tests for ``scripts/precheck_random_measure.py``.
 
-Three tests per spec §6.2 of
-[docs/precheck_random_measure_spec.md](../docs/precheck_random_measure_spec.md):
-
-1. ``test_precheck_iid_synthetic`` — shots iid given a known per-player
-   multinomial; R should be near 0 and decision should be STOP.
-2. ``test_precheck_latent_synthetic`` — shots drawn from a per-game random
-   multinomial with known logistic-normal variance; R should recover the
-   known excess covariance and decision should be PROCEED.
-3. ``test_precheck_calibration_failure_aborts`` — baseline with known
-   constant bias on one zone; calibration check should fail and the pipeline
-   should report a calibration-failed abort.
+1. ``test_precheck_iid_synthetic``: shots iid given a known per-player multinomial
+   give ``R`` near 0 and a STOP decision.
+2. ``test_precheck_latent_synthetic``: shots from a per-game logistic-normal random
+   multinomial give a large ``R`` and a PROCEED decision.
+3. ``test_precheck_calibration_failure_aborts``: a baseline with a constant bias on
+   one zone fails the calibration check.
 """
 
 from __future__ import annotations
@@ -40,9 +35,8 @@ def _draw_iid_multinomial(p: np.ndarray, K: int, rng: np.random.Generator) -> np
 
 
 def test_precheck_iid_synthetic() -> None:
-    """Generate N games where shots are iid given a known per-player p.
-    Use p as the baseline (perfectly calibrated). Then R should be near 0
-    and the decision rule should fire STOP."""
+    """With shots iid given a known ``p`` used as the (perfectly calibrated) baseline,
+    ``R`` is near 0 and the decision is STOP."""
     rng = np.random.default_rng(0)
     N = 10_000
     # Each "player" has a fixed multinomial. Draw N players.
@@ -74,18 +68,17 @@ def test_precheck_iid_synthetic() -> None:
 
 
 def test_precheck_latent_synthetic() -> None:
-    """Generate N games where each game's p_n = softmax(mu + L*z_n),
-    z_n ~ N(0, I), and shots are iid from p_n. The marginal mean E[p_n]
-    serves as the baseline. The decision rule should fire PROCEED.
+    """With per-game ``p_n = softmax(mu + L z_n)``, ``z_n ~ N(0, I)``, and the marginal
+    mean ``E[p_n]`` as baseline, the decision is PROCEED.
 
-    The injected latent variance is large enough (L scale = 0.6) to push
-    R well above the 20% PROCEED threshold."""
+    The latent scale (0.6) puts ``R`` well above the PROCEED threshold.
+    """
     rng = np.random.default_rng(0)
     N = 10_000
     K_const = 20  # high stratum
 
-    # Population-mean logits. Two latent dimensions with non-trivial
-    # influence on all 4 zones — pushed to make excess variance >> 20%.
+    # Population-mean logits and two latent dimensions that move all 4 zones,
+    # giving excess variance well above the PROCEED threshold.
     mu = np.array([0.6, 0.3, -0.5, -0.4])
     L = 0.6 * np.array(
         [
@@ -102,8 +95,8 @@ def test_precheck_latent_synthetic() -> None:
     p_n = np.exp(logits)
     p_n = p_n / p_n.sum(axis=-1, keepdims=True)
 
-    # Baseline = the per-game marginal mean. Approximate via Monte Carlo
-    # over the latent prior (same for all games here).
+    # The baseline is the marginal mean, estimated by Monte Carlo over the latent
+    # prior (the same for every game).
     z_mc = rng.standard_normal(size=(20_000, 2))
     logits_mc = mu[None, :] + z_mc @ L.T
     p_mc = np.exp(logits_mc) / np.exp(logits_mc).sum(axis=-1, keepdims=True)
@@ -132,11 +125,11 @@ def test_precheck_latent_synthetic() -> None:
 
 
 def test_precheck_calibration_failure_aborts() -> None:
-    """Inject a known +0.05 systematic bias on one zone of the baseline.
-    The calibration check should fail (not pass) so that the downstream
-    pipeline can detect it and abort. Updated 2026-06-10: criterion is
-    practical effect-size (|gap| < 0.03 on ≥8/10 deciles, no systematic
-    monotone drift on the upper tail)."""
+    """A baseline that under-predicts one zone by 0.05 fails the calibration check.
+
+    The check is an effect-size criterion: per zone, most deciles must have
+    ``|gap|`` below the threshold and the upper deciles must show no systematic drift.
+    """
     rng = np.random.default_rng(0)
     N = 5_000
     K = rng.integers(15, 25, size=N)

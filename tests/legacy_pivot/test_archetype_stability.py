@@ -1,16 +1,9 @@
-"""Tests for :mod:`scripts.archetype_stability`.
+"""Tests for the multi-seed archetype stability script.
 
-Three layers of testing:
-
-1. **Pairwise stability primitives.** Hungarian matching recovers
-   a known permutation; pair stats are zero on identity; SW matrix
-   is symmetric in the right places.
-2. **Per-seed fit determinism.** Fits seeded with the same random
-   integer reproduce byte-for-byte; different seeds produce
-   different archetypes.
-3. **End-to-end smoke test.** A small synthetic dataset runs through
-   ``run_stability`` and produces all expected output files +
-   resume-safe behavior.
+Covers ``scripts/legacy_pivot/archetype_stability.py``: Hungarian-matched
+pairwise stability statistics, per-seed fit determinism, the within-fit
+distinctness and per-atom usage diagnostics, the four-rule certification,
+and an end-to-end ``run_stability`` run including resume behavior.
 """
 
 from __future__ import annotations
@@ -26,7 +19,7 @@ matplotlib.use("Agg")  # non-interactive backend for CI
 import numpy as np
 import pandas as pd
 
-# Add repo scripts/ to sys.path so test can import the script.
+# Put scripts/legacy_pivot/ on sys.path so the script can be imported.
 _REPO = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_REPO / "scripts" / "legacy_pivot"))
 sys.path.insert(0, str(_REPO / "scripts"))
@@ -381,7 +374,7 @@ def test_within_fit_stats_in_between_flag_effective_rank_warning() -> None:
 
 
 def test_within_fit_stats_in_summary_json(tmp_path: Path) -> None:
-    """End-to-end: the new within-fit fields land in stability_summary.json."""
+    """End-to-end: the within-fit fields land in stability_summary.json."""
     shots_path = _synthetic_shots(tmp_path)
     output_dir = tmp_path / "stability"
     archetype_stability.run_stability(
@@ -490,7 +483,7 @@ def test_usage_stats_flags_dominant_atom() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. Paper-grade certification
+# 6. Certification
 # ---------------------------------------------------------------------------
 
 

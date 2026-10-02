@@ -1,7 +1,4 @@
-"""Tests for :class:`shotcloud.models.PresenceModel`.
-
-Phase 3.4 PR-P1 of the 2026-06-07 audit.
-"""
+"""Tests for :class:`shotcloud.models.PresenceModel`, the causal on-court presence model."""
 
 from __future__ import annotations
 
@@ -42,9 +39,8 @@ def test_output_shape_and_range() -> None:
 
 
 def test_parameter_count_is_small() -> None:
-    """The presence model is small by design: ρ̃, b0, β̃_h, and a
-    (n_positions × n_starter × n_bins) pool table = 3 + 3*2*30 = 183
-    learnable scalars.
+    """The parameters are ``ρ̃``, ``b0``, ``β̃_h`` and an
+    (n_positions × n_starter × n_bins) pool table: 3 + 3·2·30 = 183 scalars.
     """
     m = PresenceModel()
     total = sum(p.numel() for p in m.parameters())
@@ -53,9 +49,8 @@ def test_parameter_count_is_small() -> None:
 
 
 def test_cold_start_returns_pool() -> None:
-    """With ``history_count == 0`` the gate is :math:`\\sigma(b_0)` and
-    the self curve is all zeros; output should equal
-    :math:`(1-\\sigma(b_0))\\cdot q_\\mathrm{pool}`.
+    """With ``history_count == 0`` the gate is :math:`\\sigma(b_0)` and the self
+    curve is all zeros, so the output is :math:`(1-\\sigma(b_0))\\cdot q_\\mathrm{pool}`.
 
     Initialization uses :math:`b_0=-1`, so :math:`\\sigma(-1) \\approx 0.27`
     and the cold-start output is :math:`0.73 \\cdot q_\\mathrm{pool}`.
@@ -79,10 +74,8 @@ def test_cold_start_returns_pool() -> None:
 
 
 def test_pure_self_when_history_very_large() -> None:
-    """At a very large ``history_count``, the gate saturates to 1 and
-    the output equals the recency-weighted self curve.
-
-    We force a large β_h to make the saturation tight.
+    """At a very large ``history_count`` the gate saturates at 1 and the output equals
+    the recency-weighted self curve (a large ``β_h`` makes the saturation tight).
     """
     m = PresenceModel(beta_h_init=5.0)  # softplus(5)=5.0067 → strong slope
     batch = 2
@@ -114,8 +107,7 @@ def test_pure_self_when_history_very_large() -> None:
 
 
 def test_recent_games_dominate_old_games() -> None:
-    """With learned ρ > 0 and a large age gap, the recent prior should
-    dominate the self curve."""
+    """With ``ρ > 0`` and a large age gap, the recent prior dominates the self curve."""
     m = PresenceModel()  # default ρ ≈ 1/45
     batch = 1
     k_max = 2
@@ -134,7 +126,7 @@ def test_recent_games_dominate_old_games() -> None:
 
 
 def test_gate_increases_with_history_count() -> None:
-    """:math:`\\lambda(N)` should be monotone in N."""
+    """The gate :math:`\\lambda(N)` is non-decreasing in ``N``."""
     m = PresenceModel()
     n_values = torch.tensor([0.0, 1.0, 5.0, 50.0, 500.0])
     lam = m.history_gate(n_values)
@@ -143,8 +135,7 @@ def test_gate_increases_with_history_count() -> None:
 
 
 def test_per_bin_bce_loss_is_finite_under_training_step() -> None:
-    """One backward pass against per-bin BCE on synthetic data should
-    leave parameters finite."""
+    """One backward pass of per-bin BCE leaves parameters and gradients finite."""
     torch.manual_seed(0)
     m = PresenceModel()
     inputs = _make_inputs(batch=8, k_max=4)

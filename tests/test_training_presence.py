@@ -1,7 +1,4 @@
-"""Tests for :func:`shotcloud.training.train_presence_only`.
-
-Phase 3.4 PR-P1 of the 2026-06-07 audit.
-"""
+"""Tests for :func:`shotcloud.training.train_presence_only`."""
 
 from __future__ import annotations
 

@@ -1,9 +1,8 @@
-"""Tests for the Tier-2a D-matchup reweighting module.
+"""Tests for :class:`~shotcloud.models.zone_defense_reweighting.MatchupReweightingDefense`.
 
-Scope: unit behavior of :class:`MatchupReweightingDefense`. The
-feature-building / Δ̂ arithmetic is covered separately in
-``tests/test_features_matchup_features.py``; here we exercise only the
-forward (gather + β_match · Δ̂ + zone mask + gradient flow).
+Covers the forward pass only (zone gather, ``β_match · Δ̂``, out-of-court masking,
+gradient flow); construction of the matchup features ``Δ̂`` is tested in
+``tests/test_features_matchup_features.py``.
 """
 
 from __future__ import annotations
@@ -21,8 +20,8 @@ from shotcloud.models.zone_defense_reweighting import (
 def _zone_corners() -> tuple[torch.Tensor, torch.Tensor]:
     """A small ``(B=8, M=1, 2)`` ``query_xy`` where row ``i`` is in zone
     ``i``, plus the matching expected zone-index tensor."""
-    # One canonical (x, y) per zone — same set the matchup feature
-    # tests verify with ``zone_from_xy_vectorized``.
+    # One canonical (x, y) per zone, matching the coordinates used in the matchup
+    # feature tests with ``zone_from_xy_vectorized``.
     coords = torch.tensor(
         [
             [0.0, 2.0],  # RA
@@ -38,9 +37,7 @@ def _zone_corners() -> tuple[torch.Tensor, torch.Tensor]:
     )
     xy = coords.unsqueeze(1)  # (8, 1, 2)
     expected_zone = torch.arange(N_ZONES, dtype=torch.int64).unsqueeze(-1)  # (8, 1)
-    # Sanity: the zone_from_xy_torch helper agrees with our handpicked
-    # coords. This guards against silent reshuffling of the zone
-    # convention if ``zone_from_xy_torch`` is ever updated.
+    # Guards the fixture against a change in the zone ordering of zone_from_xy_torch.
     assert torch.equal(zone_from_xy_torch(xy), expected_zone)
     return xy, expected_zone
 
@@ -73,9 +70,7 @@ def test_beta_zero_collapses_to_exact_zero() -> None:
 
 
 def test_score_equals_beta_times_delta_hat_at_zone() -> None:
-    """For a row in zone z, the per-shot contribution must equal
-    β_match · Δ̂_{row, z}. Validates the gather is hitting the right
-    column of Δ̂."""
+    """A shot in zone ``z`` contributes ``β_match · Δ̂_{row, z}``."""
     xy, _expected_zone = _zone_corners()  # (8, 1, 2), (8, 1)
     B = xy.shape[0]
     # Diagonal Δ̂: row i has 1.0 at zone i, 0 elsewhere. So the gather
@@ -88,8 +83,7 @@ def test_score_equals_beta_times_delta_hat_at_zone() -> None:
 
 
 def test_cold_start_delta_hat_yields_zero() -> None:
-    """A row with Δ̂ = 0 (cold-start cell) gets zero contribution at
-    any β_match."""
+    """A row with ``Δ̂ = 0`` (cold-start cell) contributes zero at any ``β_match``."""
     m = MatchupReweightingDefense(beta_init=5.0)
     B, M = 3, 4
     xy = torch.tensor(
@@ -106,8 +100,8 @@ def test_cold_start_delta_hat_yields_zero() -> None:
 
 
 def test_out_of_court_xy_is_zeroed() -> None:
-    """Out-of-court support shots (zone == -1) must contribute zero
-    even when Δ̂ is large."""
+    """Out-of-court support shots (zone ``-1``) contribute zero even when ``Δ̂`` is
+    large."""
     m = MatchupReweightingDefense(beta_init=1.0)
     # All three shots in row 0 are out-of-court (backcourt, behind
     # baseline, far sideline).
@@ -160,9 +154,7 @@ def test_input_shape_validation() -> None:
 
 
 def test_per_shot_sigma_grids_dont_leak_across_rows() -> None:
-    """Two batch rows with different Δ̂ vectors must produce
-    independent outputs — guards against accidental cross-row
-    gather/broadcast bugs."""
+    """Each row's output depends only on its own ``Δ̂`` row."""
     m = MatchupReweightingDefense(beta_init=1.0)
     # Two rows, both in RA (zone 0); Δ̂_0 differs.
     xy = torch.tensor([[[0.0, 2.0]], [[0.0, 2.0]]], dtype=torch.float32)  # (2, 1, 2)
@@ -174,8 +166,7 @@ def test_per_shot_sigma_grids_dont_leak_across_rows() -> None:
 
 
 def test_only_beta_match_is_a_parameter() -> None:
-    """No surprise extra parameters slipped in (e.g. accidental γ_z
-    or n_opponents buffer)."""
+    """``β_match`` is the module's only parameter, and it has no buffers."""
     m = MatchupReweightingDefense()
     params = list(m.parameters())
     buffers = list(m.buffers())
@@ -185,10 +176,8 @@ def test_only_beta_match_is_a_parameter() -> None:
 
 
 def test_state_dict_size_matches_d_lite_zero() -> None:
-    """D-matchup-0 has the same parameter footprint as D-lite-0 (one
-    scalar). This is a structural-parity check — if someone later
-    adds a per-zone γ to D-matchup, this guards us from accidentally
-    flunking the 'simplest identifiable version first' rule."""
+    """The state dict holds a single scalar ``beta_match``, the same footprint as
+    ``ZoneReweightingDefense`` without per-zone ``γ``."""
     m = MatchupReweightingDefense()
     sd = m.state_dict()
     assert tuple(sd.keys()) == ("beta_match",)
@@ -196,6 +185,5 @@ def test_state_dict_size_matches_d_lite_zero() -> None:
 
 
 def _sanity_match_zone_helper_consistent() -> None:
-    """Lightweight nudge that ``np.testing`` is importable alongside
-    ``torch.testing``."""
+    """Keep the ``numpy`` import in use."""
     np.testing.assert_array_equal(np.array([1, 2]), np.array([1, 2]))

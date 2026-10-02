@@ -3,8 +3,9 @@
 Builds a 26-dimensional trait vector per (player, snapshot). Trait
 vectors drive analogue retrieval (:mod:`shotcloud.models.analogue_retrieval`)
 and the shooter-similarity term of the collaborative KDE. Every
-play-derived slot at snapshot ``m`` uses only games and shots strictly
-before that snapshot's anchor date.
+slot at snapshot ``m`` uses only games and shots strictly before that
+snapshot's anchor date, including the population statistics that
+standardize the biographical slots.
 
 Trait vector layout — exactly 26 dims (see :data:`SLOT_NAMES`):
 
@@ -40,12 +41,16 @@ Missingness indicator:
    25  m_play                (1 if player had any FGA before anchor)
 ```
 
-Block A's continuous slots are z-scored across all players in the
-vocabulary at each snapshot, with age evaluated at the snapshot's
-anchor date (height and weight are static, so their z-scores are the
-same at every snapshot). Missing biographical values are imputed to the
-post-z-score mean (zero), placing such players at the population-average
-coordinate.
+Block A's continuous slots are z-scored at each snapshot against the
+*reference population*: the players with at least one game in the
+``reference_window_days`` before the snapshot's anchor date. The mean and
+standard deviation therefore describe the league as it stood at the
+anchor and never depend on players who debut later. Every player in the
+vocabulary, including one who has not yet played, is standardized with
+those statistics, with age evaluated at the anchor date. Missing
+biographical values are imputed to the post-z-score mean (zero), placing
+such players at the population-average coordinate; when the reference
+population is empty or has zero variance, the slot is zero for everyone.
 
 Block B is multiplied by ``m_play`` so players with no prior field-goal
 attempts get exact zeros across the play-derived block. The explicit
@@ -224,15 +229,21 @@ def _recency_aggregate_per_snapshot(
 
 def _z_score_with_nan_imputation(
     values: NDArray[np.float64],
+    reference: NDArray[np.bool_],
 ) -> NDArray[np.float32]:
-    """Z-score a 1-D array, imputing NaN to the post-z-score mean (0)."""
+    """Z-score a 1-D array against its ``reference`` rows, imputing NaN to 0.
+
+    The mean and standard deviation are taken over the finite entries
+    selected by ``reference``; every entry is standardized with them.
+    """
     finite_mask = np.isfinite(values)
-    if not finite_mask.any():
-        # No finite values: every entry is imputed to zero.
+    reference_mask = finite_mask & reference
+    if not reference_mask.any():
+        # No finite reference values: the z-score is undefined, so return zeros.
         return np.zeros_like(values, dtype=np.float32)
-    finite_vals = values[finite_mask]
-    mean = float(finite_vals.mean())
-    std = float(finite_vals.std())
+    reference_vals = values[reference_mask]
+    mean = float(reference_vals.mean())
+    std = float(reference_vals.std())
     if std < 1e-9:
         # Zero variance: the z-score is undefined, so return zeros.
         return np.zeros_like(values, dtype=np.float32)
@@ -248,13 +259,15 @@ def build_player_traits_table(
     game_logs_df: pd.DataFrame,
     *,
     recency_half_life_days: float = 30.0,
+    reference_window_days: float = 365.0,
 ) -> PlayerTraitsTable:
     """Build the causal trait table for the collaborative KDE.
 
-    For each snapshot, Block A is filled from ``bio_df`` and Block B
-    from the snapshot bundle (position mixture, role profile) and from
-    recency-weighted aggregates of ``game_logs_df`` over games strictly
-    before the bundle's anchor date.
+    For each snapshot, Block A is filled from ``bio_df`` and standardized
+    against the players active in the ``reference_window_days`` before the
+    bundle's anchor date. Block B is filled from the snapshot bundle
+    (position mixture, role profile) and from recency-weighted aggregates
+    of ``game_logs_df`` over games strictly before the anchor.
 
     Parameters
     ----------
@@ -276,15 +289,32 @@ def build_player_traits_table(
         Exponential half-life for recency-weighted aggregates of
         minutes, FGA, and usage. Matches
         :data:`shotcloud.data.game_logs.DEFAULT_RECENCY_HALFLIFE_DAYS`.
+    reference_window_days : float, default 365.0
+        Length of the window before each anchor that defines the
+        reference population for the height, weight, and age z-scores:
+        vocabulary players with at least one game in
+        ``[anchor - reference_window_days, anchor)``.
 
     Returns
     -------
     PlayerTraitsTable
         Traits of shape ``(len(vocab_ids), n_snapshots, TRAIT_DIM)``.
     """
+    if reference_window_days <= 0:
+        raise ValueError(f"reference_window_days must be positive, got {reference_window_days}")
     player_ids = np.asarray(vocab_ids, dtype=np.int64)
     n_players = len(player_ids)
     n_snapshots = len(snapshot_store.bundles)
+
+    # Vocabulary row and date of every game, for the per-snapshot reference
+    # population of the biographical z-scores.
+    row_of_player = pd.Series(np.arange(n_players), index=player_ids)
+    game_dates = pd.to_datetime(game_logs_df["game_date"], errors="coerce")
+    game_rows = game_logs_df["player_id"].map(row_of_player)
+    known_game = (game_dates.notna() & game_rows.notna()).to_numpy()
+    game_dates_np = game_dates.to_numpy()[known_game]
+    game_rows_np = game_rows.to_numpy()[known_game].astype(np.int64)
+    reference_window = pd.Timedelta(days=reference_window_days)
 
     # ---- Bio block aligned to vocab order (height/weight/birthdate/position) -----
     bio_indexed = bio_df.set_index("player_id")
@@ -324,10 +354,19 @@ def build_player_traits_table(
         anchor = bundle.anchor_date
 
         # Block A: per-snapshot z-scored height, weight, age + static one-hot.
+        # The z-score statistics come from players active in the window
+        # before the anchor, so they never depend on later debuts.
+        anchor_ts = pd.Timestamp(anchor)
+        in_window = (game_dates_np >= (anchor_ts - reference_window).to_datetime64()) & (
+            game_dates_np < anchor_ts.to_datetime64()
+        )
+        reference = np.zeros(n_players, dtype=np.bool_)
+        reference[game_rows_np[in_window]] = True
+
         ages = compute_age_years(bio_birthdate_series, anchor)
-        height_z = _z_score_with_nan_imputation(height_raw)
-        weight_z = _z_score_with_nan_imputation(weight_raw)
-        age_z = _z_score_with_nan_imputation(ages)
+        height_z = _z_score_with_nan_imputation(height_raw, reference)
+        weight_z = _z_score_with_nan_imputation(weight_raw, reference)
+        age_z = _z_score_with_nan_imputation(ages, reference)
 
         traits[:, m_idx, 0] = height_z
         traits[:, m_idx, 1] = weight_z

@@ -1,26 +1,9 @@
-"""PR-D2b — programmatic training smoke for the cell-free defense path.
+"""Training smoke tests for ``train_gibbs`` with the continuous adaptive defensive field.
 
-This is a *unit-level* smoke: it runs ``train_gibbs(...)`` end-to-end
-with the cell-free defense triple wired (PR-D2a), on synthetic data,
-for two epochs at small batch / small ``M_def``. The purpose is to
-fence against integration regressions in the trainer's defense
-wiring before PR-D3 plumbs the user-facing CLI.
-
-A real-data sibling lives at
-:mod:`scripts.smoke_train_with_defense`.
-
-Acceptance criteria from the PR-D2b build approval (2026-05-26):
-
-1. ✓ Training runs end-to-end with defense wired.
-2. ✓ Train + val loss are finite.
-3. ✓ Defense parameters join the optimizer (β_D moves between
-   epochs).
-4. ✓ ``β_D`` receives gradient.
-5. ✓ ``q_net``, ``k_net``, opponent embedding receive gradients.
-6. ✓ Defense diagnostics populate on the wrapper output:
-   ``defense_logits`` shape and finiteness; ``defense_cold_start``
-   shape; values finite.
-7. ✓ No NaNs anywhere along the training path.
+Runs ``train_gibbs`` on synthetic data with a small batch and defensive support cap
+and checks that training finishes with finite losses, that the defensive field's
+parameters (``β_D``, ``q_net``, ``k_net``, opponent embedding) receive gradients and
+move, and that incomplete or unsupported defense configurations are rejected.
 """
 
 from __future__ import annotations
@@ -62,9 +45,9 @@ from shotcloud.training import GibbsShotDataset, OpponentVocab, PlayerVocab, tra
 
 
 def _build_setup(seed: int = 0) -> dict[str, object]:
-    """4 players × 2 opponents × ~40 shots each, evenly spread across
-    a 100-day window. Enough causal history for the offensive
-    collaborative KDE and the defensive cache to populate."""
+    """Four players with 40 shots each, alternating between two opponents over 40
+    consecutive days, plus the offensive ``CollaborativeKDE`` and the defensive
+    cache, features, and field."""
     rng = np.random.default_rng(seed)
     grid = CourtGrid(xlim=(-25.0, 25.0), ylim=(-5.0, 47.0), nx=14, ny=12)
     base_date = pd.Timestamp("2024-01-01")
@@ -141,7 +124,7 @@ def _build_setup(seed: int = 0) -> dict[str, object]:
         grid=grid,
     )
 
-    # Defensive triple.
+    # Defensive cache, features, and field.
     cache_cfg = DefensiveRetrievalCacheConfig(
         shots_fingerprint="smoke_v0",
         anchor_dates=tuple(int(d) for d in anchors_np),
@@ -203,16 +186,14 @@ def _build_setup(seed: int = 0) -> dict[str, object]:
 
 
 def test_training_with_defense_runs_two_epochs_end_to_end() -> None:
-    """Two-epoch programmatic training smoke: defense wired, no
-    NaNs, defense parameters move."""
+    """Two epochs with defense wired give finite losses and move the defensive
+    parameters."""
     setup = _build_setup()
     residual = ContextResidualEncoder(rank=4, within_game_dim=0)
     loc = LocationEmbedding(rank=4)
     gate = PoolingGate(history_dim=0)
 
-    # Snapshot β_D and a relevance-head weight before training; we'll
-    # assert they move (or at least receive gradient that produces a
-    # non-trivial post-optimizer-step state).
+    # Record β_D and a query-network weight before training to check that they move.
     def_field = setup["def_field"]
     beta_before = float(def_field.beta_D.detach().clone().item())  # type: ignore[union-attr]
     q_weight_before = def_field.q_net[0].weight.detach().clone()  # type: ignore[union-attr, index]
@@ -240,13 +221,12 @@ def test_training_with_defense_runs_two_epochs_end_to_end() -> None:
         restore_best_val=False,
     )
 
-    # 1-2. Training ran end-to-end; train + val losses are finite.
+    # Training ran for both epochs with finite losses.
     assert len(history.train_spatial_mix_nll) == 2
     for v in history.train_spatial_mix_nll:
         assert np.isfinite(v), f"train mix_nll not finite: {v}"
 
-    # 3-4. Defense parameters moved (the Adam step on a non-zero
-    # gradient must have changed at least β_D or the relevance head).
+    # An optimizer step on a nonzero gradient changes β_D or the query network.
     beta_after = float(def_field.beta_D.detach().item())  # type: ignore[union-attr]
     q_weight_after = def_field.q_net[0].weight.detach()  # type: ignore[union-attr, index]
     moved = not np.isclose(beta_before, beta_after) or not torch.allclose(
@@ -259,16 +239,14 @@ def test_training_with_defense_runs_two_epochs_end_to_end() -> None:
 
 
 def test_defense_parameters_join_optimizer() -> None:
-    """The defensive field's parameters must end up in the optimizer
-    so backward passes actually update them. Verified by checking
-    that ``β_D.grad`` is non-``None`` and non-zero after a single
-    training step."""
+    """After one epoch, ``β_D``, ``q_net``, ``k_net`` and the opponent embedding all have
+    gradients populated."""
     setup = _build_setup()
     residual = ContextResidualEncoder(rank=4, within_game_dim=0)
     loc = LocationEmbedding(rank=4)
     gate = PoolingGate(history_dim=0)
     def_field = setup["def_field"]
-    # Use a deep-copy so we can inspect grads after a single epoch.
+    # Train a deep copy so its gradients can be inspected afterwards.
     def_field = copy.deepcopy(def_field)
     setup["def_field"] = def_field
 
@@ -294,10 +272,8 @@ def test_defense_parameters_join_optimizer() -> None:
         progress=False,
         restore_best_val=False,
     )
-    # Adam called .step() during training but didn't necessarily zero
-    # the grads afterwards (the trainer may; doesn't matter for this
-    # invariant — we just want to see that grads were *populated* by
-    # the backward pass at some point in training).
+    # Only check that backward populated the gradients; whether the trainer zeroes
+    # them after the last step does not matter here.
     assert def_field.beta_D.grad is not None
     assert def_field.q_net[0].weight.grad is not None  # type: ignore[index]
     assert def_field.k_net[0].weight.grad is not None  # type: ignore[index]
@@ -305,9 +281,8 @@ def test_defense_parameters_join_optimizer() -> None:
 
 
 def test_train_gibbs_rejects_partial_defense_triple() -> None:
-    """Wiring a D-field cell-free field without cache + features
-    raises ``ValueError`` from ``train_gibbs`` (mirrors the wrapper's
-    kind-specific check: D-field requires the full triple)."""
+    """A continuous adaptive defensive field without ``defensive_cache`` and
+    ``defensive_features`` raises ``ValueError``."""
     import pytest
 
     setup = _build_setup()
@@ -320,7 +295,7 @@ def test_train_gibbs_rejects_partial_defense_triple() -> None:
             train_set=setup["train_set"],  # type: ignore[arg-type]
             grid=setup["grid"],  # type: ignore[arg-type]
             defensive_field_cellfree=setup["def_field"],  # type: ignore[arg-type]
-            # cache + features omitted on purpose
+            # defensive_cache and defensive_features omitted
             spatial_likelihood="continuous_mixture",
             n_epochs=1,
             batch_size=16,
@@ -330,9 +305,8 @@ def test_train_gibbs_rejects_partial_defense_triple() -> None:
 
 
 def test_train_gibbs_rejects_defense_with_non_continuous_mixture() -> None:
-    """The cell-free defense triple is only supported with
-    spatial_likelihood='continuous_mixture'; combining it with
-    'mode_mixture' or the grid paths raises."""
+    """The defensive field requires ``spatial_likelihood='continuous_mixture'``; with
+    ``'mode_mixture'`` the trainer raises ``NotImplementedError``."""
     import pytest
 
     setup = _build_setup()
