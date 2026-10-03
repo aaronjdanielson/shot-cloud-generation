@@ -1,0 +1,166 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shotcloud"
+version = "0.1.0"
+description = "Role-aware KDE-tilted marked point process for basketball shot clouds"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Aaron John Danielson" },
+]
+keywords = [
+    "machine learning",
+    "generative models",
+    "marked point process",
+    "kernel density estimation",
+    "sports analytics",
+    "basketball",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.4",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "pandas>=2.1",
+    "scikit-learn>=1.3",
+    "matplotlib>=3.8",
+    "pyyaml>=6.0",
+    "hydra-core>=1.3",
+    "omegaconf>=2.3",
+    "tqdm>=4.66",
+    "einops>=0.7",
+    "pyarrow>=24.0.0",
+]
+
+[project.optional-dependencies]
+data = [
+    "nba_api>=1.4",
+    "pbpstats>=1.3.11",
+    "requests>=2.31",
+]
+viz = [
+    "seaborn>=0.13",
+]
+train = [
+    "wandb>=0.16",
+]
+dev = [
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pre-commit>=3.7",
+    "nbformat>=5.11.1",
+    "nbclient>=0.11.0",
+    "ipykernel>=7.4.0",
+]
+
+[project.urls]
+Documentation = "https://github.com/aaronjdanielson/shotcloud"
+Repository = "https://github.com/aaronjdanielson/shotcloud"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+shotcloud = ["py.typed"]
+
+# ---------------------------------------------------------------------------
+# Ruff — replaces black, isort, and flake8.
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "N",    # pep8-naming
+    "NPY",  # numpy-specific rules
+    "RUF",  # ruff-specific rules
+]
+ignore = [
+    "E203",   # whitespace before ':' (conflicts with black-style slicing)
+    "N803",   # argument name should be lowercase (we use math notation: K_n, V, etc.)
+    "N806",   # variable in function should be lowercase (same reason)
+    "N812",   # import lowercase as uppercase (same)
+    "RUF001", # string contains ambiguous unicode (Greek/math intentional: ρ, α, ε)
+    "RUF002", # docstring contains ambiguous unicode (we use Greek/math intentionally: α, κ, σ, ×)
+    "RUF003", # ditto for comments
+]
+
+[tool.ruff.lint.per-file-ignores]
+# tests intentionally reset the global numpy RNG (NPY002) for determinism
+# without having to thread a Generator into every test that uses np.random.
+"tests/**" = ["N802", "NPY002"]
+"scripts/**" = ["N802"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
+# ---------------------------------------------------------------------------
+# Mypy — strict on src/, lenient on tests/scripts.
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+follow_imports = "normal"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*", "scripts.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
+
+# ---------------------------------------------------------------------------
+# Pytest.
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--cov=src/shotcloud",
+    "--cov-report=term-missing",
+    "--cov-report=html:.coverage_html",
+]
+
+[tool.coverage.run]
+source = ["src/shotcloud"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
