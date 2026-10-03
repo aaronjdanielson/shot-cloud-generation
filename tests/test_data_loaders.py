@@ -10,9 +10,9 @@ import pytest
 
 from shotcloud import load_shots
 
-# Path to the sibling shot_flow project's collected shot data.
-# The integration test is skipped when this file is unavailable.
-SHOT_FLOW_CSV = Path("/Users/aarondanielson/Dropbox/shot_flow/data/shot_data.csv")
+# The collected shot data (scripts/fetch_shots.py). The integration test is
+# skipped when this file is unavailable.
+SHOT_FLOW_CSV = Path(__file__).resolve().parents[1] / "data/raw/shot_data.csv"
 
 
 # ---------------------------------------------------------------------------
@@ -319,11 +319,11 @@ def test_missing_file_raises(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Real-data smoke test (skipped when shot_flow data is not on disk)
+# Real-data smoke test (skipped when the shot data is not on disk)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not SHOT_FLOW_CSV.exists(), reason="shot_flow CSV not available")
+@pytest.mark.skipif(not SHOT_FLOW_CSV.exists(), reason="shot data not available")
 def test_load_real_shot_flow_csv_sample() -> None:
     """The first 5,000 rows of the real NBA dataset load with the canonical schema."""
     df = load_shots(SHOT_FLOW_CSV, nrows=5_000)

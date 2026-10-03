@@ -16,7 +16,7 @@ from shotcloud.data.positions import (
     ra_rate_per_player,
 )
 
-SHOT_FLOW_CSV = Path("/Users/aarondanielson/Dropbox/shot_flow/data/shot_data.csv")
+SHOT_FLOW_CSV = Path(__file__).resolve().parents[1] / "data/raw/shot_data.csv"
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +220,7 @@ def test_derive_positions_invalid_min_shots_raises() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not SHOT_FLOW_CSV.exists(), reason="shot_flow CSV not available")
+@pytest.mark.skipif(not SHOT_FLOW_CSV.exists(), reason="shot data not available")
 def test_derive_positions_on_real_nba_data() -> None:
     """On real NBA data, we should see a reasonable mix of bigs/wings/guards."""
     df = load_shots(SHOT_FLOW_CSV, nrows=50_000)

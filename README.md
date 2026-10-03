@@ -10,9 +10,9 @@ scores the forecast against the shots the player then takes.
 density with the 29 shots he took. Right: the same density as a surface over
 the half court, with each observed shot on a stem.*
 
-This repository holds the `shotcloud` Python package and the paper *Adaptive
-Collaborative KDE for Forecasting NBA Player-Game Shot Clouds*
-([paper/shot_cloud.tex](paper/shot_cloud.tex)).
+This repository holds the `shotcloud` Python package: the model, its
+training and evaluation scripts, and the visualization tools. The
+accompanying paper is in preparation.
 
 ## The model
 
@@ -72,19 +72,23 @@ uv sync                # runtime dependencies only
 
 ## Data
 
-The scripts read three raw tables and build two derived artifacts. Locations
-come from environment variables, with these defaults:
+Everything comes from the public NBA Stats API through the `fetch_*` scripts
+in [scripts/](scripts/) (install the `data` extra). Four tables feed the
+model; a fifth, play-by-play lineups, serves only the optional presence model.
 
-| Variable | Default | Contents |
-| --- | --- | --- |
-| `SHOTS` | `$HOME/Dropbox/shot_flow/data/shot_data.csv` | NBA Stats shot events |
-| `GAME_LOGS` | `$HOME/Dropbox/shot_flow/data/player_game_logs.csv` | per-player box scores |
-| `STARTERS` | `$HOME/Dropbox/shot_flow/data/starters.csv` | starter status per player-game |
-| `PLAYER_BIO` | `data/player_bio.csv` | height, weight, position, birth date; fetched by `scripts/fetch_player_bio.py` |
-| `SNAPSHOTS` | `data/snapshots_K4.pt` | causal snapshot store; built by `scripts/pretrain_snapshots.py` |
+| Variable | Default | Contents | Fetched by |
+| --- | --- | --- | --- |
+| `GAME_LOGS` | `data/raw/player_game_logs.csv` | per-player box scores, one row per player-game | `fetch_game_logs.py`, one request per season |
+| `SHOTS` | `data/raw/shot_data.csv` | every shot with court coordinates | `fetch_shots.py`, one request per player-season |
+| `STARTERS` | `data/raw/starters.csv` | starter status per player-game | `fetch_starters.py`, one request per game |
+| `PLAYER_BIO` | `data/player_bio.csv` | height, weight, position, birth date | `fetch_player_bio.py`, one request per player |
+| `PBP_EVENTS` | `data/raw/pbp_events/` | play-by-play events with on-court lineups | `fetch_play_by_play.py`, one feed per game |
+| `SNAPSHOTS` | `data/snapshots_K4.pt` | causal snapshot store | built by `pretrain_snapshots.py` |
 
-Set `SHOT_FLOW_DATA` to move all three raw tables at once, and `DEVICE`
-(`mps` by default) to choose `cpu`, `cuda`, or `mps`.
+The fetchers are resumable and rate-limited; the game logs take a minute, the
+shots about an hour, the starters several hours. `replication/00_data.sh`
+runs the first four in order. Set `RAW_DATA` to move the raw tables at once,
+and `DEVICE` (`mps` by default) to choose `cpu`, `cuda`, or `mps`.
 
 ## Running the code
 
@@ -92,7 +96,7 @@ The command-line scripts live in [scripts/](scripts/). Most have a
 ready-to-run launcher of the same name in [scripts/runs/](scripts/runs/):
 
 ```bash
-scripts/runs/train_gibbs.sh               # train AC-KDE with the paper's configuration
+scripts/runs/train_gibbs.sh               # train AC-KDE with the reference configuration
 tail -f logs/train_gibbs_*.log            # follow its log
 ```
 
@@ -118,7 +122,7 @@ The pipeline, in order:
 
 | Step | Launcher | Writes |
 | --- | --- | --- |
-| Fetch player bios | `scripts/runs/fetch_player_bio.sh` | player bio table |
+| Fetch the raw data | `scripts/runs/fetch_game_logs.sh`, `fetch_shots.sh`, `fetch_starters.sh`, `fetch_player_bio.sh` | the tables above |
 | Build the snapshot store | `scripts/runs/pretrain_snapshots.sh` | snapshot store and manifest |
 | Pretrain the count head | `scripts/runs/train_count_head.sh` | count-head run directory |
 | Pretrain the timing head | `scripts/runs/train_timing_head.sh` | timing-head run directory |
@@ -130,14 +134,14 @@ The pipeline, in order:
 | Sample shot clouds | `scripts/runs/sample_shot_clouds.sh` | sampled clouds |
 | Figures | `scripts/runs/build_attention_figure.sh`, `scripts/runs/plot_hero_shot_clouds.sh` | PNG figures |
 
-These launchers write to fresh output paths, so they do not overwrite the
-results the paper reads. The remaining launchers in `scripts/runs/` cover
+These launchers write to fresh output paths, so they do not overwrite
+existing results. The remaining launchers in `scripts/runs/` cover
 diagnostics and audits.
 
-## Reproducing the paper
+## Reproducing the results
 
 [replication/](replication/) is a numbered pipeline from raw data to the
-compiled paper:
+reported metrics and figures:
 
 ```bash
 replication/run_all.sh                    # everything, in order
@@ -145,15 +149,14 @@ SKIP_ABLATIONS=1 replication/run_all.sh   # without the comparison training runs
 DRY_RUN=1 replication/run_all.sh          # print what would run; execute nothing
 ```
 
-Stages write to the paths the paper reads and skip any step whose outputs
-already exist, so a rerun resumes where it stopped. See
+Stages write to fixed output paths and skip any step whose outputs already
+exist, so a rerun resumes where it stopped. See
 [replication/README.md](replication/README.md) for the stages, the table that
-maps each figure and table of the paper to its source file, and the items the
+maps each reported table and figure to its source file, and the items the
 pipeline does not cover.
 
 The scripts `scripts/run_experiment_*.sh` and `scripts/eval_*.sh` hold the
-exact configuration of each run reported in the paper; the replication stages
-call them.
+exact configuration of each reported run; the replication stages call them.
 
 ## Repository layout
 
@@ -172,10 +175,8 @@ src/shotcloud/
   legacy/, legacy_pivot/   deprecated components, kept for reproducibility
 scripts/         command-line entry points and experiment launchers
 scripts/runs/    one launcher per script
-replication/     the paper's pipeline
+replication/     end-to-end pipeline for the reported results
 tests/           test suite
-paper/           paper source
-abstract/        conference abstract
 examples/        standalone rendering example
 assets/          images used in this README
 ```

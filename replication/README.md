@@ -1,25 +1,26 @@
 # Replication
 
-A numbered pipeline that regenerates the artifacts behind *Adaptive
-Collaborative KDE for Forecasting NBA Player-Game Shot Clouds*, from raw data
-to the compiled paper.
+A numbered pipeline that regenerates the reported results, from raw data to
+the metrics and figures. The paper is in preparation and its source is not
+distributed with the repository; the last two stages compile it when the
+source is present and are skipped otherwise.
 
 ## Requirements
 
 - [uv](https://docs.astral.sh/uv/) and Python 3.11+; run `uv sync --all-extras`
   from the repository root.
-- A LaTeX distribution with `latexmk` and `pdflatex` (stages 9 and 10);
-  `pdftotext` for stage 10.
-- The raw inputs below. Locations are read from environment variables and
-  default to a sibling `shot_flow` checkout.
+- For stages 9 and 10 only: a LaTeX distribution with `latexmk` and
+  `pdflatex`, and `pdftotext`.
+- Network access to the NBA Stats API for stage 0, which fetches the raw
+  tables below; locations are read from environment variables.
 
 | Variable | Default | Contents |
 | --- | --- | --- |
-| `SHOT_FLOW_DATA` | `$HOME/Dropbox/shot_flow/data` | directory holding the three raw tables |
-| `SHOTS` | `$SHOT_FLOW_DATA/shot_data.csv` | NBA Stats shot events |
-| `GAME_LOGS` | `$SHOT_FLOW_DATA/player_game_logs.csv` | per-player box scores |
-| `STARTERS` | `$SHOT_FLOW_DATA/starters.csv` | starter status per player-game |
-| `PLAYER_BIO` | `data/player_bio.csv` | player bio table (fetched in stage 0) |
+| `RAW_DATA` | `data/raw` | directory holding the raw tables |
+| `GAME_LOGS` | `$RAW_DATA/player_game_logs.csv` | per-player box scores (stage 0) |
+| `SHOTS` | `$RAW_DATA/shot_data.csv` | NBA Stats shot events (stage 0) |
+| `STARTERS` | `$RAW_DATA/starters.csv` | starter status per player-game (stage 0) |
+| `PLAYER_BIO` | `data/player_bio.csv` | player bio table (stage 0) |
 | `SNAPSHOTS` | `data/snapshots_K4.pt` | causal snapshot store (built in stage 1) |
 | `DEVICE` | `mps` | device for the stages that take one (`cpu`, `cuda`, `mps`) |
 
@@ -39,15 +40,15 @@ the current shell instead.
 
 A step is skipped when its outputs already exist, so an interrupted run resumes
 where it stopped and finished work is never overwritten. `FORCE=1` runs every
-step regardless; the count-head, timing-head, and AC-KDE training scripts still
-refuse to overwrite an existing run directory, so move that directory aside
-first.
+step regardless; the game-log fetcher and the count-head, timing-head, and
+AC-KDE training scripts still refuse to overwrite an existing output, so move
+it aside first.
 
 ## Stages
 
 | Stage | Produces |
 | --- | --- |
-| `00_data.sh` | checks the raw inputs; fetches `data/player_bio.csv` |
+| `00_data.sh` | the four raw tables, fetched from NBA Stats |
 | `01_snapshots.sh` | `data/snapshots_K4.pt` and its manifest |
 | `02_count_head.sh` | `outputs/count_head_v1/` |
 | `03_timing_head.sh` | `outputs/timing_head_v2_masked/` |
@@ -56,17 +57,17 @@ first.
 | `06_evaluate.sh` | mainline metrics: finite-cloud, density-surface, autonomous rollout, support audit, count audit, attention statistics |
 | `07_ablations.sh` | five comparison runs and their evaluations against the mainline |
 | `08_figures.sh` | `outputs/figures/paper/*.png` |
-| `09_paper.sh` | `paper/shot_cloud.pdf` |
-| `10_abstract.sh` | `abstract/SSAC27_submission/SSAC27_abstract.pdf` |
+| `09_paper.sh` | the compiled paper, when `paper/` is present |
+| `10_abstract.sh` | the compiled abstract, when `abstract/` is present |
 
 The stages call the launchers in `scripts/` and `scripts/runs/`, which hold the
 exact hyperparameters; nothing is duplicated here. Stages 2 to 4 and 7 are
 training runs and dominate the wall-clock time. All runs use seed 0 and the
-split used throughout the paper: training through 2023-06-30, validation
-through 2024-04-30, and evaluation on the 2000 largest validation player-games
-with at least three shots.
+same split: training through 2023-06-30, validation through 2024-04-30, and
+evaluation on the 2000 largest validation player-games with at least three
+shots.
 
-## Paper elements
+## Reported tables and figures
 
 | Element | Source | Stage |
 | --- | --- | --- |
@@ -103,5 +104,6 @@ with at least three shots.
   mainline run; `scripts/runs/hero_b2.sh` draws the same games from the
   full-residual run of the ablation chain.
 - **Presence-model paragraph.** `scripts/run_experiment_presence_then_timing.sh`
-  reproduces it and needs play-by-play events from a separate source
-  (`EVENTS_DIR`).
+  reproduces it from the play-by-play events in `$PBP_EVENTS`, fetched by
+  `scripts/runs/fetch_play_by_play.sh` (2024-25 regular season, one feed per
+  game).
