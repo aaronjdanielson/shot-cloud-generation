@@ -153,7 +153,9 @@ Stages write to fixed output paths and skip any step whose outputs already
 exist, so a rerun resumes where it stopped. See
 [replication/README.md](replication/README.md) for the stages, the table that
 maps each reported table and figure to its source file, and the items the
-pipeline does not cover.
+pipeline does not cover. [replication/replication.ipynb](replication/replication.ipynb)
+rebuilds every reported table from the pipeline's outputs, with paired
+confidence intervals, and shows the figures.
 
 The scripts `scripts/run_experiment_*.sh` and `scripts/eval_*.sh` hold the
 exact configuration of each reported run; the replication stages call them.

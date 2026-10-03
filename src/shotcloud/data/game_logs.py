@@ -5,11 +5,9 @@ played, plus the recency-weighted ``recent_3pa_frac``,
 ``recent_usage``, and ``recent_fga`` features of the context vector
 ``x_n``.
 
-**Upstream data.** The game-log CSV is produced by shot_flow's
-``scripts/fetch_game_logs.R`` (R + ``nbastatR``) and covers seasons
-2014-15 through 2024-25; it is treated as an external input (for
-example ``path/to/player_game_logs.csv``) and joined onto the shot
-table.
+**Upstream data.** The game-log CSV is produced by
+``scripts/fetch_game_logs.py`` (one NBA Stats request per season) and
+joined onto the shot table.
 
 **Starter inference.** The game-log CSV does not carry the NBA Stats
 ``START_POSITION`` column, so :func:`load_game_logs` derives a
@@ -61,12 +59,12 @@ def load_game_logs(
     starters_path: str | Path | None = None,
     recency_halflife_days: float = DEFAULT_RECENCY_HALFLIFE_DAYS,
 ) -> pd.DataFrame:
-    """Load shot_flow's ``player_game_logs.csv`` into a canonical frame.
+    """Load ``player_game_logs.csv`` into a canonical frame.
 
     Parameters
     ----------
     path : str or Path
-        Path to the CSV produced by ``shot_flow/scripts/fetch_game_logs.R``.
+        Path to the CSV produced by ``scripts/fetch_game_logs.py``.
     starters_path : str or Path, optional
         Path to the CSV produced by ``scripts/fetch_starters.py`` —
         per-(player, game) ``position`` and ``starter`` derived from

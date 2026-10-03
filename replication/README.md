@@ -44,6 +44,20 @@ step regardless; the game-log fetcher and the count-head, timing-head, and
 AC-KDE training scripts still refuse to overwrite an existing output, so move
 it aside first.
 
+## Notebook
+
+[replication.ipynb](replication.ipynb) reproduces every reported table from
+the files the pipeline writes and shows the figures: the finite-cloud
+ladder with paired confidence intervals, the density-surface scores, the
+count and timing diagnostics, the autonomous rollout, the component
+comparisons, and the support-attention statistics by history length. It
+reads results only, so it runs in a minute once `outputs/` exists:
+
+```bash
+uv sync --all-extras
+uv run jupyter notebook replication/replication.ipynb
+```
+
 ## Stages
 
 | Stage | Produces |
@@ -83,6 +97,13 @@ shots.
 | Stress-test table | `outputs/joint_b2_outcome_{spatial_hawkes,stratified_kernel,causal_zone_bias,mode_routed}_v1/` | 7 |
 | Residual ablation table and summary figure | see below | — |
 | Example-game figure | see below | — |
+
+## Known issue
+
+`paper/references.bib` contains two repeated entries (`szekely2013energy`,
+`bashtannyk2001bandwidth`). BibTeX skips the duplicates and the PDF is
+written, but `latexmk` exits non-zero, which stops `run_all.sh` before stage
+10. Remove the duplicates, or run `replication/10_abstract.sh` separately.
 
 ## Not covered by the pipeline
 
